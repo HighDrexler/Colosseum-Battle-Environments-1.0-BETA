@@ -16,11 +16,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Validate exact 1.2 package
+      - name: Download and validate exact 1.2 release asset
         shell: bash
         run: |
           set -euo pipefail
-          cp .release_payload/Colosseum-Battle-Environments-1.2.zip /tmp/Colosseum-Battle-Environments-1.2.zip
+          curl -fL --retry 3 --retry-delay 2 \
+            'https://github.com/HighDrexler/Colosseum-Battle-Environments-1.0-BETA/releases/download/1.2.0/Colosseum-Battle-Environments-1.2.zip' \
+            -o /tmp/Colosseum-Battle-Environments-1.2.zip
           echo 'd81416d45e91d1bc77c3d660be87f80064d12963bf0495e627087e547a7641d6  /tmp/Colosseum-Battle-Environments-1.2.zip' | sha256sum -c -
           rm -rf /tmp/cbe-release
           mkdir -p /tmp/cbe-release
