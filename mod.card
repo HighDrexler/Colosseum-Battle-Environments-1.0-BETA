@@ -1,0 +1,29 @@
+1.2 RELEASE CONSOLIDATION
+• Adds RANDOM arena selection. One concrete arena is chosen at battle start and remains fixed for the entire battle.
+• Keeps/strengthens RANDOM Colosseum battle music selection with one theme per battle and no immediate repeat when alternatives exist.
+• ISO/GCM + supported GameCube CISO are accepted through the same persistent Gen1Recomp required-import flow. CISO is read in place and is never expanded into a 1.46 GiB temporary ISO.
+• Restores the universal in-process MusyX renderer: Windows, Linux, macOS, Android and iOS use the same Lua/LuaJIT audio build path. No amuserender.exe, cmd.exe, shell script, or external extraction host is required.
+• Hard cleanup removes the obsolete Windows-only audio executable path while retaining compatibility/migration code that still protects existing CBE installs.
+• Preserves the complete current Gen 1 + Gen 2 runtime, Poké Ball transition, transition sting, Mt. Battle material/geometry fixes, five arenas, trainer models/animation, camera behavior, sprite/actor provider arbitration, and external-mod compatibility.
+
+# Colosseum Battle Environments 1.2
+
+Colosseum Battle Environments replaces the flat battle presentation with Colosseum-style 3D environments, trainers and cinematography while leaving Gen1Recomp's battle state and the user's selected Pokémon presentation source authoritative.
+
+## Battle selection
+• ARENA: AUTO / RANDOM / Water Colosseum / Orre Colosseum / Realgam Colosseum / Orre Wildlands / Mt. Battle Summit. RANDOM binds once at battle acquisition, so the environment never changes mid-battle.
+• MUSIC: RANDOM plus all eleven extracted Colosseum battle themes or ORIGINAL / OFF. RANDOM binds one available Colosseum theme to the battle lifecycle and releases it when the battle ends.
+• Arena and music randomization are independent, so either or both can be randomized.
+
+## Compatibility retained
+• Full Gen 1 and Gen 2 battle functionality.
+• Gen 2 Poké Ball battle transition and the isolated Colosseum battle-entry sting remain intact.
+• Arena rendering stays independent from Battle Arts, Stadium models, Dramatic Shape, custom sprites and other supported presentation providers.
+• Portable battleSprites, battleActors and battlePresentation providers keep ownership through send-out, switch, faint and result choreography.
+• StadiumBattleFX, Stadium 2 models, Colosseum UI, Battle Arts and Dramatic Shape remain optional rather than dependencies.
+• Existing camera, trainer, actor arbitration, transition ownership and load-order compatibility fixes are retained.
+
+## Source import / generated cache
+Import Pokémon Colosseum USA GC6E01 disc 0 revision 0 through the Gen1Recomp launcher as either a clean ISO/GCM or the supported GameCube CISO. The source is retained outside the replaceable mod folder. Current launcher/mobile builds stream large required imports instead of loading them into one Lua string; CBE reads the source in bounded ranges. CISO is decoded as a logical disc on demand without creating an expanded ISO copy.
+
+The arena/trainer/transition/audio cache is generated locally from the user's validated source. Audio generation is now fully in-process and platform-neutral; the obsolete bundled Windows converter has been removed. No Colosseum arena, trainer, music or disc payload is bundled with the mod. The existing isolated transition-reference sting remains unchanged from the current compatibility baseline.

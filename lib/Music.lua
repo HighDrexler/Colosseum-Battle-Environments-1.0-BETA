@@ -1,0 +1,165 @@
+local V=...
+local GeneratedAssets=V.GeneratedAssets
+local M={}
+local installed=false
+local hookInstalled=false
+local gameRef=nil
+local modRef=nil
+local registeredForData=nil
+local randomBattleTheme=nil
+local lastRandomTheme=nil
+local missingWarned={}
+
+-- Battle-theme library rendered from the user's Pokemon Colosseum ROM.
+-- UI ids stay stable even if the underlying extracted sequence/cache layout changes.
+local THEMES={
+  {id="normal",label="NORMAL BATTLE",seq="battle5",song="COLOSSEUM_ENV_NORMAL",intro="assets/audio/themes/normal_battle_intro.wav",loop="assets/audio/themes/normal_battle_loop.wav"},
+  {id="first",label="FIRST BATTLE",seq="battle8",song="COLOSSEUM_ENV_FIRST",intro="assets/audio/themes/first_battle_intro.wav",loop="assets/audio/themes/first_battle_loop.wav"},
+  {id="cipher_peon",label="CIPHER PEON",seq="battle7",song="COLOSSEUM_ENV_CIPHER_PEON",intro="assets/audio/themes/cipher_peon_intro.wav",loop="assets/audio/themes/cipher_peon_loop.wav"},
+  {id="miror_b",label="MIROR B.",seq="mirrorbo",song="COLOSSEUM_ENV_MIROR_B",intro="assets/audio/themes/miror_b_intro.wav",loop="assets/audio/themes/miror_b_loop.wav"},
+  {id="cipher_admin",label="CIPHER ADMIN",seq="battle9plus",song="COLOSSEUM_ENV_CIPHER_ADMIN",intro="assets/audio/themes/cipher_admin_intro.wav",loop="assets/audio/themes/cipher_admin_loop.wav"},
+  {id="mirakle_b",label="MIRAKLE B.",seq="miraclebo",song="COLOSSEUM_ENV_MIRAKLE_B",intro="assets/audio/themes/mirakle_b_intro.wav",loop="assets/audio/themes/mirakle_b_loop.wav"},
+  {id="semifinal",label="SEMI-FINAL",seq="battle2",song="COLOSSEUM_ENV_SEMIFINAL",intro="assets/audio/themes/semifinal_intro.wav",loop="assets/audio/themes/semifinal_loop.wav"},
+  {id="final",label="FINAL BATTLE",seq="battle6",song="COLOSSEUM_ENV_FINAL",intro="assets/audio/themes/final_battle_intro.wav",loop="assets/audio/themes/final_battle_loop.wav"},
+  {id="link1",label="BATTLE MODE 1",seq="tool_battle1",song="COLOSSEUM_ENV_LINK1",intro="assets/audio/themes/link_1_intro.wav",loop="assets/audio/themes/link_1_loop.wav"},
+  {id="link2",label="BATTLE MODE 2",seq="tool_battle2",song="COLOSSEUM_ENV_LINK2",intro="assets/audio/themes/link_2_intro.wav",loop="assets/audio/themes/link_2_loop.wav"},
+  {id="link3",label="BATTLE MODE 3",seq="tool_battle3",song="COLOSSEUM_ENV_LINK3",intro="assets/audio/themes/link_3_intro.wav",loop="assets/audio/themes/link_3_loop.wav"},
+}
+local OPTIONS={{id="random",label="RANDOM"}}
+for _,t in ipairs(THEMES) do OPTIONS[#OPTIONS+1]=t end
+OPTIONS[#OPTIONS+1]={id="original",label="ORIGINAL / OFF",original=true}
+local BY_ID={}
+for _,t in ipairs(OPTIONS) do BY_ID[t.id]=t end
+
+local function log(mod,level,msg)
+  local l=mod and mod.log;if l and type(l[level])=="function" then pcall(l[level],l,msg) end
+end
+local fileDataCache={}
+local function exists(_,asset) return GeneratedAssets.exists(asset) end
+local function assetData(asset)
+  local hit=fileDataCache[asset]
+  if hit~=nil then return hit or nil end
+  local fd,err=GeneratedAssets.fileData(asset,asset:match("[^/]+$") or "cbe.wav")
+  if not fd then fileDataCache[asset]=false;return nil,err end
+  fileDataCache[asset]=fd
+  return fd
+end
+local function assetPath(_,asset) return assetData(asset) end
+local function themeAvailable(theme)
+  return theme and exists(modRef,theme.intro) and exists(modRef,theme.loop) or false
+end
+local function settings(game)
+  if not (game and game.save) then return {music="normal"} end
+  local s=game.save.colosseumBattle;if type(s)~="table" then s={};game.save.colosseumBattle=s end
+  -- migrate the v14-v16 selector: the old generic Colosseum choice was Normal Battle;
+  -- old Kanto-forcing choices are intentionally retired rather than kept hidden.
+  if s.music=="colosseum" or s.music=="wild" or s.music=="trainer" or s.music=="gym" then s.music="normal" end
+  if not BY_ID[s.music] then s.music="normal" end
+  return s
+end
+local function requestKind(song,ctx)
+  local s=tostring(song or ""):lower()
+  if s:find("defeatedtrainer",1,true) or s:find("defeatedwildmon",1,true) or s:find("defeatedgymleader",1,true) or s:find("victory",1,true) then return "result" end
+  if s:find("wildbattle",1,true) or s:find("trainerbattle",1,true) or s:find("gymleaderbattle",1,true) or s:find("finalbattle",1,true) then return "battle" end
+  if type(ctx)=="table" then
+    local reason=tostring(ctx.reason or ctx.kind or ctx.state or ""):lower()
+    if reason=="victory" then return "result" end
+    if reason=="battle" or reason=="battle_music" then return "battle" end
+  end
+end
+local function ensureSongs(game)
+  game=game or gameRef or (modRef and modRef.game);local data=game and game.data;local songs=data and data.audio and data.audio.songs
+  if not songs then return false end
+  local ready=true
+  for _,theme in ipairs(THEMES) do if not songs[theme.song] then ready=false;break end end
+  if registeredForData==data and ready then return true end
+  for _,theme in ipairs(THEMES) do
+    local intro=assetPath(modRef,theme.intro);local loop=assetPath(modRef,theme.loop)
+    if not intro or not loop then
+      if not missingWarned[theme.id] then
+        missingWarned[theme.id]=true
+        log(modRef,"warn","Colosseum theme asset unavailable: "..theme.id)
+      end
+      return false
+    end
+    missingWarned[theme.id]=nil
+    songs[theme.song]={file=intro,loopFile=loop}
+  end
+  registeredForData=data;installed=true
+  log(modRef,"info","registered 11 Pokemon Colosseum battle themes")
+  return true
+end
+local function chooseRandom()
+  local available={}
+  for _,theme in ipairs(THEMES) do if themeAvailable(theme) then available[#available+1]=theme end end
+  local n=#available;if n<1 then return nil end
+  local i=math.random(1,n)
+  if n>1 and lastRandomTheme and available[i].id==lastRandomTheme then i=(i%n)+1 end
+  randomBattleTheme=available[i]
+  lastRandomTheme=randomBattleTheme.id
+  return randomBattleTheme
+end
+function M.themeOptions(game)
+  ensureSongs(game or gameRef);local out={}
+  local haveTheme=false
+  for _,t in ipairs(THEMES) do if themeAvailable(t) then haveTheme=true break end end
+  if haveTheme then
+    out[#out+1]={id="random",label="RANDOM"}
+    for _,t in ipairs(THEMES) do if themeAvailable(t) then out[#out+1]={id=t.id,label=t.label} end end
+  end
+  out[#out+1]={id="original",label=haveTheme and "ORIGINAL / OFF" or "ORIGINAL / CACHE REQUIRED"}
+  return out
+end
+function M.themeLabel(game,mode)
+  local t=BY_ID[mode or M.getMode(game)];return (t and t.label) or "NORMAL BATTLE"
+end
+function M.nextMode(game,current)
+  current=current or M.getMode(game);local options=M.themeOptions(game);local at=0
+  for i,o in ipairs(options) do if o.id==current then at=i;break end end
+  return options[(at%#options)+1].id
+end
+function M.install(mod)
+  modRef=modRef or mod;gameRef=(mod and mod.game) or gameRef;ensureSongs(gameRef)
+  if hookInstalled then return installed end
+  if not (mod and mod.hooks and type(mod.hooks.wrap)=="function") then return false end
+  mod.hooks:wrap("music.select",function(next,song,ctx)
+    local selected=next(song,ctx);local game=(modRef and modRef.game) or gameRef;local mode=settings(game).music;local kind=requestKind(selected,ctx) or requestKind(song,ctx)
+    if mode=="original" then randomBattleTheme=nil;return selected end
+    if mode=="random" then
+      if kind=="battle" then
+        local theme=randomBattleTheme or chooseRandom();if ensureSongs(game) and theme then return theme.song end
+      elseif kind=="result" then
+        randomBattleTheme=nil
+      else
+        -- map/field music means the prior battle lifecycle is over.
+        randomBattleTheme=nil
+      end
+      return selected
+    end
+    randomBattleTheme=nil
+    local theme=BY_ID[mode] or BY_ID.normal
+    if not ensureSongs(game) then return selected end
+    if kind=="battle" and theme and theme.song then return theme.song end
+    return selected
+  end,1200)
+  hookInstalled=true;installed=ensureSongs(gameRef) or installed;return installed
+end
+function M.attachGame(game) gameRef=game or gameRef;return ensureSongs(gameRef) end
+function M.getMode(game) return settings(game or gameRef).music end
+function M.setMode(game,mode)
+  game=game or gameRef;local s=settings(game);if BY_ID[mode] then s.music=mode end;randomBattleTheme=nil;ensureSongs(game);return s.music
+end
+function M.resetRuntime()
+  randomBattleTheme=nil
+  lastRandomTheme=nil
+  registeredForData=nil
+  missingWarned={}
+  fileDataCache={}
+  if gameRef then ensureSongs(gameRef) end
+  return true
+end
+function M.status()
+  local list={};for _,t in ipairs(THEMES) do list[#list+1]={id=t.id,label=t.label,sequence=t.seq,song=t.song} end
+  return {installed=installed,hookInstalled=hookInstalled,mode=M.getMode(gameRef),modeLabel=M.themeLabel(gameRef),themeOptions=M.themeOptions(gameRef),themes=list,randomChoice=randomBattleTheme and randomBattleTheme.id or nil,lastRandomTheme=lastRandomTheme,renderer="CBE generated-audio cache / MusyX source compiler",sourceGroup="snd_music"}
+end
+return M
