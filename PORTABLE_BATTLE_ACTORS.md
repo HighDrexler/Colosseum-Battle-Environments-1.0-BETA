@@ -47,9 +47,21 @@ A mod that supplies real 3D Pokémon may publish `mod.exports.battleActors`:
 
 `opts` passed to `acquire` contains `side`, `context`, and `battler`. Renderer
 options contain `eye`, `width`, `height`, and `context`. An actor may implement
-`update`, `matrix`, `build`, `draw`, `attack`, `hit`, `faint`, and `release`.
+`update`, `matrix`, `build`, `draw`, `spawn`, `idle`, `attack`, `hit`, `faint`,
+`remove`, `attachment`, and `release`.
 `attack(moveId, moveDef)` receives the visible move boundary. Actor `update`
 uses presentation time normalized against logic fast-forward.
+
+Lifecycle callbacks are presentation notifications only. `spawn(progress)` is
+driven by the engine's authoritative send-out scale, and `remove(reason)` is
+called only when the live battle slot is replaced or authoritatively hidden.
+Providers must not mutate battle state or decide damage, fainting, switching,
+or replacement.
+
+`attachment(name)` may return `{ matrix, boneIndex, source }` for a source-authored
+body-map point such as `origin`, `mouth`, `chest`, `tail`, `center`, hands, feet,
+or eyes. Return `nil` when that joint matrix is unavailable; hosts must not
+invent a bounding-box attachment as a substitute.
 
 The service draws only into the caller's active color/depth target and must not
 clear or replace the canvas, UI, arena, camera, or battle state. Declining one

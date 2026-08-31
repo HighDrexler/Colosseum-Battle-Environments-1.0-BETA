@@ -14,7 +14,7 @@ local REFERENCE_SFX_ASSET = "assets/audio/colosseum_battle_entry_sting.wav"
 local MASK_A = "assets/transition/wipe_ball00.rgba"
 local MASK_B = "assets/transition/wipe_ball01.rgba"
 local WIPE_SECONDS = 0.62
-local BLACK_HOLD_SECONDS = 0.13
+local BLACK_HOLD_SECONDS = 0.0
 local REFERENCE_SFX_SECONDS = 0.678
 local installed = false
 local rendererPatched = false
@@ -291,7 +291,7 @@ local function decorateGen2State(mod,state)
     local elapsed=math.max(0,now()-(self.__cbeRealStart or now()))
     self.__cbeProgress=clamp(elapsed/WIPE_SECONDS,0,1)
     -- The stock Gold transition has a public finish() that performs its own
-    -- pop + onDone exactly once. Once the CBE wipe and brief black resolve are
+    -- pop + onDone exactly once. Once the CBE wipe and final resolve are
     -- complete, use that native exit instead of sitting on a black frame while
     -- Gold's hidden flash/outro counters continue for another second. Registry
     -- replacement screens keep their original lifecycle unless they were built

@@ -13,8 +13,6 @@ local runtimeSelected=nil
 local pendingSelected=nil
 local boundBattle=nil
 local boundSelected=nil
-local boundResolved=nil
-local lastRandomArena=nil
 
 local DEFINITIONS={
   water={
@@ -29,7 +27,7 @@ local DEFINITIONS={
   },
   orre_colosseum={
     id="orre_colosseum",label="ORRE COLOSSEUM",cache="cache/orre_colosseum_cache.lua",ready=true,
-    stageScale=0.25,stageYaw=0,sceneRadiusRaw=560,maxGroupSpanRaw=1600,vertexRadiusRaw=550,
+    stageScale=0.25,stageYaw=0,sceneRadiusRaw=1500,maxGroupSpanRaw=5000,vertexRadiusRaw=1450,
     pokemon={player={-4.4,16.8},enemy={4.4,-16.8}},figureScale=0.335,
     trainers={player={10.8,24.8},enemy={-10.8,-24.8}},
     trainerScale={player=0.405,enemy=0.198},
@@ -49,7 +47,7 @@ local DEFINITIONS={
   },
   realgam_colosseum={
     id="realgam_colosseum",label="REALGAM COLOSSEUM",cache="cache/realgam_colosseum_cache.lua",ready=true,
-    stageScale=0.25,stageYaw=0,sceneRadiusRaw=600,maxGroupSpanRaw=1300,vertexRadiusRaw=590,
+    stageScale=0.25,stageYaw=0,sceneRadiusRaw=2300,maxGroupSpanRaw=5000,vertexRadiusRaw=2200,
     pokemon={player={-4.8,17.5},enemy={4.8,-17.5}},figureScale=0.35,
     trainers={player={12.5,27.0},enemy={-12.5,-27.0}},
     trainerScale={player=0.405,enemy=0.198},
@@ -59,7 +57,9 @@ local DEFINITIONS={
   },
   mt_battle_summit={
     id="mt_battle_summit",label="MT. BATTLE SUMMIT",cache="cache/D2_mt_battle_platform100_cache.lua",ready=true,
-    stageScale=0.25,stageYaw=0,sceneRadiusRaw=760,maxGroupSpanRaw=1600,vertexRadiusRaw=750,
+    -- D2 source stage includes the full crater wall/bridge/background instead
+    -- of the old near-field procedural rebuild, so retain remote source groups.
+    stageScale=0.25,stageYaw=0,sceneRadiusRaw=5200,maxGroupSpanRaw=12000,vertexRadiusRaw=5200,
     pokemon={player={-6.0,21.0},enemy={6.0,-21.0}},figureScale=0.34,
     trainers={player={17.0,30.0},enemy={-17.0,-30.0}},
     trainerScale={player=0.445,enemy=0.215},
@@ -67,32 +67,14 @@ local DEFINITIONS={
     -- landmark pylons and first crater wall carry the shot while the skyline
     -- still clears both battlers.
     camera={side=61,back=19,height=23.8,lookX=0,lookY=6.1,frameH=53.5},
-    -- Platform 100 source reference carries a pale high-altitude cloud deck
-    -- over the active caldera. Arena.lua expands this into layered moving cloud
-    -- bands while these colors remain the fallback profile.
-    backdrop={top={0.25,0.29,0.35},bottom={0.83,0.84,0.82}},
+    -- Neutral fallback only; the extracted D2 HSD scene owns the real backdrop.
+    backdrop={top={0.30,0.38,0.49},bottom={0.72,0.72,0.69}},
     profile="summit",crowd="none",
   },
 }
 
-local RANDOM_ARENAS={"water","orre_colosseum","realgam_colosseum","outdoor_wild","mt_battle_summit"}
-local ORDER={"auto","random","water","orre_colosseum","realgam_colosseum","outdoor_wild","mt_battle_summit"}
-local VALID={auto=true,random=true,water=true,orre_colosseum=true,realgam_colosseum=true,outdoor_wild=true,mt_battle_summit=true}
-
-local function chooseRandomArena()
-  local available={}
-  for _,id in ipairs(RANDOM_ARENAS) do
-    local def=DEFINITIONS[id]
-    if def and def.ready then available[#available+1]=id end
-  end
-  if #available==0 then return "water" end
-  local index=math.random(1,#available)
-  if #available>1 and available[index]==lastRandomArena then
-    index=(index%#available)+1
-  end
-  lastRandomArena=available[index]
-  return lastRandomArena
-end
+local ORDER={"auto","water","orre_colosseum","realgam_colosseum","outdoor_wild","mt_battle_summit"}
+local VALID={auto=true,water=true,orre_colosseum=true,realgam_colosseum=true,outdoor_wild=true,mt_battle_summit=true}
 
 local function saved(game)
   local save=game and game.save
@@ -129,7 +111,6 @@ function C.order() return ORDER end
 function C.options()
   return {
     {id="auto",label="AUTO"},
-    {id="random",label="RANDOM"},
     {id="water",label="WATER COLOSSEUM"},
     {id="orre_colosseum",label="ORRE COLOSSEUM"},
     {id="realgam_colosseum",label="REALGAM COLOSSEUM"},
@@ -179,7 +160,6 @@ function C.resolve(game,battle)
       -- A selection made in the BATTLE overlay is authoritative for this
       -- acquisition even if ctx.game still exposes an older save snapshot.
       boundSelected=pendingSelected or C.selected(game)
-      boundResolved=nil
       runtimeSelected=boundSelected
       pendingSelected=nil
     end
@@ -190,16 +170,6 @@ function C.resolve(game,battle)
   local wanted=selected
   if selected=="auto" then
     wanted=(battle and (battle.kind=="wild" or battle.kind=="safari")) and "outdoor_wild" or "water"
-  elseif selected=="random" then
-    -- Random is a battle-start choice, not a per-frame choice. Status/menu
-    -- reads outside a battle never consume RNG; the concrete arena is bound
-    -- exactly once when the provider acquires this battle.
-    if battle then
-      boundResolved=boundResolved or chooseRandomArena()
-      wanted=boundResolved
-    else
-      wanted=lastRandomArena or "water"
-    end
   end
   local def=DEFINITIONS[wanted] or DEFINITIONS.water
   if not def.ready then def=DEFINITIONS.water end
@@ -210,13 +180,12 @@ function C.releaseBattle(battle)
   if not battle or boundBattle==battle then
     boundBattle=nil
     boundSelected=nil
-    boundResolved=nil
   end
 end
 
 function C.status(game,battle)
   local def,selected=C.resolve(game,battle)
-  return {enabled=C.enabled(game),selected=selected,resolved=def.id,cache=def.cache,runtimeSelected=runtimeSelected,pendingSelected=pendingSelected,boundSelected=boundSelected,boundResolved=boundResolved,lastRandomArena=lastRandomArena,boundBattle=boundBattle~=nil,definitions=DEFINITIONS}
+  return {enabled=C.enabled(game),selected=selected,resolved=def.id,cache=def.cache,runtimeSelected=runtimeSelected,pendingSelected=pendingSelected,boundSelected=boundSelected,boundBattle=boundBattle~=nil,definitions=DEFINITIONS}
 end
 
 return C

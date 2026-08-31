@@ -138,6 +138,26 @@ local function makeFacade(model)
     end
     return false
   end
+  -- Persistent 3D actors need a stronger distinction than the 2D picture
+  -- renderer: anim.hidden can be a transient blink/hide frame, while a move
+  -- such as Fly/Dig is a genuine field-visibility state. Expose only the latter
+  -- as an actor-level hide so CBE can ignore damage blinking without making a
+  -- vanished Pokemon visible.
+  function facade:actorHidden(battler)
+    local side=sideOf(self,battler)
+    if not side then return false end
+    -- picHidden/playerHidden/enemyHidden belong to the 2D picture layer and are
+    -- also used for damage blinking. They are deliberately NOT structural actor
+    -- visibility. Only the battle view's real vanished state may hide a 3D actor.
+    local view,mon=self._view,battler and battler.mon
+    if view and type(view.isVanished)=="function" then
+      -- Match the existing facade call convention: Gen-2 exposes this as a
+      -- plain function of the mon rather than a colon-method.
+      local ok,hidden=pcall(view.isVanished,mon)
+      if ok and hidden then return true end
+    end
+    return false
+  end
   function facade:fxFaintActive(battler)
     local side=sideOf(self,battler)
     local slide=self._view and self._view.faintSlide

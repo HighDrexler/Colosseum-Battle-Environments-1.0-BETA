@@ -6,7 +6,7 @@ local GEN1_START=table.concat({"Start","Menu"})
 local function prefs(game)
   if not (game and game.save) then
     return {
-      music="normal",arena="auto",arenasEnabled=true,cameraEnabled=true,
+      music="normal",arena="auto",arenasEnabled=true,cameraEnabled=true,pokemonModelsEnabled=true,
       playerModel="red",enemyTrainerModel="auto",rivalModel="leaf",
     }
   end
@@ -16,6 +16,11 @@ local function prefs(game)
   p.arenasEnabled=p.arenasEnabled and true or false
   if p.cameraEnabled==nil then p.cameraEnabled=true end
   p.cameraEnabled=p.cameraEnabled and true or false
+  -- Colosseum Pokemon ownership is independent from the arena/camera toggles.
+  -- ON means CBE's GC6E01 actors win presentation arbitration; OFF means CBE
+  -- declines them and the user's normal resolved sprite/model pipeline wins.
+  if p.pokemonModelsEnabled==nil then p.pokemonModelsEnabled=true end
+  p.pokemonModelsEnabled=p.pokemonModelsEnabled and true or false
 
   -- Migrate older boolean trainer settings into the current model selectors.
   local legacy=p.sprites
@@ -42,7 +47,7 @@ local function prefs(game)
   local validMusic={random=true,normal=true,first=true,cipher_peon=true,miror_b=true,cipher_admin=true,mirakle_b=true,semifinal=true,final=true,link1=true,link2=true,link3=true,original=true}
   if p.music=="colosseum" or p.music=="wild" or p.music=="trainer" or p.music=="gym" then p.music="normal" end
   if not validMusic[p.music] then p.music="normal" end
-  local validArena={auto=true,random=true,water=true,orre_colosseum=true,realgam_colosseum=true,outdoor_wild=true,mt_battle_summit=true}
+  local validArena={auto=true,water=true,orre_colosseum=true,realgam_colosseum=true,outdoor_wild=true,mt_battle_summit=true}
   if not validArena[p.arena] then p.arena="auto" end
   return p
 end
@@ -88,6 +93,7 @@ local function openBattleMenu(game,returnId,returnParent)
   local menu
   local environmentToggle={keepOpen=true}
   local cameraToggle={keepOpen=true}
+  local pokemonModelsToggle={keepOpen=true}
   local musicRow={keepOpen=true}
   local arenaRow={keepOpen=true}
   local playerTrainerRow={keepOpen=true}
@@ -97,6 +103,7 @@ local function openBattleMenu(game,returnId,returnParent)
   local function refresh()
     environmentToggle.label="COLOSSEUM ARENAS  "..(p.arenasEnabled and "ON" or "OFF")
     cameraToggle.label="COLOSSEUM CAMERA  "..(p.cameraEnabled and "ON" or "OFF")
+    pokemonModelsToggle.label="COLOSSEUM MODELS  "..(p.pokemonModelsEnabled and "ON" or "OFF")
     local musicLabel=(Music and Music.themeLabel and Music.themeLabel(game,p.music)) or tostring(p.music):upper()
     musicRow.label="MUSIC    "..musicLabel
     local arenaLabel="AUTO"
@@ -124,6 +131,10 @@ local function openBattleMenu(game,returnId,returnParent)
   end
   cameraToggle.onSelect=function()
     p.cameraEnabled=not p.cameraEnabled
+    refresh()
+  end
+  pokemonModelsToggle.onSelect=function()
+    p.pokemonModelsEnabled=not p.pokemonModelsEnabled
     refresh()
   end
   musicRow.onSelect=function()
@@ -246,11 +257,11 @@ local function openBattleMenu(game,returnId,returnParent)
   refresh()
   -- Trainer presentation is intentionally three independent ownership rows:
   -- player Red, ordinary/special enemy trainers, and the Kanto rival substitute.
-  local mainRows={environmentToggle,cameraToggle,musicRow,arenaRow,playerTrainerRow,enemyTrainerRow,rivalRow,cacheRow,back}
-  menu=Menu.new(game,mainRows,{tx=1,ty=2,tw=22,maxVisible=9,onCancel=function() reopen(game,returnId,returnParent) end})
+  local mainRows={environmentToggle,cameraToggle,pokemonModelsToggle,musicRow,arenaRow,playerTrainerRow,enemyTrainerRow,rivalRow,cacheRow,back}
+  menu=Menu.new(game,mainRows,{tx=1,ty=2,tw=24,maxVisible=10,onCancel=function() reopen(game,returnId,returnParent) end})
   menu.screenId="CbeBattleSettings"
   if BattleMenuUI and BattleMenuUI.mark then
-    BattleMenuUI.mark(menu,"COLOSSEUM BATTLE",mainRows,9,"ENVIRONMENT / CAMERA / AUDIO / TRAINERS / ROM SOURCE")
+    BattleMenuUI.mark(menu,"COLOSSEUM BATTLE",mainRows,10,"ENVIRONMENT / CAMERA / POKEMON / AUDIO / TRAINERS / ROM SOURCE")
   end
   game.stack:push(menu)
 end
@@ -287,13 +298,14 @@ function S.install(mod,trainer,music,arenaCatalog,battleMenuUI,cacheManager,trai
 end
 function S.prefs(game) return prefs(game) end
 function S.cameraEnabled(game) return prefs(game or (modRef and modRef.game)).cameraEnabled~=false end
+function S.pokemonModelsEnabled(game) return prefs(game or (modRef and modRef.game)).pokemonModelsEnabled~=false end
 function S.setCameraEnabled(game,value)
   local p=prefs(game or (modRef and modRef.game)); p.cameraEnabled=value~=false; return p.cameraEnabled
 end
 function S.status(game)
   local p=prefs(game or (modRef and modRef.game))
   return {
-    installed=installed,arenasEnabled=p.arenasEnabled,cameraEnabled=p.cameraEnabled,
+    installed=installed,arenasEnabled=p.arenasEnabled,cameraEnabled=p.cameraEnabled,pokemonModelsEnabled=p.pokemonModelsEnabled,
     music=p.music,musicLabel=Music and Music.themeLabel and Music.themeLabel(game,p.music),
     arena=p.arena,playerModel=p.playerModel,enemyTrainerModel=p.enemyTrainerModel,rivalModel=p.rivalModel,
     playerTrainerModel=p.playerTrainerModel,enemyTrainerModels=p.enemyTrainerModels,

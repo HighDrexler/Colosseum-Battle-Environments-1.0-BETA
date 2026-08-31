@@ -1,9 +1,40 @@
 local V = ...
 local mod, Mat4, Trainer, PlayerTrainer =
   V.mod, V.Mat4, V.Trainer, V.PlayerTrainer
+local CurrentSpriteModels=V.CurrentSpriteModels
 local ArenaCatalog=V.ArenaCatalog
 local GeneratedAssets=V.GeneratedAssets
 local A = {}
+
+local function cbePokemonModelsEnabled(ctx)
+  local settings=V.BattleSettings
+  if not (settings and type(settings.pokemonModelsEnabled)=="function") then return true end
+  local game=(ctx and ctx.game) or (ctx and ctx.battle and ctx.battle.game) or mod.game
+  local ok,value=pcall(settings.pokemonModelsEnabled,game)
+  return (not ok) or value~=false
+end
+
+local function standaloneContext(ctx)
+  return type(ctx)=="table" and type(ctx.services)=="table"
+    and ctx.services.cbeStandalone==true
+end
+
+local function installActorServices(ctx,actorVP,stageVP,w,h,figure,pose)
+  ctx.services=type(ctx.services)=="table" and ctx.services or {}
+  ctx.services.vp=actorVP
+  ctx.services.stageVP=stageVP
+  ctx.services.figureScale=figure
+  ctx.services.renderSize={width=w,height=h}
+  ctx.services.camera=ctx.services.camera or {}
+  if pose then ctx.services.camera.pose=pose end
+  ctx.services.project=function(x,y,z)
+    local cx=actorVP[1]*x+actorVP[2]*y+actorVP[3]*z+actorVP[4]
+    local cy=actorVP[5]*x+actorVP[6]*y+actorVP[7]*z+actorVP[8]
+    local cw=actorVP[13]*x+actorVP[14]*y+actorVP[15]*z+actorVP[16]
+    if not cw or cw<=1e-6 then return nil end
+    return (cx/cw*.5+.5)*w,(cy/cw*.5+.5)*h
+  end
+end
 
 local FORMAT = {
   {"VertexPosition","float",3},
@@ -364,19 +395,10 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
         shaded *= 0.994 + outer*(0.006 + 0.010*venueSweep);
         shaded += vec3(0.004,0.010,0.015) * outer * (0.30 + 0.70*waterBounce);
       } else if (sceneProfile > 1.5 && sceneProfile < 2.5) {
-        /* Platform 100: neutral volcanic haze plus a low orange bounce from
-           the exposed caldera. Keep the battle disc metallic while the outer
-           D2 rock, lava and steel carry the source venue color. */
-        float low = 1.0-smoothstep(8.0,32.0,worldPos.y);
-        float lavaBeat=.5+.5*sin(sceneTime*.43+worldPos.x*.013);
-        shaded *= .996 + outer*.008*venueSweep;
-        shaded += vec3(.034,.011,.003)*outer*low*(.48+.52*lavaBeat);
-        // Sunset key from the open western horizon.  Subtle enough to preserve
-        // extracted materials, strong enough that rock/steel no longer feel
-        // lit by a neutral grey studio.
-        float sunsetFace=clamp(.5+.5*dot(n,normalize(vec3(.72,.18,-.42))),0.0,1.0);
-        shaded += vec3(.028,.010,.004)*outer*sunsetFace;
-        shaded += vec3(.008,.006,.008)*(1.0-low)*outer;
+        /* Source-backed Platform 100: do not add authored sunset/lava tint to
+           ordinary D2 surfaces. Exact GX textures + source material colors own
+           the rock, bridge and deck; only the common neutral light remains. */
+        shaded *= 1.0;
       } else if (sceneProfile > 2.5 && sceneProfile < 3.5) {
         /* Orre Colosseum: ancient sun-baked stone. Warm low-angle desert key
            reveals masonry relief while a cool blue sky fill prevents the bowl
@@ -430,8 +452,8 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
     float coolFace=clamp(.5+.5*dot(n,normalize(vec3(-.20,.72,.66))),0.0,1.0);
     shaded += vec3(.003,.009,.014)*wetStone*coolFace;
   } else if (sceneProfile > 1.5 && sceneProfile < 2.5 && materialMode < .5) {
-    float ashBreak=.5+.5*sin(worldPos.x*.043-worldPos.z*.057+worldPos.y*.018);
-    shaded *= .985+.020*ashBreak;
+    /* Source-backed D2 opaque materials stay ungraded. */
+    shaded *= 1.0;
   }
 
   /* 0.0.49 all-arena fidelity sweep.  These are low-amplitude, world-space
@@ -455,12 +477,8 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
       shaded += vec3(.007,.014,.003)*canopy*(.35+.65*hemi);
       shaded -= vec3(.004,.002,0.0)*(1.0-canopy);
     } else if (sceneProfile > 1.5 && sceneProfile < 2.5) {
-      /* Mt. Battle: ash staining, warm low lava bounce, cooler exposed steel. */
-      float ash=.5+.5*sin(worldPos.x*.059-worldPos.z*.044+worldPos.y*.028);
-      float low=1.0-smoothstep(12.0,42.0,worldPos.y);
-      shaded *= .974+.030*ash;
-      shaded += vec3(.018,.005,.0015)*low*(.30+.70*micro);
-      shaded += vec3(.002,.004,.007)*(1.0-low)*(1.0-ash);
+      /* No procedural ash/tint pass on source D2 materials. */
+      shaded *= 1.0;
     } else if (sceneProfile > 2.5 && sceneProfile < 3.5) {
       /* Orre Colosseum: layered sandstone tone, age-darkened seams, and sun
          bleaching.  This keeps the ancient bowl from reading as one flat tan. */
@@ -486,13 +504,8 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
       shaded *= .982+.022*leafShadow;
       shaded += vec3(.004,.009,.002)*upFace*leafShadow;
     } else if (sceneProfile > 1.5 && sceneProfile < 2.5) {
-      // Mt. Battle: restrained lava bounce at low elevation and cool open-sky fill.
-      float lowMt=1.0-smoothstep(18.0,58.0,worldPos.y);
-      float mtMacroA=.5+.5*sin(worldPos.x*.047+worldPos.z*.061+worldPos.y*.019);
-      float mtMacroB=.5+.5*sin(worldPos.x*.113-worldPos.z*.037+worldPos.y*.071);
-      float mtMicro=clamp(mtMacroA*.62+mtMacroB*.38,0.0,1.0);
-      shaded += vec3(.010,.003,.001)*lowMt*(.35+.65*mtMicro);
-      shaded += vec3(.002,.003,.005)*upFace*(1.0-lowMt);
+      // Source D2 texture/material state owns Mt. Battle's local colour.
+      shaded *= 1.0;
     } else if (sceneProfile > 2.5 && sceneProfile < 3.5) {
       // Orre: one physically consistent late-day key from the world-space sun,
       // warm desert bounce below, blue fill above. This same vector is used by
@@ -570,14 +583,14 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
     ? smoothstep(98.0,106.0,arenaRadius)
     : smoothstep(sceneRadiusWorld*.82,sceneRadiusWorld*.98,arenaRadius);
   float fog = max(distanceFog,edgeFog);
-  vec3 fogColor = summitProfile ? vec3(.46,.34,.34)
+  vec3 fogColor = summitProfile ? vec3(.50,.52,.54)
     : (orreProfile ? vec3(.63,.46,.31)
     : (realgamProfile ? vec3(.64,.47,.25)
     : (sceneProfile > .5 ? vec3(.52,.64,.64) : vec3(.10,.19,.27))));
   if (materialMode > 3.5 && materialMode < 4.5)
     shaded = mix(shaded,fogColor,fog*.10);
   else if (!(materialMode > .5 && materialMode < 1.5))
-    shaded = mix(shaded,fogColor,fog*(summitProfile ? .075 : (orreProfile ? .27 : (realgamProfile ? .22 : (sceneProfile > .5 ? .36 : .42)))));
+    shaded = mix(shaded,fogColor,fog*(summitProfile ? .055 : (orreProfile ? .27 : (realgamProfile ? .22 : (sceneProfile > .5 ? .36 : .42)))));
 
   if (materialMode > 2.5) a = 1.0;
   return vec4(clamp(shaded,vec3(0.0),vec3(1.0)),clamp(a,0.0,1.0));
@@ -587,6 +600,7 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
 local scene, shader, white
 local canvas, cw, ch
 local errorText
+local renderErrors={}
 local activeDef=nil
 local STAGE_SCALE = 0.25
 local STAGE_YAW = 0
@@ -788,7 +802,6 @@ local function materialDetail(g)
   -- banner-on-stone sheets. Crowd sprites, water and effects stay untouched.
   if path:find("tex_05c560_",1,true) or path:find("tex_05db60_",1,true) or
      path:find("tex_08bb60_",1,true) or path:find("tex_0abb60_",1,true) or
-     path:find("cache/stages/d2_crater/textures/",1,true) or
      path:find("cache/stages/wildlands/ground_",1,true) or path:find("cache/stages/wildlands/bark_",1,true) or
      path:find("cache/stages/orre/",1,true) or path:find("cache/stages/realgam/",1,true) then
     return 1
@@ -811,17 +824,16 @@ local function materialMode(g,tex)
       or path:find("cache/stages/d2_crater/textures/tex_0ea920_",1,true) then
     return 5 -- authentic D2 crater lava / lava-fall material
   end
-  -- Distinguish Mt. Battle geology and manufactured deck materials inside the
-  -- otherwise shared opaque path. The small sub-0.5 modes retain texture
-  -- sharpening, normal lighting, depth and fog while allowing a venue-specific
-  -- finish instead of grading rock and steel as the same grey surface.
+  -- D2 rock/deck/bridge surfaces now come from the exact HSD scene with their
+  -- source diffuse/ambient/material state. Do not re-grade those atlases with
+  -- the old procedural "basalt" and "steel" looks; normal mode lets the source
+  -- textures, UVs and material colors define the venue. Lava/cutout helpers
+  -- below still get portable runtime equivalents for GameCube-only TEV effects.
   if path:find("cache/stages/d2_crater/textures/tex_0ce920_",1,true)
-      or path:find("cache/stages/d2_crater/textures/tex_061ec0_",1,true) then
-    return 0.15 -- volcanic rock
-  end
-  if path:find("cache/stages/d2_crater/textures/tex_0f4120_",1,true)
+      or path:find("cache/stages/d2_crater/textures/tex_061ec0_",1,true)
+      or path:find("cache/stages/d2_crater/textures/tex_0f4120_",1,true)
       or path:find("cache/stages/d2_crater/textures/tex_07cec0_",1,true) then
-    return 0.25 -- summit deck / trim
+    return 0
   end
   if path:find("tex_0cbb60_",1,true) then return 2 end -- waterfall glint
   if path:find("tex_0cdb60_",1,true) or path:find("tex_081b60_",1,true) then return 1 end -- water
@@ -849,6 +861,11 @@ local function dropGhostLayer(g)
   -- One giant translucent 512x512 source sheet sits across the high bowl. It is
   -- a compositing layer, not useful battle geometry in our flattened renderer.
   if path:find("tex_05db60_",1,true) and g.xlu and g.noz then return true end
+  -- T1's 055ec0 group is the giant authored sky card. We already render the
+  -- exact source texture as the arena backdrop; retaining the 4k-unit world
+  -- card after lifting Orre's distance limits would double the sky and can pass
+  -- through the camera. Keep the texture, omit only that world-space carrier.
+  if path:find("cache/stages/orre/source/tex_055ec0_",1,true) then return true end
   -- D4's 0d4560 sheet is a TEV/shadow-composite silhouette. In CBE's
   -- flattened material path it becomes a huge translucent floating decal, so
   -- omit that effect plane while preserving the surrounding source structure.
@@ -958,7 +975,21 @@ local function viewProjection(ctx,w,h)
   local eye,focus=pose.eye,pose.focus
   local dx,dy,dz=eye[1]-focus[1],eye[2]-focus[2],eye[3]-focus[3]
   local dist=math.max(2,math.sqrt(dx*dx+dy*dy+dz*dz))
-  local near=math.max(0.40,dist*0.007); local far=math.max(345,dist+265)
+  local near=math.max(0.40,dist*0.007)
+  -- D2's source stage carries crater/background geometry much farther from the
+  -- battle disc than the old procedural Platform 100 rebuild. Give that exact
+  -- scenery enough depth range instead of clipping it at the generic 345-unit
+  -- arena plane.
+  local profile=(activeDef and activeDef.profile) or "water"
+  local baseFar=(profile=="summit" and 1450)
+    or (profile=="realgam" and 1200)
+    or (profile=="orre" and 760)
+    or 345
+  local tail=(profile=="summit" and 1320)
+    or (profile=="realgam" and 1050)
+    or (profile=="orre" and 650)
+    or 265
+  local far=math.max(baseFar,dist+tail)
   local p=Mat4.perspective(pose.fov,w/h,near,far)
   p=Mat4.mul(Mat4.scale(1,-1,1),p)
   return Mat4.mul(p,Mat4.lookAt(eye,focus,{0,1,0})), pose
@@ -1071,68 +1102,18 @@ local function drawBackdrop(w,h,vp)
     love.graphics.setColor(1,1,1,1)
     return
   elseif profile=="summit" then
-    -- Late-day Mt. Battle: deep blue-violet high sky rolling into a muted
-    -- orange/rose horizon and pale cloud sea. The D2 sky/cloud cache remains the
-    -- authored texture foundation; screen-space grading only establishes time of
-    -- day and atmospheric depth behind the 3D summit.
-    local skyEntry,cloudEntry
-    if scene and scene.textures then
-      skyEntry=texture({path="cache/stages/d2_crater/textures/tex_0c2120_256x256_f14.rgba",w=256,h=256},scene.textures)
-      cloudEntry=texture({path="cache/stages/d2_crater/textures/tex_0d6920_128x128_f1.rgba",w=128,h=128},scene.textures)
-    end
-    local zen={.055,.085,.20}; local mid={.25,.24,.36}; local hor={.88,.39,.20}; local low={.66,.31,.25}
+    -- Mt. Battle is source-backed now. The HSD stage itself owns the mountain,
+    -- bridge, crater silhouettes, sky-facing cards and every decoded GX texture.
+    -- Keep screen-space background treatment deliberately neutral so it cannot
+    -- recolour the source venue into the invented sunset used by the procedural
+    -- rebuild. This gradient exists only behind holes/open horizon in the stage.
+    local a={.30,.38,.49};local b={.72,.72,.69}
     for i=0,bands-1 do
-      local t=(i+.5)/bands; local col
-      if t<.56 then
-        local q=t/.56;q=q*q*(3-2*q)
-        col={zen[1]+(mid[1]-zen[1])*q,zen[2]+(mid[2]-zen[2])*q,zen[3]+(mid[3]-zen[3])*q}
-      elseif t<.82 then
-        local q=(t-.56)/.26;q=q*q*(3-2*q)
-        col={mid[1]+(hor[1]-mid[1])*q,mid[2]+(hor[2]-mid[2])*q,mid[3]+(hor[3]-mid[3])*q}
-      else
-        local q=(t-.82)/.18;q=q*q*(3-2*q)
-        col={hor[1]+(low[1]-hor[1])*q,hor[2]+(low[2]-hor[2])*q,hor[3]+(low[3]-hor[3])*q}
-      end
-      love.graphics.setColor(col[1],col[2],col[3],1)
+      local t=(i+.5)/bands;local q=t*t*(3-2*t)
       local y=math.floor(i*h/bands);local y2=math.ceil((i+1)*h/bands)
+      love.graphics.setColor(a[1]+(b[1]-a[1])*q,a[2]+(b[2]-a[2])*q,a[3]+(b[3]-a[3])*q,1)
       love.graphics.rectangle("fill",0,y,w,math.max(1,y2-y+1))
     end
-    if skyEntry and skyEntry.image then
-      love.graphics.setColor(.73,.70,.82,.13)
-      love.graphics.draw(skyEntry.image,0,0,0,w/256,h/256)
-    end
-
-    -- Fixed world-space sun. Small enough to read as part of the horizon rather
-    -- than a UI glow, and stable through dynamic camera cuts.
-    local sx,sy=projectWorldToBackdrop(vp,-246.0,42.0,72.0,w,h)
-    if sx and sy and sx>-w*.12 and sx<w*1.12 and sy>-h*.12 and sy<h*.72 then
-      love.graphics.setColor(1.00,.38,.12,.030); love.graphics.ellipse("fill",sx,sy,w*.12,h*.105)
-      love.graphics.setColor(1.00,.57,.20,.065); love.graphics.ellipse("fill",sx,sy,w*.066,h*.060)
-      love.graphics.setColor(1.00,.80,.47,.20); love.graphics.ellipse("fill",sx,sy,w*.020,h*.019)
-    end
-
-    if cloudEntry and cloudEntry.image then
-      -- Upper banks stay cool; low banks catch the same warm sunset as the rock.
-      local d1=(sceneTime*1.35)%(w*.78)
-      love.graphics.setColor(.68,.69,.80,.075)
-      love.graphics.draw(cloudEntry.image,-w*.31+d1,h*.10,0,w/128*.95,h/128*.25)
-      love.graphics.draw(cloudEntry.image, w*.43+d1-w*.78,h*.18,0,w/128*.86,h/128*.22)
-      local d2=(sceneTime*.72)%(w*.90)
-      love.graphics.setColor(1.00,.63,.48,.105)
-      love.graphics.draw(cloudEntry.image,-w*.39-d2,h*.55,0,w/128*1.20,h/128*.26)
-      love.graphics.draw(cloudEntry.image, w*.59-d2,h*.60,0,w/128*1.12,h/128*.24)
-    end
-
-    -- Bright cloud sea below the crater silhouette, warm at the horizon and
-    -- rapidly fading toward neutral grey so it does not veil foreground assets.
-    local horizon=h*.73
-    for i=0,25 do
-      local q=i/25;local y=horizon+q*(h-horizon)
-      love.graphics.setColor(.91-.12*q,.64-.19*q,.53-.18*q,.14-.075*q)
-      love.graphics.rectangle("fill",0,y,w,math.ceil((h-horizon)/25)+2)
-    end
-    love.graphics.setColor(.24,.12,.15,.055)
-    love.graphics.rectangle("fill",0,h*.91,w,h*.09)
     love.graphics.setColor(1,1,1,1)
     return
   elseif profile=="realgam" then
@@ -1324,6 +1305,19 @@ function A:arena(ctx)
   log(ctx,"info","arena acquire selected=%s resolved=%s cache=%s",tostring(selected),tostring(activeArenaId),tostring(def.cache))
   return arena
 end
+function A:prewarm(ctx)
+  ctx=type(ctx)=="table" and ctx or {}
+  local arena=self:arena(ctx)
+  if not arena then return false,"arena unavailable" end
+  local scene0,err=loadScene(ctx)
+  if not scene0 then return false,err end
+  local w,h=pixelSize()
+  if w and h and w>0 and h>0 then pcall(ensureCanvas,w,h) end
+  if Trainer and type(Trainer.prewarm)=="function" then pcall(Trainer.prewarm,Trainer,ctx) end
+  if PlayerTrainer and type(PlayerTrainer.prewarm)=="function" then pcall(PlayerTrainer.prewarm,PlayerTrainer,ctx) end
+  return true,arena
+end
+
 function A:begin(ctx,arena)
   sceneTime=0
   if arena and arena._cbeArenaId and arena._cbeArenaId~=activeArenaId then
@@ -1339,6 +1333,17 @@ function A:begin(ctx,arena)
     local okPlayer,playerErr=PlayerTrainer:begin(ctx)
     if okPlayer==false then log(ctx,"error","Red actor unavailable: %s",tostring(playerErr)) end
   end
+  -- Gold already reaches CurrentSpriteModels through CBE's standalone host.
+  -- StadiumBattleFX's Gen 1 compositor historically selected its own model
+  -- provider first, which let Battle Art suddenly replace CBE at 1x speed.
+  -- In the delegated host, initialize the exact same CBE actor session here;
+  -- Arena.render owns the draw pass below whenever COLOSSEUM MODELS is ON.
+  if CurrentSpriteModels and cbePokemonModelsEnabled(ctx) and not standaloneContext(ctx) then
+    local okModels,accepted=pcall(CurrentSpriteModels.begin,CurrentSpriteModels,ctx)
+    if not okModels or accepted==false then
+      log(ctx,"warn","delegated CBE Pokemon actor begin failed open: %s",tostring(accepted))
+    end
+  end
   updateAnchors(arena)
   return true
 end
@@ -1346,6 +1351,9 @@ function A:update(ctx,dt,arena)
   sceneTime=sceneTime+(tonumber(dt) or 0)
   if Trainer then Trainer:update(ctx,dt) end
   if PlayerTrainer then PlayerTrainer:update(ctx,dt) end
+  if CurrentSpriteModels and cbePokemonModelsEnabled(ctx) and not standaloneContext(ctx) then
+    pcall(CurrentSpriteModels.update,CurrentSpriteModels,ctx,dt)
+  end
   updateAnchors(arena)
 end
 function A:render(ctx,arena,drawActors)
@@ -1381,13 +1389,39 @@ function A:render(ctx,arena,drawActors)
     -- actorVP applies their global figure scale without touching the trainer.
     love.graphics.setShader()
     love.graphics.setColor(1,1,1,1)
-    drawActors({vp=actorVP,stageVP=vp,figureScale=figureScale,groundY=0,width=w,height=h})
+    local actorOk,actorErr
+    if CurrentSpriteModels and cbePokemonModelsEnabled(ctx) then
+      -- CBE model ownership is absolute inside a CBE arena.  Render the same
+      -- CurrentSpriteModels service in both generations instead of accepting
+      -- whichever model provider StadiumBattleFX happened to select for Gen 1.
+      -- This decision depends only on battle/settings state, never battle speed.
+      installActorServices(ctx,actorVP,vp,w,h,figureScale,pose)
+      actorOk,actorErr=pcall(CurrentSpriteModels.drawWorld,CurrentSpriteModels,ctx)
+    else
+      actorOk,actorErr=pcall(drawActors,{vp=actorVP,stageVP=vp,figureScale=figureScale,groundY=0,width=w,height=h})
+    end
+    if actorOk then renderErrors.actors=nil else
+      renderErrors.actors=tostring(actorErr)
+      -- Actor/MoveFX presentation must fail open INSIDE the already-rendered
+      -- arena.  Aborting the whole canvas here exposed Gen2's black/native
+      -- battle layer for one frame and turned transient FX faults into flashes.
+      pcall(love.graphics.setShader);pcall(love.graphics.setDepthMode,"lequal",true)
+      log(ctx,"warn","actor/MoveFX pass failed open: %s",tostring(actorErr))
+    end
 
     -- 4) Boss trainer model: independent human scale, shared scene depth.
-    if PlayerTrainer then PlayerTrainer:draw(ctx,vp,pose) end
-    if PlayerTrainer and type(PlayerTrainer.drawBall)=="function" then PlayerTrainer:drawBall(ctx,vp,pose) end
-    if Trainer then Trainer:draw(ctx,vp,pose) end
-    if Trainer and type(Trainer.drawBall)=="function" then Trainer:drawBall(ctx,vp,pose) end
+    local function safeTrainer(label,obj,method,...)
+      if not (obj and type(obj[method])=="function") then return end
+      local okT,errT=pcall(obj[method],obj,...)
+      if okT then renderErrors[label]=nil else
+        renderErrors[label]=tostring(errT);pcall(love.graphics.setShader);pcall(love.graphics.setDepthMode,"lequal",true)
+        log(ctx,"warn","%s failed open: %s",label,tostring(errT))
+      end
+    end
+    safeTrainer("playerTrainer",PlayerTrainer,"draw",ctx,vp,pose)
+    safeTrainer("playerBall",PlayerTrainer,"drawBall",ctx,vp,pose)
+    safeTrainer("enemyTrainer",Trainer,"draw",ctx,vp,pose)
+    safeTrainer("enemyBall",Trainer,"drawBall",ctx,vp,pose)
 
     -- 5) Water/glass/NO_ZUPDATE material groups are camera-sorted and then
     -- composited without depth writes, preserving actors behind transparency.
@@ -1415,14 +1449,14 @@ function A:finish(ctx,reason)
 end
 function A:invalidate() canvas=nil;cw=nil;ch=nil end
 function A:resetRuntime()
-  scene=nil;shader=nil;white=nil;canvas=nil;cw=nil;ch=nil;errorText=nil;sceneTime=0
+  scene=nil;shader=nil;white=nil;canvas=nil;cw=nil;ch=nil;errorText=nil;renderErrors={};sceneTime=0
   if Trainer and type(Trainer.resetRuntime)=="function" then pcall(Trainer.resetRuntime,Trainer) end
   if PlayerTrainer and type(PlayerTrainer.resetRuntime)=="function" then pcall(PlayerTrainer.resetRuntime,PlayerTrainer) end
   return true
 end
 function A:status()
   return {
-    ready=scene~=nil,error=errorText,
+    ready=scene~=nil,error=errorText,renderErrors=renderErrors,
     opaque=scene and #scene.opaque or 0,
     cutout=scene and #scene.cutout or 0,
     crowd=scene and #scene.crowd or 0,

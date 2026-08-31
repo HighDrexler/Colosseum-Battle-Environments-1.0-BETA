@@ -1,4 +1,5 @@
 local V = ...
+local BattleDirector=V.BattleDirector
 local GeneratedAssets=V.GeneratedAssets
 local mod, Mat4, TrainerRig = V.mod, V.Mat4, V.TrainerRig
 local TrainerPerformance=V.TrainerPerformance
@@ -56,10 +57,12 @@ vec4 position(mat4 transform_projection, vec4 vertex_position) {
   // Source boss poses are model-specific silhouettes, not rigid
   // action-figure endpoints.  Keep enough morph authority to read the pose,
   // but let the pelvis/torso performance carry more of the gesture.
-  float wa=max(armMix,0.0)*0.46*sourcePoseGain, ws=max(shiftMix,0.0)*0.58*sourcePoseGain, wt=max(settleMix,0.0)*0.48*sourcePoseGain;
-  float wc=max(commandMix,0.0)*0.57*sourcePoseGain, wb=max(braceMix,0.0)*0.52*sourcePoseGain;
+  float wa=max(armMix,0.0)*1.00*sourcePoseGain, ws=max(shiftMix,0.0)*0.96*sourcePoseGain, wt=max(settleMix,0.0)*0.90*sourcePoseGain;
+  float wc=max(commandMix,0.0)*1.00*sourcePoseGain, wb=max(braceMix,0.0)*0.96*sourcePoseGain;
   float sum=wa+ws+wt+wc+wb;
-  float action=clamp(sum,0.0,1.0);
+  // Native B1 source poses now own decisive gestures. Keep a small ceiling so
+  // interpolation/recovery remains smooth, but do not reduce them to pose hints.
+  float action=clamp(sum,0.0,0.84);
   if (sum>0.0001) {
     vec3 target=(ArmPosition*wa+ShiftPosition*ws+SettlePosition*wt+
                  CommandPosition*wc+BracePosition*wb)/sum;
@@ -67,7 +70,7 @@ vec4 position(mat4 transform_projection, vec4 vertex_position) {
   }
   // Breath and look are tiny secondary motion and fade almost completely
   // during decisive source-style battle gestures.
-  float secondary=1.0-action*0.94;
+  float secondary=1.0-action*0.92;
   p+=(BreathPosition-base)*breathMix*secondary;
   p+=(LookPosition-base)*lookMix*secondary;
   vec3 n = VertexNormal;
@@ -81,6 +84,8 @@ vec4 position(mat4 transform_projection, vec4 vertex_position) {
 local PIXEL = [[
 uniform vec3 cameraEye;
 uniform vec4 tintColor;
+uniform vec4 materialColor;
+uniform float useTexture;
 uniform float unlit;
 uniform float opacity;
 uniform float flipV;
@@ -89,9 +94,11 @@ varying vec3 worldNormal;
 vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
   vec2 sampleUV=vec2(uv.x,mix(uv.y,1.0-uv.y,flipV));
   vec4 texel = Texel(texture,sampleUV);
-  float a = texel.a * tintColor.a * opacity * color.a;
+  float texAlpha=mix(1.0,texel.a,useTexture);
+  float a = texAlpha * materialColor.a * tintColor.a * opacity * color.a;
   if (a < 0.08) discard;
-  if (unlit > 0.5) return vec4(tintColor.rgb,a);
+  vec3 sourceBase=mix(materialColor.rgb,texel.rgb,useTexture);
+  if (unlit > 0.5) return vec4(sourceBase*tintColor.rgb,a);
   vec3 n = normalize(worldNormal);
   vec3 lightDir = normalize(vec3(-0.42,0.82,0.38));
   float key = abs(dot(n,lightDir));
@@ -99,7 +106,7 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
   vec3 viewDir = normalize(cameraEye-worldPos);
   float rim = pow(1.0-clamp(abs(dot(n,viewDir)),0.0,1.0),2.4);
   float light = 0.72 + key*0.24 + hemi*0.07;
-  vec3 rgb = texel.rgb * light;
+  vec3 rgb = sourceBase * light;
   rgb += vec3(0.055,0.075,0.10)*rim;
   rgb = clamp((rgb-vec3(0.5))*1.035+vec3(0.5),vec3(0.0),vec3(1.0));
   return vec4(rgb*tintColor.rgb,a);
@@ -248,42 +255,6 @@ local function applyModelScale()
   end
 end
 
--- Dakim's cache carries a second, fully authored clip-1 idle frame in slots
--- 9..11. Promote that coherent source frame to every position stream instead
--- of trying to reconstruct his characteristic stance with limb masks. This is
--- deliberately all-or-nothing per vertex: triangles retain their source shape.
-local function dakimAuthoredIdle(vertices)
-  if currentModel~="dakim" then return vertices or {} end
-  local out={}
-  for i,v in ipairs(vertices or {}) do
-    local row={};for j=1,#v do row[j]=v[j] end
-    local x,y,z=tonumber(v[9]) or tonumber(v[1]) or 0,tonumber(v[10]) or tonumber(v[2]) or 0,tonumber(v[11]) or tonumber(v[3]) or 0
-    -- battleyama_b1's malformed rear shoulder shell occupies this exact band.
-    -- Compact it around the measured attachment instead of deleting triangles;
-    -- the result is a broad cap with intact UVs and no upward white tower.
-    if math.abs(x)>3 and y>25 and z< -2.4 then
-      local side=x>=0 and 1 or -1
-      local px,py,pz=side*4.786,21.87,-2.699
-      x=px+(x-px)*.35+side*.8
-      y=py+(y-py)*.35
-      z=pz+(z-pz)*.45
-    end
-    for _,base in ipairs({1,9,12,15,18,21,24,27}) do row[base],row[base+1],row[base+2]=x,y,z end
-    row[30]=0
-    out[i]=row
-  end
-  -- The shoulder shell changed shape, so rebuild flat face normals to keep the
-  -- compacted cap's lighting coherent with Dakim's faceted source art.
-  for i=1,#out,3 do if out[i+2] then
-    local a,b,c=out[i],out[i+1],out[i+2]
-    local ux,uy,uz=b[1]-a[1],b[2]-a[2],b[3]-a[3]
-    local vx,vy,vz=c[1]-a[1],c[2]-a[2],c[3]-a[3]
-    local nx,ny,nz=uy*vz-uz*vy,uz*vx-ux*vz,ux*vy-uy*vx
-    local n=math.sqrt(nx*nx+ny*ny+nz*nz)
-    if n>.000001 then nx,ny,nz=nx/n,ny/n,nz/n;for j=i,i+2 do out[j][6],out[j][7],out[j][8]=nx,ny,nz end end
-  end end
-  return out
-end
 
 local function loadScene(ctx)
   local cfg,reason=trainerModelFor(ctx)
@@ -304,18 +275,20 @@ local function loadScene(ctx)
   local textures={}; local groups={}
   for i,g in ipairs(cache.groups or {}) do
     local path=g.texture and g.texture.path
-    local img=textures[path]
-    if not img then
+    local img=path and textures[path] or nil
+    if path and not img then
       img,err=imageFromRaw(g.texture)
       if not img then errorText=tostring(err);return nil,errorText end
       textures[path]=img
     end
-    -- Every non-Dakim trainer passes through untouched. Dakim alone promotes
-    -- his complete authored idle sample; no positional membership mask exists.
-    local ok,mesh=pcall(love.graphics.newMesh,FORMAT,dakimAuthoredIdle(g.vertices),"triangles","static")
+    local ok,mesh=pcall(love.graphics.newMesh,FORMAT,g.vertices or {},"triangles","static")
     if not ok then errorText=(cfg.label or currentModel).." mesh "..i..": "..tostring(mesh);return nil,errorText end
-    mesh:setTexture(img)
-    groups[#groups+1]={mesh=mesh,material=g.material}
+    if img then mesh:setTexture(img) end
+    local d=g.diffuse or {1,1,1}
+    groups[#groups+1]={mesh=mesh,material=g.material,image=img,textured=img~=nil,
+      diffuse={tonumber(d[1]) or 1,tonumber(d[2]) or 1,tonumber(d[3]) or 1},
+      alpha=tonumber(g.alpha) or 1,xlu=g.xlu==true,noz=g.noz==true,
+      renderFlags=tonumber(g.renderFlags) or 0,shadow=g.shadow==true,effect=g.effect==true}
   end
   local ok,sh=pcall(love.graphics.newShader,VERTEX,PIXEL)
   if not ok or not sh then errorText=(cfg.label or currentModel).." shader: "..tostring(sh or "unavailable");return nil,errorText end
@@ -358,6 +331,11 @@ function T:setMode(game,mode)
   if off then p.enemyTrainerModel="off" elseif not p.enemyTrainerModel or p.enemyTrainerModel=="off" then p.enemyTrainerModel="auto" end
 end
 
+function T:prewarm(ctx)
+  local s,err=loadScene(ctx)
+  if s then pcall(ensureBall) end
+  return s~=nil,err
+end
 function T:shouldRender(ctx)
   local b=battleOf(ctx)
   if not b or b.kind~="trainer" then return false end
@@ -477,18 +455,28 @@ end
 
 function T:event(ctx,name,payload)
   payload=type(payload)=="table" and payload or {}
+  local b0=battleOf(ctx)
+  local gen2=b0 and b0.__cbeGeneration==2
+  local queueSync=gen2 and b0.__cbePresentationQueueSync==true
+  if queueSync and (name=="battle.move_used" or name=="battle.damage_dealt" or name=="battle.fainted") then return end
+  local semantic=name
+  if name=="battle.presentation_damage" then semantic="battle.damage_dealt"
+  elseif name=="battle.presentation_faint" then semantic="battle.fainted" end
   if not activeNow then return end
-  if name=="battle.move_used" then
+  if semantic=="battle.move_used" or name=="battle.presentation_move" then
     local actor=payloadSide(ctx,payload,{"user","attacker","source","battler","side"})
     if actor=="enemy" and not pendingFrustration then trigger("command",1.0) end
-  elseif name=="battle.damage_dealt" then
+  elseif semantic=="battle.damage_dealt" then
     local target=payloadSide(ctx,payload,{"target","defender","targetSide","defenderSide"})
     if not target then local actor=payloadSide(ctx,payload,{"user","attacker","source","side"});target=other(actor) end
     if target=="enemy" then
       local b=battleOf(ctx);local dmg=tonumber(payload.damage) or 0
       local maxhp=b and b.enemy and b.enemy.mon and b.enemy.mon.stats and tonumber(b.enemy.mon.stats.hp) or 1
       local ratio=dmg/math.max(1,maxhp)
-      trigger(ratio>=0.28 and "concern" or "brace",ratio>=0.28 and 1.0 or .78)
+      -- Tiny chip hits do not make the trainer flinch on every contact. Source
+      -- reactions are reserved for readable battle beats; large hits escalate.
+      if ratio>=.30 then trigger("concern",1.0)
+      elseif ratio>=.085 then trigger("brace",.70) end
     end
   elseif name=="battle.status_inflicted" then
     local target=payloadSide(ctx,payload,{"target","battler","side","targetSide"})
@@ -497,10 +485,20 @@ function T:event(ctx,name,payload)
     -- AI switch events can lead the actual enemySendingOut phase. Arm the
     -- performance, but let update() start it on the authoritative phase edge.
     local switched=payloadSide(ctx,payload,{"side","battler","target","switchedSide"})
-    if switched=="enemy" then initialSendoutQueued=false end
-  elseif name=="battle.fainted" then
+    if switched=="enemy" then
+      initialSendoutQueued=false
+      local previous=payload.previous or payload.oldBattler
+      local mon=type(previous)=="table" and (previous.mon or previous) or nil
+      local hp=mon and tonumber(mon.hp)
+      if hp==nil or hp>0 then trigger("recall",.96) end
+    end
+  elseif semantic=="battle.fainted" then
     local fainted=payloadSide(ctx,payload,{"battler","target","side","faintedSide","targetSide"})
-    if fainted=="enemy" then pendingFrustration=0.24 end
+    if fainted=="enemy" then
+      local fd=BattleDirector and type(BattleDirector.faintDuration)=="function"
+        and BattleDirector:faintDuration(ctx,"enemy") or nil
+      pendingFrustration=math.max(.52,math.min(1.35,(tonumber(fd) or 1.0)*.80))
+    end
   elseif name=="battle.ended" then
     local b=battleOf(ctx);local result=payload.result or payload.outcome or (b and b.result)
     if result=="lose" or result=="loss" or result=="defeat" then trigger("victory",1.0)
@@ -542,8 +540,10 @@ local function setShader(vp,model,pose,unlit,tint,opacity,motion)
   shader:send("unlit",unlit or 0)
   shader:send("tintColor",tint or {1,1,1,1})
   shader:send("opacity",opacity or 1)
+  shader:send("materialColor",{1,1,1,1})
+  shader:send("useTexture",1)
   shader:send("flipV",currentModel=="miror_b" and 1 or 0)
-  local breathMix=currentModel=="dakim" and 0 or (motion.breath or 0)
+  local breathMix=motion.breath or 0
   shader:send("breathMix",breathMix)
   shader:send("lookMix",motion.look or 0)
   shader:send("armMix",motion.arm or 0)
@@ -551,7 +551,7 @@ local function setShader(vp,model,pose,unlit,tint,opacity,motion)
   shader:send("settleMix",motion.settle or 0)
   shader:send("commandMix",motion.command or 0)
   shader:send("braceMix",motion.brace or 0)
-  shader:send("sourcePoseGain",1+(tonumber(motion.sourceAuthority) or 0)*.28)
+  shader:send("sourcePoseGain",1)
 end
 
 function T:drawShadow(ctx,vp,pose)
@@ -583,7 +583,16 @@ function T:draw(ctx,vp,pose)
   if love.graphics.setMeshCullMode then love.graphics.setMeshCullMode("none") end
   love.graphics.setColor(1,1,1,1)
   setShader(vp,model,pose,0,{1,1,1,1},smooth(p.progress/0.40),motion)
-  for _,g in ipairs(s.groups) do love.graphics.draw(g.mesh) end
+  -- Retain source HSD material/pass semantics. Opaque groups write depth; XLU
+  -- and NO_ZUPDATE helper/effect surfaces blend without corrupting the world Z.
+  for _,grp in ipairs(s.groups) do
+    local d=grp.diffuse or {1,1,1}
+    shader:send("materialColor",{d[1] or 1,d[2] or 1,d[3] or 1,grp.alpha or 1})
+    shader:send("useTexture",grp.textured and 1 or 0)
+    if love.graphics.setDepthMode then love.graphics.setDepthMode("lequal",not (grp.noz or grp.xlu)) end
+    love.graphics.draw(grp.mesh)
+  end
+  if love.graphics.setDepthMode then love.graphics.setDepthMode("lequal",true) end
   love.graphics.setShader()
 end
 

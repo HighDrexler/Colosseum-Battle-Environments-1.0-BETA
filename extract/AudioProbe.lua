@@ -3,23 +3,8 @@ local FSYS=V.FSYS
 local A={}
 local serial=0
 
-local function platformName()
-  if love and love.system and type(love.system.getOS)=="function" then
-    local ok,name=pcall(love.system.getOS)
-    if ok and type(name)=="string" and name~="" then return name end
-  end
-  return "Unknown"
-end
-
-function A.capabilities()
-  -- Beta.42 removes the host-executable contract. Every platform enters the
-  -- same Lua/LuaJIT compute worker and renders MusyX source in-process.
-  return {platform=platformName(),inProcessRenderer=true,mode="musyx-in-process-alpha",sampleRate=32000}
-end
-
--- loopFrame is the previously validated 48-kHz loop-frame reference. The
--- in-process renderer derives the loop from each SNG tempo table and checks
--- the result against this reference before caching audio.
+-- loopFrame is the sequence header's loopStartTick integrated through its
+-- tempo table at 48 kHz. It is format metadata, not copied audio.
 local THEMES={
   {source="battle5_song",setup=51,loopFrame=7181,intro="assets/audio/themes/normal_battle_intro.wav",loop="assets/audio/themes/normal_battle_loop.wav"},
   {source="battle8_song",setup=4,loopFrame=493908,intro="assets/audio/themes/first_battle_intro.wav",loop="assets/audio/themes/first_battle_loop.wav"},
@@ -32,6 +17,13 @@ local THEMES={
   {source="tool_battle1_song",setup=20,loopFrame=468525,intro="assets/audio/themes/link_1_intro.wav",loop="assets/audio/themes/link_1_loop.wav"},
   {source="tool_battle2_song",setup=21,loopFrame=482190,intro="assets/audio/themes/link_2_intro.wav",loop="assets/audio/themes/link_2_loop.wav"},
   {source="tool_battle3_song",setup=22,loopFrame=444292,intro="assets/audio/themes/link_3_intro.wav",loop="assets/audio/themes/link_3_loop.wav"},
+}
+
+
+local ONE_SHOTS={
+  -- bgm_archive.fsys index/setup 9 is the retail Colosseum Snag-success jingle.
+  -- Render it from the user's own disc exactly like the existing battle themes.
+  {source="me_snatch_song",setup=9,output="assets/audio/capture/me_snatch.wav"},
 }
 
 local function memberMap(archive)
@@ -97,19 +89,15 @@ local function render(mod,payload,progress,generated)
       if message.kind=="source" then
         active=tostring(message.source or "audio source")
         activeAt=now()
-        progress(("AUDIO %d/23 / %s"):format(complete,active),complete,23)
-      elseif message.kind=="progress" then
-        active=tostring(message.label or message.source or active)
-        activeAt=now()
-        progress(("AUDIO %d/23 / %s"):format(complete,active),complete,23)
+        progress(("AUDIO %d/24 / %s"):format(complete,active),complete,24)
       elseif message.kind=="asset" then
         writeAsset(mod,tostring(message.path),message.bytes,generated)
         complete=complete+1
-        progress(("AUDIO %d/23 / %s"):format(complete,tostring(message.source or message.path)),complete,23)
+        progress(("AUDIO %d/24 / %s"):format(complete,tostring(message.source or message.path)),complete,24)
       elseif message.kind=="error" then
         error(("audio source %s: %s"):format(tostring(message.source or active),tostring(message.error or "conversion failed")),0)
       elseif message.kind=="done" then
-        assert(complete==23,("audio renderer completed with %d/23 cached assets"):format(complete))
+        assert(complete==24,("audio renderer completed with %d/24 cached assets"):format(complete))
         input:clear();output:clear()
         return complete
       end
@@ -119,21 +107,37 @@ local function render(mod,payload,progress,generated)
     local t=now()
     if t-lastHeartbeat>=0.20 then
       lastHeartbeat=t
-      progress(("AUDIO %d/23 / %s / %ds"):format(complete,active,math.floor(t-activeAt)),complete,23)
+      progress(("AUDIO %d/24 / %s / %ds"):format(complete,active,math.floor(t-activeAt)),complete,24)
     end
     if love.timer and love.timer.sleep then love.timer.sleep(0.04) end
   end
 end
 
+
+function A.platformSupported()
+  local osName=nil
+  if love and love.system and type(love.system.getOS)=="function" then
+    local ok,v=pcall(love.system.getOS);if ok then osName=tostring(v or "") end
+  end
+  -- The bundled Amuse renderer is a Windows executable. Android/iOS/macOS/Linux
+  -- must never be sent through cmd.exe; visuals remain fully usable without it.
+  if osName=="" or osName==nil then return true,"unknown" end
+  return osName=="Windows",osName
+end
 function A.run(mod,disc,progress,generated)
   progress=progress or function()end
-  local caps=A.capabilities()
-  progress(("AUDIO 0/23 / %s / in-process MusyX"):format(caps.platform),0,23)
+  local supported,osName=A.platformSupported()
+  assert(supported,("Colosseum music conversion is unavailable on %s; visual CBE runtime remains supported"):format(tostring(osName or "this platform")))
+  progress("AUDIO 0/24 / locating MusyX sources",0,24)
   local commonFile=assert(disc:file("common.fsys"),"audio source common.fsys: archive missing")
   local bgmFile=assert(disc:file("bgm_archive.fsys"),"audio source bgm_archive.fsys: archive missing")
   local common=FSYS.open(disc,commonFile)
   local bgm=FSYS.open(disc,bgmFile)
   local commonMembers,bgmMembers=memberMap(common),memberMap(bgm)
+
+  local renderer=mod:read("third_party/amuse/amuserender.exe")
+  assert(type(renderer)=="string" and #renderer>0,
+    "audio renderer third_party/amuse/amuserender.exe: bundled converter missing")
 
   local songs={}
   for _,theme in ipairs(THEMES) do
@@ -145,8 +149,14 @@ function A.run(mod,disc,progress,generated)
     }
   end
 
+  local oneShots={}
+  for _,shot in ipairs(ONE_SHOTS) do
+    oneShots[#oneShots+1]={source="bgm_archive.fsys/"..shot.source,setup=shot.setup,outputPath=shot.output,
+      sequence=requiredMember(bgm,bgmMembers,shot.source,"bgm_archive.fsys")}
+  end
+
   local payload={
-    sampleRate=32000,renderer="musyx-in-process-alpha",songs=songs,
+    renderer=renderer,sampleRate=48000,songs=songs,oneShots=oneShots,
     music={
       proj=requiredMember(common,commonMembers,"snd_music_proj","common.fsys"),
       pool=requiredMember(common,commonMembers,"snd_music_pool","common.fsys"),
@@ -161,8 +171,8 @@ function A.run(mod,disc,progress,generated)
     },
   }
   local complete=render(mod,payload,progress,generated)
-  progress("AUDIO 23/23 / generated cache verified",complete,23)
-  return {ready=true,complete=complete,total=23,platform=caps.platform,renderer="CBE in-process MusyX alpha / 32 kHz PCM"}
+  progress("AUDIO 24/24 / generated cache verified",complete,24)
+  return {ready=true,complete=complete,total=24,renderer="CBE import worker / Amuse"}
 end
 
 A.themes=THEMES

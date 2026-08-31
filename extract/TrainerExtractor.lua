@@ -27,6 +27,17 @@ local function signature(tex)
   if not tex then return "none" end
   return table.concat({tex.w,tex.h,tex.format,tex.rgba:sub(1,48)},":")
 end
+local function normalizeJointPositions(points,s,cx,baseY,cz)
+  if type(points)~="table" then return points end
+  for _,p in ipairs(points) do
+    if type(p)=="table" then
+      p[1]=((tonumber(p[1]) or 0)-cx)*s
+      p[2]=((tonumber(p[2]) or 0)-baseY)*s
+      p[3]=((tonumber(p[3]) or 0)-cz)*s
+    end
+  end
+  return points
+end
 local function normalize(model,targetHeight)
   local mn,mx=model.bounds.min,model.bounds.max;local h=math.max(1e-6,mx[2]-mn[2]);local s=targetHeight/h
   local cx=(mn[1]+mx[1])/2;local cz=(mn[3]+mx[3])/2
@@ -35,6 +46,7 @@ local function normalize(model,targetHeight)
     v[1]=(v[1]-cx)*s;v[2]=(v[2]-mn[2])*s;v[3]=(v[3]-cz)*s
     for k=1,3 do if v[k]<nmin[k] then nmin[k]=v[k] end;if v[k]>nmax[k] then nmax[k]=v[k] end end
   end end
+  normalizeJointPositions(model.jointPositions,s,cx,mn[2],cz)
   model.bounds={min=nmin,max=nmax,center={(nmin[1]+nmax[1])/2,(nmin[2]+nmax[2])/2,(nmin[3]+nmax[3])/2}}
   return model
 end
@@ -51,6 +63,7 @@ local function normalizeLike(model,targetHeight,referenceBounds)
     v[1]=(v[1]-cx)*s;v[2]=(v[2]-mn[2])*s;v[3]=(v[3]-cz)*s
     for k=1,3 do if v[k]<nmin[k] then nmin[k]=v[k] end;if v[k]>nmax[k] then nmax[k]=v[k] end end
   end end
+  normalizeJointPositions(model.jointPositions,s,cx,mn[2],cz)
   model.bounds={min=nmin,max=nmax,center={(nmin[1]+nmax[1])/2,(nmin[2]+nmax[2])/2,(nmin[3]+nmax[3])/2}}
   return model
 end
@@ -72,65 +85,300 @@ local function alignSampleFeet(base,sample,height)
     q[1]=q[1]-dx;q[2]=q[2]-dy;q[3]=q[3]-dz
     for k=1,3 do if q[k]<mn[k] then mn[k]=q[k] end;if q[k]>mx[k] then mx[k]=q[k] end end
   end end
+  for _,q in ipairs(sample.jointPositions or {}) do
+    q[1]=(tonumber(q[1]) or 0)-dx;q[2]=(tonumber(q[2]) or 0)-dy;q[3]=(tonumber(q[3]) or 0)-dz
+  end
   sample.bounds={min=mn,max=mx,center={(mn[1]+mx[1])/2,(mn[2]+mx[2])/2,(mn[3]+mx[3])/2}}
   return true
 end
-local function poseRmsRatio(base,sample,height)
-  if not (base and sample and #(base.groups or {})==#(sample.groups or {})) then return nil end
-  local H=math.max(.001,height or 1);local half=math.max(.001,math.abs(base.bounds.min[1] or 0),math.abs(base.bounds.max[1] or 0))
-  local sum,n=0,0
-  -- Score the arm/upper-body band rather than whole-body root translation or
-  -- Dakim's long lower garment. The sample is foot-aligned first, then this
-  -- metric looks for a readable but non-extreme change in his actual silhouette.
-  for gi,g in ipairs(base.groups or {}) do
-    local sg=sample.groups[gi];if not sg or #(g.vertices or {})~=#(sg.vertices or {}) then return nil end
-    for vi,v in ipairs(g.vertices or {}) do
-      local yn=((v[2] or 0)-(base.bounds.min[2] or 0))/H;local side=math.abs(v[1] or 0)/half
-      if yn>=.30 and yn<=.76 and side>=.18 then
-        local q=sg.vertices[vi];local dx=(q[1] or 0)-(v[1] or 0);local dy=(q[2] or 0)-(v[2] or 0);local dz=(q[3] or 0)-(v[3] or 0)
-        sum=sum+dx*dx+dy*dy+dz*dz;n=n+1
-      end
-    end
-  end
-  if n<24 then return nil end
-  return math.sqrt(sum/n)/H
-end
-local function attachIdleSample(base,sample)
+local POSE_OFFSET={breath=9,look=12,arm=15,shift=18,settle=21,command=24,brace=27}
+local function sameTopology(base,sample)
   if not (base and sample and #(base.groups or {})==#(sample.groups or {})) then return false end
   for gi,g in ipairs(base.groups or {}) do
-    local sg=sample.groups[gi];if not sg or #(g.vertices or {})~=#(sg.vertices or {}) then return false end
-  end
-  for gi,g in ipairs(base.groups or {}) do
     local sg=sample.groups[gi]
-    for vi,v in ipairs(g.vertices or {}) do local q=sg.vertices[vi];v[9]=q[1];v[10]=q[2];v[11]=q[3] end
+    if not sg or #(g.vertices or {})~=#(sg.vertices or {}) then return false end
   end
   return true
 end
-
-local function mergeGroups(model)
-  local map,out={},{}
-  for _,g in ipairs(model.groups) do
-    local key=signature(g.texture);local dst=map[key]
-    if not dst then dst={vertices={},texture=g.texture};map[key]=dst;out[#out+1]=dst end
-    for _,v in ipairs(g.vertices) do dst.vertices[#dst.vertices+1]=v end
+local function attachPose(base,sample,name)
+  local off=POSE_OFFSET[name]
+  if not off or not sameTopology(base,sample) then return false end
+  for gi,g in ipairs(base.groups or {}) do
+    local sg=sample.groups[gi]
+    for vi,v in ipairs(g.vertices or {}) do
+      local q=sg.vertices[vi];v[off]=q[1];v[off+1]=q[2];v[off+2]=q[3]
+    end
   end
-  model.groups=out;return model
+  if type(sample.jointPositions)=="table" then
+    base.poseJointPositions=base.poseJointPositions or {}
+    local copy={}
+    for i,p in ipairs(sample.jointPositions) do copy[i]={tonumber(p[1]) or 0,tonumber(p[2]) or 0,tonumber(p[3]) or 0} end
+    base.poseJointPositions[name]=copy
+  end
+  return true
 end
+local function poseMetrics(base,sample,height)
+  if not sameTopology(base,sample) then return nil end
+  local H=math.max(.001,tonumber(height) or 1)
+  local minY=base.bounds and base.bounds.min and base.bounds.min[2] or 0
+  local sum,upper,lower,head,n,nu,nl,nh=0,0,0,0,0,0,0,0
+  local left,right,nLeft,nRight=0,0,0,0
+  local torsoDy,torsoN,maxD=0,0,0
+  for gi,g in ipairs(base.groups or {}) do
+    local sg=sample.groups[gi]
+    for vi,v in ipairs(g.vertices or {}) do
+      local q=sg.vertices[vi]
+      local dx=(q[1] or 0)-(v[1] or 0);local dy=(q[2] or 0)-(v[2] or 0);local dz=(q[3] or 0)-(v[3] or 0)
+      local d2=dx*dx+dy*dy+dz*dz;local d=math.sqrt(d2);if d>maxD then maxD=d end
+      local yn=((v[2] or 0)-minY)/H
+      sum=sum+d2;n=n+1
+      if yn>=.32 then
+        upper=upper+d2;nu=nu+1
+        if (v[1] or 0)<0 then left=left+d2;nLeft=nLeft+1 else right=right+d2;nRight=nRight+1 end
+      else lower=lower+d2;nl=nl+1 end
+      if yn>=.72 then head=head+d2;nh=nh+1 end
+      if yn>=.28 and yn<=.78 then torsoDy=torsoDy+dy;torsoN=torsoN+1 end
+    end
+  end
+  if n<24 then return nil end
+  local function rr(v,c)return c>0 and math.sqrt(v/c)/H or 0 end
+  local l=rr(left,nLeft);local r=rr(right,nRight)
+  return {overall=rr(sum,n),upper=rr(upper,nu),lower=rr(lower,nl),head=rr(head,nh),
+    asym=math.abs(l-r),torsoDy=(torsoN>0 and torsoDy/torsoN/H or 0),max=maxD/H}
+end
+local function finiteMetric(m)
+  if type(m)~="table" then return false end
+  for _,k in ipairs({"overall","upper","lower","head","asym","torsoDy","max"}) do
+    local v=tonumber(m[k]);if not v or v~=v or v==math.huge or v==-math.huge then return false end
+  end
+  return m.overall<=.78 and m.max<=1.85
+end
+local function sourcePoseSample(base,clip,frame,targetHeight,referenceBounds)
+  if not (HSD and type(HSD.extractNativePose)=="function") then return nil end
+  local sample=HSD.extractNativePose(base,clip,frame,{textures=false,maxVertices=30000,maxDisplayOps=120000,maxJobjs=1536,maxDobjs=6144,maxPobjs=12288})
+  if not sample then return nil end
+  normalizeLike(sample,targetHeight,referenceBounds)
+  if not alignSampleFeet(base,sample,targetHeight) then return nil end
+  local metrics=poseMetrics(base,sample,targetHeight)
+  if not finiteMetric(metrics) then return nil end
+  return {model=sample,clip=clip,frame=frame,metrics=metrics}
+end
+local function chooseCandidate(list,score,used,keyMode)
+  local best,bestScore=nil,math.huge
+  for _,c in ipairs(list or {}) do
+    local id=(keyMode=="frame") and (tostring(c.clip)..":"..string.format("%.4f",tonumber(c.frame) or 0)) or tostring(c.clip)
+    if not (used and used[id]) then
+      local sc=score(c.metrics or {},c)
+      if sc and sc==sc and sc<bestScore then best,bestScore=c,sc end
+    end
+  end
+  if best and used then
+    local id=(keyMode=="frame") and (tostring(best.clip)..":"..string.format("%.4f",tonumber(best.frame) or 0)) or tostring(best.clip)
+    used[id]=true
+  end
+  return best
+end
+local function attachSourcePoseBank(model,target,referenceBounds,progressLabel)
+  model.nativePoseMap={};model.nativeClipCount=0
+  if not (HSD and type(HSD.nativeAnimationInfo)=="function" and type(HSD.extractNativePose)=="function") then return model end
+  local idleInfo,clipCount=HSD.nativeAnimationInfo(model,1)
+  clipCount=tonumber(clipCount) or (idleInfo and tonumber(idleInfo.clipCount)) or 0
+  model.nativeClipCount=clipCount
+  local idleCandidates={}
+  local actionByClip={}
+  local function sample(clip,frame)
+    return sourcePoseSample(model,clip,frame,target.height,referenceBounds)
+  end
+  if idleInfo and (tonumber(idleInfo.endFrame) or 0)>1 then
+    local e=tonumber(idleInfo.endFrame) or 1
+    for _,f in ipairs({.16,.34,.52,.70,.88}) do
+      local c=sample(1,e*f);if c and (c.metrics.overall or 0)>=.0012 then idleCandidates[#idleCandidates+1]=c end
+    end
+  end
+
+  -- Build coherent source CLIP families rather than independently selecting one
+  -- frame from several unrelated clips.  1.5.54's semantic classifier could
+  -- choose COMMAND from clip 4, ARM from clip 7 and SETTLE from clip 9; even
+  -- though every endpoint was source-authored, transitioning between them made
+  -- the trainer look like a robot teleporting between unrelated silhouettes.
+  -- For each B1 action clip, retain an authored anticipation/mid/follow-through
+  -- sequence. We then choose one gesture clip and one reaction clip and map
+  -- their ordered frames onto the shader's existing source-pose channels.
+  local last=math.min(math.max(1,clipCount-1),12)
+  for clip=2,last do
+    local info=HSD.nativeAnimationInfo(model,clip)
+    local e=info and tonumber(info.endFrame) or 0
+    if e and e>1 then
+      local row={clip=clip,endFrame=e,samples={}}
+      for _,f in ipairs({.20,.36,.52,.68,.84}) do
+        local c=sample(clip,e*f)
+        if c and (c.metrics.overall or 0)>=.0012 then
+          c.phase=f;row.samples[#row.samples+1]=c
+        end
+      end
+      if #row.samples>=3 then actionByClip[#actionByClip+1]=row end
+    end
+  end
+
+  local idleUsed={}
+  local breath=chooseCandidate(idleCandidates,function(m)return math.abs((m.overall or 0)-.018)+(m.max or 0)*.025 end,idleUsed,"frame")
+  local look=chooseCandidate(idleCandidates,function(m)return -((m.head or 0)*1.4-(m.lower or 0)*.35)+(m.overall or 0)*.18 end,idleUsed,"frame")
+
+  local function clipScore(row,kind)
+    local best=-math.huge
+    for _,c in ipairs(row.samples or {}) do
+      local m=c.metrics or {};local sc
+      if kind=="gesture" then
+        sc=(m.upper or 0)*1.34+(m.asym or 0)*.82+(m.head or 0)*.10-(m.lower or 0)*.24+(m.overall or 0)*.18
+      else
+        sc=(m.lower or 0)*.74+(m.upper or 0)*.46+(m.overall or 0)*.58+math.abs(m.torsoDy or 0)*1.05
+      end
+      if sc>best then best=sc end
+    end
+    return best
+  end
+  local gesture,reaction=nil,nil
+  for _,row in ipairs(actionByClip) do
+    if not gesture or clipScore(row,"gesture")>clipScore(gesture,"gesture") then gesture=row end
+  end
+  for _,row in ipairs(actionByClip) do
+    local penalty=(gesture and row.clip==gesture.clip and #actionByClip>1) and .22 or 0
+    local score=clipScore(row,"reaction")-penalty
+    if not reaction or score>(reaction._score or -math.huge) then reaction=row;reaction._score=score end
+  end
+
+  local function nearestPhase(row,want)
+    local best,bestD=nil,math.huge
+    for _,c in ipairs(row and row.samples or {}) do
+      local d=math.abs((tonumber(c.phase) or 0)-want)
+      if d<bestD then best,bestD=c,d end
+    end
+    return best
+  end
+  -- Gesture progression uses three chronological frames from ONE real B1 clip.
+  local command=nearestPhase(gesture,.20)
+  local arm=nearestPhase(gesture,.52)
+  local settle=nearestPhase(gesture,.84)
+  -- Reaction progression likewise stays inside one authored clip.
+  local brace=nearestPhase(reaction,.36)
+  local shift=nearestPhase(reaction,.68)
+
+  -- Sparse-model fail-open: if the B1 actor exposes too few distinct clips, use
+  -- the strongest available source rows but never synthesize limb geometry.
+  local all={}
+  for _,row in ipairs(actionByClip) do for _,c in ipairs(row.samples or {}) do all[#all+1]=c end end
+  local strongest=function(m)return -(m.overall or 0) end
+  command=command or chooseCandidate(all,strongest)
+  arm=arm or command
+  settle=settle or arm or command
+  brace=brace or chooseCandidate(all,function(m)return -((m.lower or 0)+(m.overall or 0)*.5) end)
+  shift=shift or brace
+  breath=breath or look
+  look=look or breath
+
+  local selected={breath=breath,look=look,arm=arm,shift=shift,settle=settle,command=command,brace=brace}
+  for name,c in pairs(selected) do
+    if c and attachPose(model,c.model,name) then
+      model.nativePoseMap[name]={clip=c.clip,frame=c.frame,phase=c.phase,metrics=c.metrics}
+    end
+  end
+  model.nativeGestureClip=gesture and gesture.clip or nil
+  model.nativeReactionClip=reaction and reaction.clip or nil
+  return model
+end
+
+-- Pick the actual source JOBJ that best behaves like the trainer's throwing
+-- hand. The extractor has exact world-space joint origins for the B1 model and
+-- for every retained source pose, so runtime ball release no longer has to
+-- guess from shoulder height / model width. Colosseum's player battle actors
+-- use the negative-X arm as the lead throwing side in this normalized basis.
+local function selectReleaseJoint(model,target)
+  local base=model and model.jointPositions
+  if type(base)~="table" or #base==0 then return nil end
+  local poses=model.poseJointPositions or {}
+  local action=poses.arm or poses.command or poses.settle or base
+  local parents=model.jointParents or {}
+  local b=model.bounds or {};local mn=b.min or {0,0,0};local mx=b.max or {0,16,0};local center=b.center or {0,8,0}
+  local h=math.max(.001,(tonumber(mx[2]) or 16)-(tonumber(mn[2]) or 0))
+  local side=tonumber(target and target.releaseSide) or -1
+  local childCount={}
+  for i,parent in ipairs(parents) do
+    parent=tonumber(parent) or 0
+    if parent>0 then childCount[parent]=(childCount[parent] or 0)+1 end
+  end
+  local best,bestScore=nil,-1e30
+  for i,p in ipairs(action) do
+    local q=base[i] or p
+    local bx,by=tonumber(q[1]) or 0,tonumber(q[2]) or 0
+    local sideX=side*(bx-(tonumber(center[1]) or 0))/h
+    local baseY=(by-(tonumber(mn[2]) or 0))/h
+    local leaf=(#parents==#base) and ((childCount[i] or 0)==0) or nil
+    -- Select from the SOURCE REST SKELETON, not the moving throw pose. The real
+    -- wrist/hand drops below the old 0.54-height gate during Colosseum's throw,
+    -- which caused the renderer to reject it and attach the ball to the elbow.
+    -- The arm hand is a lateral upper-body end effector in the rest skeleton.
+    if sideX>.10 and baseY>.56 and baseY<.90 and (leaf~=false) then
+      local ax,ay,az=tonumber(p[1]) or bx,tonumber(p[2]) or by,tonumber(p[3]) or (tonumber(q[3]) or 0)
+      local dx=ax-bx;local dy=ay-by;local dz=az-(tonumber(q[3]) or 0)
+      local move=math.sqrt(dx*dx+dy*dy+dz*dz)/h
+      local reach=sideX
+      local handBand=1-math.min(1,math.abs(baseY-.74)/.18)
+      local leafBonus=(leaf==true) and 2.4 or 0
+      local score=reach*7.0+move*1.25+handBand*.9+leafBonus
+      if score>bestScore then best,bestScore=i,score end
+    end
+  end
+  model.releaseJoint=best
+  model.releaseJointScore=bestScore>-1e20 and bestScore or nil
+  model.releaseSide=side
+  return best
+end
+
 local function cacheLua(target,model,texturePaths,sourceName)
-  local b=model.bounds;local out={"-- Generated locally from the user's Pokemon Colosseum GC6E01 disc.\nreturn {formatVersion=21,morphFormat=\"source-hsd-native-nonbind-v4-dakim-idle\",source=",q("Pokemon Colosseum / "..target.id.." / "..sourceName),",bounds={min={",num(b.min[1]),",",num(b.min[2]),",",num(b.min[3]),"},max={",num(b.max[1]),",",num(b.max[2]),",",num(b.max[3]),"},center={",num(b.center[1]),",",num(b.center[2]),",",num(b.center[3]),"}},groups={\n"}
+  local b=model.bounds
+  local poseMap={}
+  local function pointsLua(points)
+    local rows={}
+    for _,p in ipairs(points or {}) do rows[#rows+1]="{"..num(p[1] or 0)..","..num(p[2] or 0)..","..num(p[3] or 0).."}" end
+    return "{"..table.concat(rows,",").."}"
+  end
+  local function intsLua(values)
+    local rows={}
+    for _,v in ipairs(values or {}) do rows[#rows+1]=tostring(math.floor(tonumber(v) or 0)) end
+    return "{"..table.concat(rows,",").."}"
+  end
+  local poseJoints={}
+  for _,name in ipairs({"breath","look","arm","shift","settle","command","brace"}) do
+    local pts=model.poseJointPositions and model.poseJointPositions[name]
+    if type(pts)=="table" then poseJoints[#poseJoints+1]=name.."="..pointsLua(pts) end
+  end
+  for _,name in ipairs({"breath","look","arm","shift","settle","command","brace"}) do
+    local p=model.nativePoseMap and model.nativePoseMap[name]
+    if p then poseMap[#poseMap+1]=name.."={clip="..num(p.clip)..",frame="..num(p.frame)..",rms="..num(p.metrics and p.metrics.overall or 0).."}" end
+  end
+  local out={"-- Generated locally from the user's Pokemon Colosseum GC6E01 disc.\nreturn {formatVersion=25,morphFormat=\"source-hsd-coherent-clipfamilies-v6-hand-topology-end-effector\",source=",q("Pokemon Colosseum / "..target.id.." / "..sourceName),
+    ",sourceRoot=",q(model.sourceRootMode or "unknown"),",nativeClipCount=",num(model.nativeClipCount or 0),",poseMap={",table.concat(poseMap,","),"},releaseJoint=",num(model.releaseJoint or 0),",releaseSide=",num(model.releaseSide or -1),",releaseJointScore=",num(model.releaseJointScore or 0),",jointPositions=",pointsLua(model.jointPositions),",jointParents=",intsLua(model.jointParents),",poseJointPositions={",table.concat(poseJoints,","),"},bounds={min={",num(b.min[1]),",",num(b.min[2]),",",num(b.min[3]),"},max={",num(b.max[1]),",",num(b.max[2]),",",num(b.max[3]),"},center={",num(b.center[1]),",",num(b.center[2]),",",num(b.center[3]),"}},groups={\n"}
   for gi,g in ipairs(model.groups) do
     out[#out+1]="{material="..q("source_group_"..gi)
+    local function color3(v,default)
+      v=type(v)=="table" and v or default or {1,1,1}
+      return "{"..num(tonumber(v[1]) or 1)..","..num(tonumber(v[2]) or 1)..","..num(tonumber(v[3]) or 1).."}"
+    end
+    out[#out+1] = ",diffuse="..color3(g.diffuse,{1,1,1})..",ambient="..color3(g.ambient,{0,0,0})..",specular="..color3(g.specular,{0,0,0})
+      ..",alpha="..num(tonumber(g.alpha) or 1)..",shininess="..num(tonumber(g.shininess) or 0)
+      ..",xlu="..tostring(g.xlu==true)..",noz="..tostring(g.noz==true)..",renderFlags="..num(tonumber(g.renderFlags) or 0)
+      ..",shadow="..tostring(g.shadow==true)..",effect="..tostring(g.effect==true)
+      ..",useConstant="..tostring(g.useConstant==true)..",useVertexColor="..tostring(g.useVertexColor==true)
+      ..",useDiffuseLighting="..tostring(g.useDiffuseLighting~=false)..",textureSlot="..num(tonumber(g.textureSlot) or -1)
     local tp=texturePaths[gi]
     if tp then out[#out+1]=",texture={path="..q(tp.path)..",w="..tp.w..",h="..tp.h.."}" end
     out[#out+1]=",vertices={\n"
     for _,v in ipairs(g.vertices) do
       local x,y,z,u,w,nx,ny,nz=v[1],v[2],v[3],v[4] or 0,v[5] or 0,v[6] or 0,v[7] or 1,v[8] or 0
       local row={x,y,z,u,w,nx,ny,nz}
-      -- BreathPosition carries a second AUTHORED frame only for Dakim. Every
-      -- other trainer falls back to base XYZ here, preserving stable silhouettes
-      -- untouched. This is a source-frame blend, not procedural limb skinning.
-      row[#row+1]=v[9] or x;row[#row+1]=v[10] or y;row[#row+1]=v[11] or z
-      for _=1,6 do row[#row+1]=x;row[#row+1]=y;row[#row+1]=z end
+      for _,off in ipairs({9,12,15,18,21,24,27}) do
+        row[#row+1]=v[off] or x;row[#row+1]=v[off+1] or y;row[#row+1]=v[off+2] or z
+      end
       row[#row+1]=0
       local parts={};for i=1,#row do parts[i]=num(row[i]) end;out[#out+1]="{"..table.concat(parts,",").."},\n"
     end
@@ -173,7 +421,7 @@ function T.run(mod,disc,progress,generated,options)
     end
   end
 
-  local archives={};local diag={"CBE trainer scan / extractor rev 11 / native trainer pose 4 / clip1 non-bind + Dakim idle phase blend","mode="..(options.directOnly and "exact-source repair" or "full"),"archives requested="..#archiveNames}
+  local archives={};local diag={"CBE trainer scan / extractor rev 12 / coherent native B1 clip-family bank v6 / semantic scene root / residual procedural motion","mode="..(options.directOnly and "exact-source repair" or "full"),"archives requested="..#archiveNames}
   for _,name in ipairs(archiveNames) do
     local arc=openArchive(disc,name)
     if arc then
@@ -255,35 +503,23 @@ function T.run(mod,disc,progress,generated,options)
         progress(("TRAINER FINAL DECOMPRESS  %s  %d%%"):format(label,pct),0,1)
       end,
     });assert(ok and type(blob)=="string",blob or ("trainer source read failed: "..src.key))
-    local opts={textures=true,maxRoots=16,maxVertices=30000,maxDisplayOps=120000,maxJobjs=1536,maxDobjs=6144,maxPobjs=12288,nativePose={clip=1,frame=0}}
-    local model,err=HSD.extractModel(blob,opts);assert(model,err or ("trainer HSD decode failed: "..src.key))
-    if target.nativeIdleProbe then
-      local ref={min={model.bounds.min[1],model.bounds.min[2],model.bounds.min[3]},max={model.bounds.max[1],model.bounds.max[2],model.bounds.max[3]}}
-      normalize(model,target.height)
-      local best,bestFrame,bestRatio,bestScore=nil,nil,nil,1e30
-      -- Stay inside clip 1, the now-validated non-bind stance. Probe several
-      -- phases and choose a MODERATE real source displacement: enough to free
-      -- Dakim from the frozen frame-0 statue, nowhere near an action extreme.
-      for _,frame in ipairs({8,16,24,32,40}) do
-        local sample,sErr=HSD.extractModel(blob,{textures=false,maxRoots=16,maxVertices=30000,maxDisplayOps=120000,maxJobjs=1536,maxDobjs=6144,maxPobjs=12288,nativePose={clip=1,frame=frame}})
-        if sample then
-          normalizeLike(sample,target.height,ref)
-          alignSampleFeet(model,sample,target.height)
-          local ratio=poseRmsRatio(model,sample,target.height)
-          if ratio and ratio>=.004 and ratio<=.12 then
-            local score=math.abs(ratio-.052)
-            if score<bestScore then best,bestFrame,bestRatio,bestScore=sample,frame,ratio,score end
-          end
-        end
-      end
-      if best and attachIdleSample(model,best) then
-        model.nativeIdleFrame=bestFrame;model.nativeIdleRatio=bestRatio
-      else
-        model.nativeIdleFrame=0;model.nativeIdleRatio=0
-      end
-      return model
+    local opts={textures=true,maxRoots=32,maxVertices=30000,maxDisplayOps=120000,maxJobjs=1536,maxDobjs=6144,maxPobjs=12288,
+      nativePose={clip=1,frame=0},semanticRootsOnly=true}
+    local model,err=HSD.extractModel(blob,opts)
+    local rootMode="scene-modelset"
+    if not model then
+      -- Keep a fail-open path for unusual B1 assets, but never let generic
+      -- relocation-root selection outrank an available authoritative scene root.
+      opts.semanticRootsOnly=nil
+      model,err=HSD.extractModel(blob,opts);rootMode="generic-fallback"
     end
-    return normalize(model,target.height)
+    assert(model,err or ("trainer HSD decode failed: "..src.key))
+    model.sourceRootMode=rootMode
+    local ref={min={model.bounds.min[1],model.bounds.min[2],model.bounds.min[3]},max={model.bounds.max[1],model.bounds.max[2],model.bounds.max[3]}}
+    normalize(model,target.height)
+    attachSourcePoseBank(model,target,ref,label)
+    selectReleaseJoint(model,target)
+    return model
   end
   local used={};local resolved={};local unresolved={}
   local function sourceByHint(hint)
@@ -341,7 +577,7 @@ function T.run(mod,disc,progress,generated,options)
       diag[#diag+1]=( "UNRESOLVED %s: %s" ):format(target.id,reason)
     else
       used[best.source.key]=true
-      local model=mergeGroups(decodeWinner(best.source,target));local texturePaths={};local textureMap={}
+      local model=decodeWinner(best.source,target);local texturePaths={};local textureMap={}
       for gi,g in ipairs(model.groups) do if g.texture then
         local sig=signature(g.texture);local tp=textureMap[sig]
         if not tp then
@@ -353,7 +589,8 @@ function T.run(mod,disc,progress,generated,options)
       local cachePath=("cache/trainers/%s/model_cache.lua"):format(target.id)
       local sourceName=best.source.archive.." :: "..best.source.entry.name
       write(mod,cachePath,cacheLua(target,model,texturePaths,sourceName),generated)
-      local nativePose=(target.id=="dakim" and model.nativeIdleFrame and model.nativeIdleFrame>0) and ("clip1/frame0 + idle-frame"..tostring(model.nativeIdleFrame)..(" rms=%.4f"):format(model.nativeIdleRatio or 0)) or "clip1/frame0"
+      local poseCount=0;for _ in pairs(model.nativePoseMap or {}) do poseCount=poseCount+1 end
+      local nativePose=("clip1/frame0 + %d source pose targets / %d clips / root=%s"):format(poseCount,tonumber(model.nativeClipCount) or 0,tostring(model.sourceRootMode or "?"))
       resolved[target.id]={archive=best.source.archive,entry=best.source.entry.index,name=best.source.entry.name,score=bestScore,vertices=model.vertexCount,groups=#model.groups,cache=cachePath,archiveBase=model.archive and model.archive.base or 0,nativePose=nativePose}
       diag[#diag+1]=( "%s %s <- %s:%s idx=%d score=%.4f vertices=%d groups=%d hsdBase=0x%X nativePose=%s" ):format(target.exactName and "EXACT" or "RESOLVED",target.id,safeName(best.source.archive),safeName(best.source.entry.name),tonumber(best.source.entry.index) or -1,bestScore,model.vertexCount,#model.groups,resolved[target.id].archiveBase,nativePose)
     end
@@ -376,7 +613,7 @@ function T.run(mod,disc,progress,generated,options)
   end
   write(mod,"build/trainer_scan.txt",table.concat(diag,"\n").."\n",generated)
 
-  local report={"return {version=4,resolved={"}
+  local report={"return {version=6,resolved={"}
   for _,t in ipairs(runTargets) do local r=resolved[t.id];if r then report[#report+1]=string.format("%s={archive=%q,entry=%d,name=%q,score=%.6f,vertices=%d,groups=%d,archiveBase=%d},",t.id,r.archive,r.entry,r.name,r.score,r.vertices,r.groups,r.archiveBase or 0) end end
   report[#report+1]="},firstSourceError="..string.format("%q",firstSourceError or "")..",unresolved={"
   for _,t in ipairs(runTargets) do if unresolved[t.id] then report[#report+1]=string.format("%s=%q,",t.id,unresolved[t.id]) end end

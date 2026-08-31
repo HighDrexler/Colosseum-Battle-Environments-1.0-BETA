@@ -1,6 +1,6 @@
 local V=...
 local HSD,FSYS=V and V.HSD,V and V.FSYS
-local A={arenaRevision=6}
+local A={arenaRevision=8}
 local floor,abs,sin,cos=math.floor,math.abs,math.sin,math.cos
 local SPECS={
   ["cache/stages/d2_crater/textures/tex_0f4120_128x128_f14.rgba"]={128,128,"metal"},
@@ -37,18 +37,32 @@ local ARENAS={
   {
     cache="cache/orre_colosseum_cache.lua",id="orre_colosseum",label="ORRE COLOSSEUM",
     sourceFsys="T1_ancient_colo.fsys",sourceMember="T1_ancient_colo.dat",textureRoot="cache/stages/orre/source",
-    minVertices=35000,minGroups=35,maxVertices=110000,maxDisplayOps=700000,maxJobjs=6000,maxDobjs=16000,maxPobjs=28000,sourceRadius=560,sourceMaxSpan=1600,keepHighBackdrop=true,
+    -- Preserve the complete T1 source scene. The old 560-unit extraction radius
+    -- discarded the remote desert/ruin geometry before runtime ever saw it.
+    minVertices=35000,minGroups=35,maxVertices=180000,maxDisplayOps=1100000,
+    maxSceneRoots=24,maxJobjs=12000,maxDobjs=36000,maxPobjs=60000,
     crowdOffsets={[0x10f240]=true,[0x111240]=true},
   },
   {
     cache="cache/realgam_colosseum_cache.lua",id="realgam_colosseum",label="REALGAM COLOSSEUM",
     sourceFsys="D4_casino_colo.fsys",sourceMember="D4_casino_colo.dat",textureRoot="cache/stages/realgam/source",
-    minVertices=50000,minGroups=100,maxVertices=250000,maxDisplayOps=1200000,maxSceneRoots=24,maxJobjs=10000,maxDobjs=30000,maxPobjs=50000,sourceRadius=600,sourceMaxSpan=1300,
+    -- Preserve the complete D4 tower/casino exterior. The old 600-unit radius
+    -- removed dozens of distant tower, support and skyline groups.
+    minVertices=50000,minGroups=100,maxVertices=320000,maxDisplayOps=1800000,
+    maxSceneRoots=32,maxJobjs=18000,maxDobjs=54000,maxPobjs=90000,
     crowdOffsets={[0x0bed60]=true,[0x0c0d60]=true},
     backdrop={offset=0x09ed60,x=0,y=336,w=512,h=176,path="cache/stages/realgam/source/sky_512x176.rgba"},
   },
   {recipe="recipes/arenas/outdoor_wild.lua",cache="cache/outdoor_wild_cache.lua",id="outdoor_wild"},
-  {recipe="recipes/arenas/mt_battle_summit.lua",cache="cache/D2_mt_battle_platform100_cache.lua",id="mt_battle_summit"},
+  {
+    cache="cache/D2_mt_battle_platform100_cache.lua",id="mt_battle_summit",label="MT. BATTLE SUMMIT",
+    sourceFsys="D2_crater_colo.fsys",sourceMember="D2_crater_colo.dat",textureRoot="cache/stages/d2_crater/textures",
+    -- Platform 100 must come from the stage archive, not CBE-authored geology.
+    -- Preserve the whole HSD scene so the crater wall, bridge, deck, pylons,
+    -- distant background and their original UV/material relationships survive.
+    minVertices=8000,minGroups=20,maxVertices=300000,maxDisplayOps=1400000,
+    maxSceneRoots=32,maxJobjs=12000,maxDobjs=36000,maxPobjs=60000,
+  },
 }local function clamp(v)return v<0 and 0 or (v>255 and 255 or floor(v+.5)) end
 local function rgba(r,g,b,a)return string.char(clamp(r),clamp(g),clamp(b),clamp(a or 255))end
 local function hash(s)local h=17;for i=1,#s do h=(h*131+s:byte(i))%104729 end;return h end
@@ -63,7 +77,7 @@ local function makeTexture(path,w,h,kind)
     elseif kind=="trim" then local c=115+80*q;r,g,b=c*1.25,c*.82,c*.28
     elseif kind=="truss" then local line=(x%24<4 or y%24<4) and 1 or 0;local c=80+55*q+70*line;r,g,b=c*.75,c*.78,c*.82;a=line==1 and 255 or 0
     elseif kind=="sky" then
-      local t=v*v*(3-2*v); local wis=.5+.5*sin((x+y*.37+seed)*.041)
+      local t=v*v*(3-2*v)
       r=70+(198-70)*t+8*(q-.5);g=80+(205-80)*t+9*(q-.5);b=94+(207-94)*t+11*(q-.5);a=255
     elseif kind=="cloud" then
       local p=.62*q+.24*(.5+.5*sin(x*.055+seed))+.14*(.5+.5*cos(y*.071-seed*.3))
@@ -120,7 +134,7 @@ local function vec(v)
   local o={"{"};for i=1,#v do if i>1 then o[#o+1]="," end;o[#o+1]=num(v[i]) end;o[#o+1]="}";return table.concat(o)
 end
 local function serializeSourceArena(model,source,crowdOriginal)
-  local out={"-- Generated from the user-supplied Pokemon Colosseum GC6E01 disc.\nreturn {version=30,source=",string.format("%q",source),",prototype=false,"}
+  local out={"-- Generated from the user-supplied Pokemon Colosseum GC6E01 disc.\nreturn {version=31,source=",string.format("%q",source),",prototype=false,"}
   local b=model.bounds or {};out[#out+1]="bounds={min="..(vec(b.min) or "{0,0,0}")..",max="..(vec(b.max) or "{0,0,0}").."},"
   out[#out+1]="groupCount="..tostring(#(model.groups or {}))..",vertexCount="..tostring(tonumber(model.vertexCount) or 0)..","
   out[#out+1]="crowdOriginal="..tostring(crowdOriginal or 0)..",crowdPolicy="..string.format("%q",model.crowdPolicy or "source-hsd-crowd")..",groups={\n"
@@ -226,42 +240,32 @@ local function buildSourceArenaFromDisc(mod,disc,progress,generated,spec)
   return {groups=#model.groups,vertices=model.vertexCount,source=source,textures=textureCount,crowdOriginal=crowdOriginal}
 end
 function A.repair(mod,disc,progress,generated)
-  -- Summit-only hotfix path. This path does not touch the already-proven Water,
-  -- Orre, Realgam, Wildlands, trainer, transition or audio caches. Only the D2
-  -- procedural texture family and Platform 100 recipe are refreshed, which keeps
-  -- this visual correction isolated from the Gen 1/Gen 2 compatibility work.
+  -- 1.5.55 arena migration: rebuild only the venues whose extraction contract
+  -- changed. Water, Wildlands and the already full-distance Mt. Battle cache are
+  -- preserved. Orre T1 + Realgam D4 are regenerated from the complete HSD scene
+  -- so their distant architecture is no longer thrown away by a compact radius.
   local report={"return {revision="..tostring(A.arenaRevision)..","}
-  progress("PRESERVING EXISTING ARENAS",0,2)
-
-  local keys={}
-  for path in pairs(SPECS) do
-    if path:find("cache/stages/d2_crater/",1,true) then keys[#keys+1]=path end
+  progress("PRESERVING WATER / WILDLANDS / MT. BATTLE",0,3)
+  for step,index in ipairs({2,3}) do
+    local arena=ARENAS[index]
+    progress((arena.label or arena.id).." / FULL SOURCE HSD",step,3)
+    local value=buildSourceArenaFromDisc(mod,disc,progress,generated,arena)
+    report[#report+1]=string.format("%s={cache=%q,groups=%d,vertices=%d,source=%q,textures=%d},",
+      arena.id,arena.cache,tonumber(value.groups) or 0,tonumber(value.vertices) or 0,
+      tostring(value.source or "GC6E01 source"),tonumber(value.textures) or 0)
   end
-  table.sort(keys)
-  for i,path in ipairs(keys) do
-    local sp=SPECS[path]
-    progress("MT. BATTLE TEXTURE "..i,i-1,#keys)
-    write(mod,path,textureBytes(mod,path,sp),generated)
-  end
-
-  local summit=ARENAS[5]
-  progress("ARENA MT_BATTLE_SUMMIT",1,2)
-  local src=assert(mod:read(summit.recipe),"missing arena recipe: "..summit.recipe)
-  local chunk,err=load(src,"@"..summit.recipe);assert(chunk,err)
-  local ok,recipe=pcall(chunk);assert(ok,recipe)
-  assert(type(recipe)=="table" and type(recipe.groups)=="table" and #recipe.groups>0,"invalid arena recipe: "..summit.id)
-  write(mod,summit.cache,src,generated)
-  report[#report+1]=string.format("%s={cache=%q,groups=%d,vertices=%d,source=%q},",summit.id,summit.cache,#recipe.groups,tonumber(recipe.vertexCount) or 0,tostring(recipe.source or "recipe"))
-  report[#report+1]="preserved={water=true,orre_colosseum=true,realgam_colosseum=true,outdoor_wild=true},}\n"
+  report[#report+1]="preserved={water=true,outdoor_wild=true,mt_battle_summit=true},}\n"
   write(mod,"build/arena_repair.lua",table.concat(report),generated)
-  progress("MT. BATTLE REPAIR READY",2,2)
+  progress("ORRE / REALGAM FULL-DISTANCE SOURCE REBUILD READY",3,3)
   return true
 end
 function A.run(mod,disc,progress,generated)
-  -- Only procedural Mt. Battle / Wildlands need authored texture generation.
+  -- Mt. Battle is source-backed in revision 7. Only Wildlands still needs
+  -- CBE-authored texture generation; D2 texture paths are written from the
+  -- exact GX textures decoded from D2_crater_colo.dat.
   local keys={}
   for p in pairs(SPECS) do
-    if p:find("cache/stages/d2_crater/",1,true) or p:find("cache/stages/wildlands/",1,true) then keys[#keys+1]=p end
+    if p:find("cache/stages/wildlands/",1,true) then keys[#keys+1]=p end
   end
   table.sort(keys)
   for i,p in ipairs(keys)do local sp=SPECS[p];progress("ARENA TEXTURE "..i,i-1,#keys);write(mod,p,textureBytes(mod,p,sp),generated)end

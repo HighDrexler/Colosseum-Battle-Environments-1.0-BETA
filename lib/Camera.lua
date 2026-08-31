@@ -1,6 +1,7 @@
 local V = ...
 local Trainer = V and V.Trainer
 local PlayerTrainer = V and V.PlayerTrainer
+local BattleDirector=V and V.BattleDirector
 local C = {}
 
 local DEFAULT = {orbit=1.33,elevation=0.34,radius=60,fov=40,focus={0,6,0}}
@@ -26,11 +27,10 @@ local EVENT_HOLDS = {
 local EVENT_PRIORITY = { passive=0, command=1, attack=2, damage=3, reaction=3, capture=4, switch=4, faint=5, exit=6 }
 local MIN_INTERRUPT_AGE = 0.44
 
--- Gen1Recomp fast-forward runs the fixed logic step multiple times per real
--- frame. Camera movement must NOT inherit that multiplier: otherwise 4X/10X
--- battle speed also means 4X/10X cuts, blends and manual camera movement.
--- We keep battle semantics accelerated, but run the director on a real-time
--- clock and progressively reduce low-value cuts at the highest speed levels.
+-- Gen1Recomp fast-forward advances the battle fixed step multiple times per
+-- rendered frame. Colosseum choreography belongs to that same game-time clock:
+-- 4X should look like the original battle fast-forwarded, NOT replace the
+-- authored shot sequence with a wide master or stretch individual holds.
 local function battleSpeed(ctx)
   local b=type(ctx)=="table" and (ctx.battle or (ctx.kind and ctx)) or nil
   local game=(b and b.game) or (ctx and ctx.game) or (V and V.mod and V.mod.game)
@@ -48,23 +48,15 @@ local function battleSpeed(ctx)
 end
 
 local function holdScale(speed)
-  speed=tonumber(speed) or 1
-  if speed>=10 then return 1.45 end
-  if speed>=4 then return 1.28 end
-  if speed>=3 then return 1.18 end
-  if speed>=2 then return 1.08 end
+  -- Holds are authored in game-time. Fast-forward shortens their wall-clock
+  -- duration naturally because the game clock advances faster.
   return 1
 end
 
 local function phaseAllowedAtSpeed(phase,speed)
-  speed=tonumber(speed) or 1
-  if speed>=10 then
-    return phase=="capture" or phase=="switch" or phase=="faint" or phase=="exit"
-  end
-  if speed>=2 then
-    return phase=="attack" or phase=="capture" or phase=="switch"
-      or phase=="faint" or phase=="exit"
-  end
+  -- Preserve the complete source-style shot vocabulary at every speed. Dropping
+  -- impact/reaction cuts at 4X was the main reason accelerated footage stayed
+  -- parked on a distant master while the actors were already performing.
   return true
 end
 
@@ -283,55 +275,29 @@ local function trainerPassiveMaster(ctx)
   return shotPose(shot,drift)
 end
 
--- Fast-forward should accelerate the battle, not turn the viewer around the
--- arena once per queued event. Above 1X keep one screen direction and express
--- semantics with restrained focus/lens changes. The battle still reacts to
--- attacks, switches and KOs, but never whip-pans between opposite hemispheres.
-local function speedMasterShot(ctx,arena,phase,side,speed)
-  local center={0,5.9,0}
-  local subject=arenaPoint(arena,side or "enemy",6.1)
-  local bias=speed>=6 and .12 or (speed>=4 and .18 or .28)
-  if phase=="passive" or phase=="command" then bias=0 end
-  local focus={center[1]+(subject[1]-center[1])*bias,
-    center[2]+(subject[2]-center[2])*bias,
-    center[3]+(subject[3]-center[3])*bias}
-  local eye={58,22.5,7.5}
-  local fov=43
-  if speed>=6 then eye={63,25,5};fov=46
-  elseif speed>=4 then eye={61,24,6};fov=45 end
-  if phase=="faint" then
-    focus[1]=center[1]+(subject[1]-center[1])*(speed>=4 and .22 or .36)
-    focus[3]=center[3]+(subject[3]-center[3])*(speed>=4 and .22 or .36)
-    fov=fov-1
-  elseif phase=="switch" or phase=="capture" then
-    fov=fov-0.6
-  end
-  -- One small dolly breath keeps the camera alive without producing yaw.
-  local breath=math.sin(state.time*.55)*.45
-  eye[1]=eye[1]+breath
-  eye[2]=eye[2]+breath*.12
-  return {eye=eye,focus=focus,fov=math.rad(fov)}
-end
 
 local function eventShot(ctx,arena,side,kind,variant)
   side=side or "player"; variant=((variant or 1)-1)%3+1
   local a=arenaPoint(arena,side,6.2); local sgn=side=="player" and 1 or -1
   local z=a[3]
   if kind=="attack" then
-    -- Two of the three attack variants deliberately preserve trainer + Pokemon
-    -- in one composition so a command gesture is visible during normal play.
-    -- This adds performance value without increasing cut frequency.
-    local hasTrainer=trainerVisible(ctx,side)
-    local tp=hasTrainer and trainerPoint(side,7.0) or a
-    local midx=hasTrainer and (tp[1]+a[1])*.5 or a[1]
-    local midz=hasTrainer and (tp[3]+a[3])*.5 or a[3]
-    if variant==1 then return {eye={-sgn*36,16,sgn*8},focus={midx,6.1,midz},fov=math.rad(hasTrainer and 40 or 42)} end
-    if variant==2 then return {eye={-36,16,z+sgn*9},focus={midx,6.2,midz},fov=math.rad(hasTrainer and 39 or 41)} end
-    return {eye={sgn*33,17,sgn*10},focus={midx,6.2,midz},fov=math.rad(hasTrainer and 40 or 42)}
+    -- Move cinematography must keep the attacking Pokemon readable. The old
+    -- trainer/Pokemon midpoint could put the human in the exact centre while
+    -- both battlers were outside the crop (visible in the 1.5.40 Flame Wheel
+    -- test). Frame the combat line itself; trainer reaction gets its own beat.
+    local target=arenaPoint(arena,other(side),6.1)
+    local focus={a[1]*.72+target[1]*.28,6.15,a[3]*.72+target[3]*.28}
+    if variant==1 then return {eye={56,20,sgn*15},focus=focus,fov=math.rad(45)} end
+    if variant==2 then return {eye={-52,19,-sgn*13},focus=focus,fov=math.rad(45)} end
+    return {eye={sgn*48,20,-sgn*18},focus=focus,fov=math.rad(46)}
   elseif kind=="damage" then
-    if variant==1 then return {eye={34,14,z+sgn*10},focus={a[1],6.1,z},fov=math.rad(32)} end
-    if variant==2 then return {eye={-30,13,z+sgn*13},focus={a[1],5.9,z},fov=math.rad(33)} end
-    return {eye={46,18,z*0.35},focus={a[1],6.0,z},fov=math.rad(35)}
+    -- Center the damaged Pokemon but retain enough of the combat line to show
+    -- incoming source particles and the authored hurt animation together.
+    local attacker=arenaPoint(arena,other(side),6.1)
+    local focus={a[1]*.78+attacker[1]*.22,6.05,a[3]*.78+attacker[3]*.22}
+    if variant==1 then return {eye={50,18,z+sgn*7},focus=focus,fov=math.rad(42)} end
+    if variant==2 then return {eye={-47,18,z+sgn*8},focus=focus,fov=math.rad(43)} end
+    return {eye={54,20,z*.25},focus=focus,fov=math.rad(44)}
   elseif kind=="reaction" then
     -- Reactions belong to the affected side, not to a specific model mod. If a
     -- trainer is actually present, keep the Pokemon as the foreground subject
@@ -346,11 +312,73 @@ local function eventShot(ctx,arena,side,kind,variant)
   elseif kind=="capture" then
     local target=arenaPoint(arena,"enemy",6.0); local hasTrainer=trainerVisible(ctx,"player")
     local tp=hasTrainer and trainerPoint("player",7.0) or target
-    local midx=hasTrainer and (target[1]*.72+tp[1]*.28) or target[1]
-    local midz=hasTrainer and (target[3]*.72+tp[3]*.28) or target[3]
-    if variant==1 then return {eye={39,18,22},focus={midx,6.1,midz},fov=math.rad(39)} end
-    if variant==2 then return {eye={-35,15,18},focus={target[1],6.0,target[3]},fov=math.rad(37)} end
-    return {eye={44,21,-5},focus={midx,6.0,midz},fov=math.rad(40)}
+    local status
+    if PlayerTrainer and type(PlayerTrainer.captureStatus)=="function" then
+      local ok,v=pcall(PlayerTrainer.captureStatus,PlayerTrainer,ctx)
+      if ok and type(v)=="table" and v.active then status=v end
+    end
+    local phase=status and status.phase or "charge"
+    local u=math.max(0,math.min(1,tonumber(status and status.progress) or 0))
+    local liveBall=nil
+    if PlayerTrainer and type(PlayerTrainer.captureBallPosition)=="function" then
+      local ok,v=pcall(PlayerTrainer.captureBallPosition,PlayerTrainer,ctx)
+      if ok and type(v)=="table" and tonumber(v[1]) and tonumber(v[2]) and tonumber(v[3]) then liveBall=v end
+    end
+
+    -- Build every capture shot from the live trainer->enemy battle axis so the
+    -- sequence keeps the same Colosseum screen direction in every arena.
+    local dx,dz=target[1]-tp[1],target[3]-tp[3]
+    local len=math.max(.001,math.sqrt(dx*dx+dz*dz));local fx,fz=dx/len,dz/len
+    local rx,rz=-fz,fx
+    local function eyeAt(point,back,side,y)
+      return {point[1]-fx*back+rx*side,y,point[3]-fz*back+rz*side}
+    end
+    local function focusAt(point,y)
+      return {point[1],y,point[3]}
+    end
+
+    -- Reference order: source hand/ball hold -> tracked side throw -> target
+    -- impact/absorb -> tracked fall -> low resting/shake shot -> result. The
+    -- live source prop is the focus whenever available, so camera and ball can
+    -- no longer disagree about where the throw actually is.
+    local ball=liveBall or target
+    if phase=="charge" then
+      -- Medium over-shoulder rather than an extreme body-centred close-up. This
+      -- keeps the authentic small ball readable in the throwing hand.
+      return {eye=eyeAt(tp,5.9,7.8,8.4),focus={ball[1],ball[2]+.05,ball[3]},fov=math.rad(31)}
+    elseif phase=="throw" then
+      local lead={ball[1]+fx*2.0,ball[2]-.12,ball[3]+fz*2.0}
+      return {eye=eyeAt(ball,5.8,10.8-u*2.4,8.8-u*.8),focus=lead,fov=math.rad(33)}
+    elseif phase=="impact" then
+      return {eye=eyeAt(target,13.2,-8.0,8.7),focus={ball[1],ball[2],ball[3]},fov=math.rad(29)}
+    elseif phase=="absorb" then
+      return {eye=eyeAt(target,11.8,-6.8,7.8),focus={ball[1],ball[2]-.10,ball[3]},fov=math.rad(28)}
+    elseif phase=="fall" then
+      return {eye=eyeAt(ball,8.6,7.0,5.0),focus={ball[1],ball[2]-.18,ball[3]},fov=math.rad(27)}
+    elseif phase=="settle" then
+      return {eye=eyeAt(ball,7.4,6.3,3.25),focus={ball[1],ball[2]+.06,ball[3]},fov=math.rad(25)}
+    elseif phase=="shake" then
+      -- Lock the lens to the LANDING POINT, not to the moving ball. 1.5.61
+      -- tracked the ball's lateral wobble with the camera, visually cancelling
+      -- the shake. The real source prop now rocks inside a stationary low shot,
+      -- so every engine-authored shake count is unmistakable.
+      local ground={target[1],.31,target[3]}
+      return {eye=eyeAt(ground,5.35,4.55,2.42),focus={ground[1],ground[2]+.08,ground[3]},fov=math.rad(22)}
+    elseif phase=="caught" then
+      return {eye=eyeAt(ball,7.4,5.8,3.7),focus={ball[1],ball[2]+.04,ball[3]},fov=math.rad(26)}
+    elseif phase=="breakout" then
+      -- Give the native miss/open prop its own ground beat, then let the frame
+      -- travel back up to the re-forming target instead of snapping immediately
+      -- from ball to Pokemon.
+      local ground={target[1],.31,target[3]}
+      if u<.42 then
+        return {eye=eyeAt(ground,7.2,5.8,3.15),focus={ground[1],ground[2]+.18,ground[3]},fov=math.rad(26)}
+      end
+      local q=smooth((u-.42)/.58)
+      local focus={ground[1]+(target[1]-ground[1])*q,.55+(5.15-.55)*q,ground[3]+(target[3]-ground[3])*q}
+      return {eye=eyeAt(target,10.6,-7.1,6.9),focus=focus,fov=math.rad(29)}
+    end
+    return {eye=eyeAt(target,12,8,8),focus=focusAt(target,4),fov=math.rad(30)}
   elseif kind=="faint" then
     -- Human reaction is part of the KO, not background dressing. Bias the
     -- composition toward the trainer while retaining the fallen Pokemon in the
@@ -434,9 +462,7 @@ local function targetFor(ctx,phase,base,arena)
   local side=state.eventSide
   local pose
   local speed=battleSpeed(ctx)
-  if speed>=2 and phase~="intro" and phase~="exit" then
-    pose=speedMasterShot(ctx,arena,phase,side,speed)
-  elseif phase=="attack" then pose=eventShot(ctx,arena,side or "player","attack",state.eventIndex)
+  if phase=="attack" then pose=eventShot(ctx,arena,side or "player","attack",state.eventIndex)
   elseif phase=="damage" then pose=eventShot(ctx,arena,side or "enemy","damage",state.eventIndex)
   elseif phase=="reaction" then pose=eventShot(ctx,arena,side or "enemy","reaction",state.eventIndex)
   elseif phase=="capture" then pose=eventShot(ctx,arena,"enemy","capture",state.eventIndex)
@@ -491,11 +517,11 @@ end
 
 local function requestedPhase(name,ctx)
   if name=="battle.move_used" or name=="battle.presentation_move" then return "attack" end
-  if name=="battle.damage_dealt" then return "damage" end
+  if name=="battle.damage_dealt" or name=="battle.presentation_damage" then return "damage" end
   if name=="battle.status_inflicted" then return "reaction" end
   if name=="battle.ball_thrown" then return "capture" end
   if name=="battle.exp_gained" then return nil end
-  if name=="battle.fainted" then return "faint" end
+  if name=="battle.fainted" or name=="battle.presentation_faint" then return "faint" end
   if name=="battle.battler_switched" then return "switch" end
   if name=="battle.turn_started" or name=="battle.turn_ended" then return "passive" end
   if name=="battle.ended" then return "exit" end
@@ -505,13 +531,13 @@ local function requestedPhase(name,ctx)
 end
 
 local function eventSideFor(ctx,name,payload)
-  -- Shot ownership is explicit in v7:
+  -- Shot ownership is explicit in v8:
   --   move_used -> actor, damage/faint -> affected battler, switch -> switched side.
   -- Damage payloads are not guaranteed to expose `user`; resolving the target
   -- first avoids the old fallback that occasionally cut to the attacker's side.
   if name=="battle.move_used" or name=="battle.presentation_move" then
     return sideFrom(ctx,payload,{"user","attacker","source","battler","side"})
-  elseif name=="battle.damage_dealt" then
+  elseif name=="battle.damage_dealt" or name=="battle.presentation_damage" then
     local target=sideFrom(ctx,payload,{"target","defender","targetSide","defenderSide","battler"})
     if target then return target end
     local actor=sideFrom(ctx,payload,{"user","attacker","source","side"})
@@ -520,7 +546,7 @@ local function eventSideFor(ctx,name,payload)
     return sideFrom(ctx,payload,{"target","battler","side","targetSide","source"})
   elseif name=="battle.ball_thrown" then
     return "enemy"
-  elseif name=="battle.fainted" then
+  elseif name=="battle.fainted" or name=="battle.presentation_faint" then
     return sideFrom(ctx,payload,{"battler","target","side","faintedSide","targetSide"})
   elseif name=="battle.battler_switched" then
     return sideFrom(ctx,payload,{"side","battler","target","switchedSide"})
@@ -580,10 +606,9 @@ function C:update(ctx,dt)
   dt=tonumber(dt) or 0
   local speed=battleSpeed(ctx)
   state.logicSpeed=speed
-  -- input.step supplies the fixed 1/60 logic step. At NX battle speed the
-  -- engine invokes this update N times per real frame, so dividing each step
-  -- by N reconstructs the presentation clock without changing battle timing.
-  local cameraDt=dt/math.max(1,speed)
+  -- Follow game-time exactly. 4X/10X fast-forward therefore accelerates the
+  -- same choreography instead of changing which shots exist.
+  local cameraDt=dt
   state.time=state.time+cameraDt
   state.phaseAge=state.phaseAge+cameraDt
 
@@ -602,19 +627,25 @@ function C:update(ctx,dt)
     -- Let the actual KO read before moving to the victory/defeat master. Runs
     -- and captures have no faint beat and can transition much sooner.
     local resultDelay=faintInFlight and 1.35 or 0.22
-    -- At accelerated battle speeds the engine may finish several queue rows in
-    -- one rendered frame. Keep a brief readable result beat, but do not hold
-    -- the camera to a slow-motion schedule after the native battle has moved on.
-    if speed>=10 then resultDelay=math.min(resultDelay,0.08)
-    elseif speed>=4 then resultDelay=math.min(resultDelay,0.26)
-    elseif speed>=3 then resultDelay=math.min(resultDelay,0.42) end
+    if faintInFlight and BattleDirector and type(BattleDirector.faintDuration)=="function" then
+      local side=(state.pendingEvent and state.pendingEvent.phase=="faint" and state.pendingEvent.side) or state.eventSide
+      local ok,fd=pcall(BattleDirector.faintDuration,BattleDirector,ctx,side)
+      if ok and tonumber(fd) then
+        -- Never abandon an authored faint clip for the victory/defeat master.
+        -- The short removal tail is part of Actor:terminalDuration(), so this
+        -- cut lands only after the complete source collapse has actually read.
+        resultDelay=math.max(resultDelay,tonumber(fd)+.10)
+      end
+    end
+    -- Result delay is authored in game-time, so fast-forward naturally
+    -- compresses it in wall-clock time without changing the battle direction.
     state.resultAt=state.time+resultDelay
   end
-  -- The authored opening is a real-time camera sequence, not a battle-state
+  -- The authored opening is a presentation-time sequence, not a battle-state
   -- phase. Gen1Recomp can remain in intro/messages until the user dismisses
   -- text, so waiting for turn_started leaves the camera parked forever on the
   -- final intro angle. Hand control to the passive/menu master once the opening
-  -- has actually played, independent of text speed or fast-forward.
+  -- has actually played; fast-forward advances this same sequence in game-time.
   if state.phase=="intro" and state.phaseAge>=4.20 then
     state.startPose=copyPose(state.lastPose)
     state.phase="passive";state.phaseAge=0;state.idleClock=0
@@ -622,9 +653,16 @@ function C:update(ctx,dt)
   end
   if state.phase=="passive" or state.phase=="command" then state.idleClock=state.idleClock+cameraDt end
   if state.special and state.time>=state.specialUntil then state.special=nil end
-  if state.pendingEvent and state.time>=state.shotLockUntil and state.time>=(state.pendingEvent.notBefore or 0) then
+  local captureStillActive=false
+  if state.phase=="capture" and PlayerTrainer and type(PlayerTrainer.captureStatus)=="function" then
+    local okCapture,captureStatus=pcall(PlayerTrainer.captureStatus,PlayerTrainer,ctx)
+    captureStillActive=okCapture and type(captureStatus)=="table" and captureStatus.active==true
+  end
+  local pendingBlockedByCapture=captureStillActive and state.pendingEvent
+    and (EVENT_PRIORITY[state.pendingEvent.phase] or 0)<EVENT_PRIORITY.capture
+  if state.pendingEvent and not pendingBlockedByCapture and state.time>=state.shotLockUntil and state.time>=(state.pendingEvent.notBefore or 0) then
     local ev=state.pendingEvent;state.pendingEvent=nil;acceptEvent(ev)
-  elseif not state.pendingEvent and state.time>=state.shotLockUntil and state.shotLockUntil>0
+  elseif not captureStillActive and not state.pendingEvent and state.time>=state.shotLockUntil and state.shotLockUntil>0
       and (state.phase=="attack" or state.phase=="damage" or state.phase=="reaction" or state.phase=="capture" or state.phase=="faint" or state.phase=="switch") then
     -- One-shot cinematic beats must relinquish the camera. Older builds left
     -- the director permanently parked on the last damaged/fainted Pokemon
@@ -670,25 +708,32 @@ function C:event(ctx,name,payload)
   -- early semantic move event and cut only when StandaloneHost reports the
   -- corresponding visible queue row. Gen 1 keeps its native move boundary.
   local gen2=ctx and ctx.battle and ctx.battle.__cbeGeneration==2
-  if name=="battle.move_used" and gen2 then return end
+  local queueSync=gen2 and ctx.battle.__cbePresentationQueueSync==true
+  if queueSync and (name=="battle.move_used" or name=="battle.damage_dealt" or name=="battle.fainted") then return end
   local phase=requestedPhase(name,ctx)
   if not phase then return end
   local speed=battleSpeed(ctx)
   state.logicSpeed=speed
   if name=="battle.ended" and type(payload)=="table" then state.eventResult=payload.result or payload.outcome end
-  -- Fast-forward may deliver an entire move/impact/turn chain between two
-  -- renders. Preserve meaningful battle state but deliberately drop low-value
-  -- camera cuts as speed rises: 4X becomes one authored cut per move at most;
-  -- 10X+ keeps only switches, captures, KOs and the result.
+  -- Fast-forward can deliver several semantic beats between rendered frames,
+  -- but they still belong to the same authored sequence. The scheduler below
+  -- coalesces genuinely superseded events; speed itself never deletes a shot.
   if not phaseAllowedAtSpeed(phase,speed) then return end
-  local indexed=name=="battle.move_used" or name=="battle.presentation_move" or name=="battle.damage_dealt"
+  local indexed=name=="battle.move_used" or name=="battle.presentation_move" or name=="battle.damage_dealt" or name=="battle.presentation_damage"
     or name=="battle.status_inflicted" or name=="battle.ball_thrown"
-    or name=="battle.fainted" or name=="battle.battler_switched"
+    or name=="battle.fainted" or name=="battle.presentation_faint" or name=="battle.battler_switched"
   local ev={name=name,phase=phase,side=eventSideFor(ctx,name,payload),indexed=indexed,ctx=ctx}
   -- Gen1Recomp emits the faint semantic state before the complete visual fall
   -- has necessarily finished. Hold the impact composition briefly, then move
   -- to the trainer reaction instead of cutting on move selection / early KO.
-  if phase=="faint" then ev.notBefore=state.time+0.62 end
+  if phase=="faint" then
+    local delay=.32
+    if BattleDirector and type(BattleDirector.faintDuration)=="function" and ev.side then
+      local ok,fd=pcall(BattleDirector.faintDuration,BattleDirector,ctx,ev.side)
+      if ok and tonumber(fd) then delay=math.max(.14,math.min(.48,tonumber(fd)*.14)) end
+    end
+    ev.notBefore=state.time+delay
+  end
 
   -- Intro owns its authored sequence until actual battle events begin.
   -- After that, inputs merely advancing text/menus cannot reset the camera:
@@ -702,7 +747,7 @@ function C:event(ctx,name,payload)
   -- A major hit gets one human reaction beat after the impact. This is derived
   -- only from authoritative battle damage/max-HP data; external animation mods
   -- never need to expose their own notions of recoil or expression.
-  if name=="battle.damage_dealt" and ev.side and trainerVisible(ctx,ev.side) and type(payload)=="table" then
+  if (name=="battle.damage_dealt" or name=="battle.presentation_damage") and ev.side and trainerVisible(ctx,ev.side) and type(payload)=="table" then
     local damage=tonumber(payload.damage or payload.amount or payload.hpDamage) or 0
     local target=payload.target or payload.defender or payload.battler
     local mon=type(target)=="table" and (target.mon or target) or nil
@@ -722,6 +767,19 @@ function C:shot(ctx,phase,progress,base,arena)
   -- The event scheduler above is the sole owner of automatic shot changes.
   local activePhase=state.phase
   local target=targetFor(ctx,activePhase,base,arena);local pose
+  -- WazaSequence camera entries outrank the semantic CBE camera once their
+  -- source parameter curves are decoded. The handler currently preserves the
+  -- exact entry and returns nil rather than guessing a pose; this seam means the
+  -- future decoder does not require another camera architecture rewrite.
+  local wh=V and V.WazaHandlers
+  local sourceBlend=nil
+  if wh and type(wh.cameraPose)=="function" and not state.manual and (activePhase=="attack" or activePhase=="damage") then
+    local ok,sourcePose=pcall(wh.cameraPose,ctx)
+    if ok and type(sourcePose)=="table" and sourcePose.eye and sourcePose.focus and sourcePose.fov then
+      target=sourcePose
+      sourceBlend=tonumber(sourcePose.blend)
+    end
+  end
   if state.manual then
     if state.phaseAge<0.24 and state.startPose then pose=mix(state.startPose,target,state.phaseAge/0.24) else pose=target end
   elseif state.returning then
@@ -731,8 +789,11 @@ function C:shot(ctx,phase,progress,base,arena)
   elseif activePhase=="passive" or activePhase=="command" then
     if state.startPose and state.phaseAge<0.72 then pose=mix(state.startPose,target,state.phaseAge/0.72) else pose=target end
   else
-    local blend=state.logicSpeed>=4 and 0.62 or (state.logicSpeed>=2 and 0.52 or 0.38)
-    pose=mix(state.startPose or base,target,state.phaseAge/blend)
+    -- Source Waza cameras are already moving on the decoded 60 Hz effect clock;
+    -- use their shorter blend request so the semantic camera cannot spend most
+    -- of a fast move easing toward an angle the effect has already left.
+    local blend=sourceBlend or 0.38
+    pose=mix(state.startPose or base,target,state.phaseAge/math.max(.04,blend))
   end
   state.lastPose=copyPose(pose);return pose,nil
 end
@@ -742,6 +803,6 @@ function C:finish(ctx,reason)
   state.manual=false;state.manualLocked=false;state.manualIdle=0;state.returning=false
 end
 function C:status()
-  return {manual=state.manual,manualLocked=state.manualLocked,manualIdle=state.manualIdle,radius=state.radius,elevation=state.elevation,fov=state.fov,focus=copy3(state.focus),idleShots=#PASSIVE_SHOTS,director="colosseum-semantic-director-v6-visible-boundary-stable-speed-master",shotOffset=state.shotOffset,eventIndex=state.eventIndex,authoredZoomOut=AUTHORED_ZOOM_OUT,phase=state.phase,eventSide=state.eventSide,shotLockRemaining=math.max(0,state.shotLockUntil-state.time),pendingEvent=state.pendingEvent and state.pendingEvent.phase or nil,lastEvent=state.lastEventName,eventResult=state.eventResult,resultPending=state.resultPending,logicSpeed=state.logicSpeed,clock="real-time-from-fixed-step",highSpeedMaster=state.logicSpeed>=2}
+  return {manual=state.manual,manualLocked=state.manualLocked,manualIdle=state.manualIdle,radius=state.radius,elevation=state.elevation,fov=state.fov,focus=copy3(state.focus),idleShots=#PASSIVE_SHOTS,director="colosseum-semantic-director-v9-waza-source-geometry",shotOffset=state.shotOffset,eventIndex=state.eventIndex,authoredZoomOut=AUTHORED_ZOOM_OUT,phase=state.phase,eventSide=state.eventSide,shotLockRemaining=math.max(0,state.shotLockUntil-state.time),pendingEvent=state.pendingEvent and state.pendingEvent.phase or nil,lastEvent=state.lastEventName,eventResult=state.eventResult,resultPending=state.resultPending,logicSpeed=state.logicSpeed,clock="game-time-from-fixed-step",highSpeedMaster=false}
 end
 return C

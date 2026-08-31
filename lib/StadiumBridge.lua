@@ -14,6 +14,54 @@ local BattleSettings=V.BattleSettings
 local CurrentSpriteModels=V.CurrentSpriteModels
 local ModLookup=V.ModLookup
 
+local function cbeOwnsPokemonModels(ctx)
+  local arena=ctx and ctx.arena
+  local id=arena and tostring(arena.id or "") or ""
+  if not id:find("^COLOSSEUM_BATTLE_ENVIRONMENTS:") then return false end
+  local game=(ctx and ctx.game) or (ctx and ctx.battle and ctx.battle.game) or mod.game
+  local arenasEnabled=not (ArenaCatalog and ArenaCatalog.enabled) or ArenaCatalog.enabled(game)
+  local modelsEnabled=not (BattleSettings and BattleSettings.pokemonModelsEnabled)
+    or BattleSettings.pokemonModelsEnabled(game)
+  return arenasEnabled and modelsEnabled
+end
+
+-- StadiumBattleFX's Gen 1 host resolves its private `models` slot AFTER the
+-- selected CBE arena begins.  That model registry is intentionally player-
+-- selected, so CBE cannot reliably change it through the public resolve API.
+-- Instead, make non-CBE model providers decline only while a CBE arena with
+-- COLOSSEUM MODELS enabled owns the battle.  Arena.lua then renders CBE's
+-- CurrentSpriteModels directly inside the same depth buffer.  The provider's
+-- original begin contract is untouched everywhere else, including when the
+-- CBE model toggle is OFF.
+local function gateModelProvider(provider)
+  if type(provider)~="table" or provider==CurrentSpriteModels then return false end
+  if rawget(provider,"__cbeDelegatedModelBegin")~=nil then return true end
+  local original=provider.begin
+  provider.__cbeDelegatedModelBegin=original or false
+  provider.begin=function(self,ctx,...)
+    if cbeOwnsPokemonModels(ctx) then return false end
+    if type(original)=="function" then return original(self,ctx,...) end
+    return true
+  end
+  return true
+end
+
+local function patchDelegatedModels(stadium,api)
+  local count=0
+  local builtin=stadium and stadium.exports and stadium.exports.modelProvider
+  if gateModelProvider(builtin) then count=count+1 end
+  if api and type(api.componentList)=="function" then
+    local ok,list=pcall(api.componentList,api,"models")
+    if ok and type(list)=="table" then
+      for _,entry in ipairs(list) do
+        if type(entry)=="table" and gateModelProvider(entry.provider) then count=count+1 end
+      end
+    end
+  end
+  S.modelGates=count
+  return count
+end
+
 function S.compatible()
   local stadium=ModLookup.find(mod,"STADIUM_BATTLE_FX")
   local api=stadium and stadium.exports and stadium.exports.battles
@@ -56,8 +104,11 @@ local function patchDefaults(stadium,api,arenaId,cameraId)
 end
 
 function S.install()
-  if S.registered then return true end
   local stadium,api=S.compatible()
+  if S.registered then
+    if stadium and api then patchDelegatedModels(stadium,api) end
+    return stadium~=nil and api~=nil
+  end
   if not (stadium and api) then return false end
 
   V.FALLBACK=api.FALLBACK
@@ -86,8 +137,15 @@ function S.install()
   })
 
   patchDefaults(stadium,api,S.arenaProviderId,S.cameraProviderId)
+  patchDelegatedModels(stadium,api)
   S.registered=true
   return true
+end
+
+function S.refreshModelGates()
+  local stadium,api=S.compatible()
+  if not (stadium and api) then return 0 end
+  return patchDelegatedModels(stadium,api)
 end
 
 function S.hasProviderHost()
@@ -133,6 +191,7 @@ function S.status()
     delegated=S.delegated,
     arenaProviderId=S.arenaProviderId,
     cameraProviderId=S.cameraProviderId,
+    modelGates=S.modelGates or 0,
   }
 end
 

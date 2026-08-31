@@ -1,7 +1,7 @@
 {
   "id": "COLOSSEUM_BATTLE_ENVIRONMENTS",
   "name": "Colosseum Battle Environments",
-  "version": "1.2",
+  "version": "1.6.1",
   "api": 2,
   "entry": "main.lua",
   "profile": "content",
@@ -27,24 +27,23 @@
     "compute"
   ],
   "affects_link": false,
-  "description": "Colosseum Battle Environments 1.2 consolidates the current Gen 1/Gen 2 battle-environment runtime, adds per-battle RANDOM arena and RANDOM Colosseum music selection, restores the platform-neutral in-process MusyX source renderer, and supports validated Pokemon Colosseum USA GC6E01 ISO/GCM and GameCube CISO imports through Gen1Recomp required-import streaming. The release keeps the existing transition, Mt. Battle, trainer, camera, sprite-provider and external-mod compatibility fixes while removing the obsolete Windows-only audio executable path.",
+  "description": "Colosseum battle arenas with CBE-owned battle presentation on Gen 1 + Gen 2, source-backed Pokemon/trainer actors, battle-entry precache, solid-floor actor constraints, exhaustive source Waza MoveFX routing, native ISO-derived capture choreography, optional fail-open Colosseum audio, and content-validated cross-platform GameCube source handling.",
   "required_imports": [
     {
       "id": "pokemon_colosseum_usa",
-      "name": "Pokemon Colosseum (USA) Disc (ISO/CISO)",
-      "description": "Required CBE source. Select Pokemon Colosseum USA GC6E01 disc 0 revision 0 as a clean ISO/GCM or supported GameCube CISO. The launcher streams the selected file into persistent private storage; CBE reads CISO in place without expanding it to a 1.46 GiB ISO.",
+      "name": "Pokemon Colosseum (USA) Disc",
+      "description": "Pokemon Colosseum USA GC6E01 source. Representation-aware Gen1Recomp builds accept structurally valid raw ISO/GCM, safely scrubbed/trimmed raw images, and GameCube CISO regardless of filename extension; older launchers retain the canonical ISO and tested CISO hash path. Audio extraction is optional and never blocks CBE visuals.",
       "file": "pokemon_colosseum_usa.iso",
       "md5": [
         "e3f389dc5662b9f941769e370195ec90",
         "a2d58d82c6b76b42653dcd25c8966de7"
       ],
       "format": "raw",
+      "max_size": 2147483648,
       "gcn_ciso": true,
-      "persistent": true,
-      "disc_id": "GC6E01",
-      "disc_revision": 0,
       "allow_scrubbed": true,
-      "max_size": 1459978240
+      "disc_id": "GC6E01",
+      "disc_revision": 0
     }
   ]
 }
