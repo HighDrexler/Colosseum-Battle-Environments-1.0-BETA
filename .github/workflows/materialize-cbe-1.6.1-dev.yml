@@ -36,11 +36,15 @@ jobs:
           test -f /tmp/cbe-release/manifest.json
           test -f /tmp/cbe-release/mod.card
           grep -q '"version": "1.6.1"' /tmp/cbe-release/manifest.json
+          test -f /tmp/cbe-release/lib/PokemonActors.lua
+          test -f /tmp/cbe-release/lib/MoveFXOwnership.lua
+          test -f /tmp/cbe-release/lib/NativeLauncherCompat.lua
+          test -f /tmp/cbe-release/extract/PokemonExtractor.lua
           test -f /tmp/cbe-release/assets/audio/colosseum_battle_entry_sting.wav
           test -f /tmp/cbe-release/assets/cbe/wildlands/ground_meadow_128.rgba
           test -f /tmp/cbe-release/third_party/amuse/amuserender.exe
           echo '65840d001001ec83b9b62fb6d545aa216b08e7ed385c0857b98bbeb7de1dc884  /tmp/cbe-release/third_party/amuse/amuserender.exe' | sha256sum -c -
-          test "$(find /tmp/cbe-release -type f | wc -l)" -eq 71
+          test "$(find /tmp/cbe-release -type f | wc -l)" -eq 70
 
       - name: Replace dev branch root with launcher-ready 1.6.1 tree
         shell: bash
@@ -56,8 +60,12 @@ jobs:
           test -f manifest.json
           test -f mod.card
           grep -q '"version": "1.6.1"' manifest.json
+          test -f lib/PokemonActors.lua
+          test -f lib/MoveFXOwnership.lua
+          test -f lib/NativeLauncherCompat.lua
+          test -f extract/PokemonExtractor.lua
           test -f third_party/amuse/amuserender.exe
-          test "$(find . -type f ! -path './.git/*' | wc -l)" -eq 71
+          test "$(find . -type f ! -path './.git/*' | wc -l)" -eq 70
           test ! -e ColosseumBattleEnvironments-1.6.1.zip
 
       - name: Commit exact 1.6.1 repository tree to dev
