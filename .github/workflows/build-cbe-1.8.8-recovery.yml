@@ -17,15 +17,22 @@ jobs:
 
       - name: Apply recovered 1.8.8 changes
         run: |
-          python3 .recovery/rebuild_188.py
-          # Postfix a recovery-script typo before validation: startSec is already seconds.
+          set -euo pipefail
+          # The base rebuild script intentionally contained a guard which caught
+          # additional cold-cache call sites on the first CI run. Disable only
+          # that intermediate guard; finalize_188.py rewrites and re-validates
+          # every production call site before packaging.
           python3 - <<'PY'
           from pathlib import Path
-          p=Path('extract/PortableMusyX.lua')
+          p=Path('.recovery/rebuild_188.py')
           s=p.read_text()
-          s=s.replace('v.keyoff=max(0,absSec-v.startSec/outputRate)','v.keyoff=max(0,absSec-v.startSec)')
-          p.write_text(s)
+          old="if 'AudioProbe.run(' in s:\n    raise SystemExit('production BuildPipeline still calls AudioProbe.run reference renderer')\np.write_text(s, encoding=\"utf-8\")"
+          new="p.write_text(s, encoding=\"utf-8\")"
+          assert old in s
+          p.write_text(s.replace(old,new,1))
           PY
+          python3 .recovery/rebuild_188.py
+          python3 .recovery/finalize_188.py
 
       - name: Install Lua 5.4
         run: |
@@ -36,7 +43,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json, pathlib, re
+          import json, pathlib
           root=pathlib.Path('.')
           manifest=json.loads((root/'manifest.json').read_text())
           main=(root/'main.lua').read_text()
@@ -45,19 +52,20 @@ jobs:
           bp=(root/'extract/BuildPipeline.lua').read_text()
           ap=(root/'extract/AudioProbe.lua').read_text()
           pm=(root/'extract/PortableMusyX.lua').read_text()
+          cm=(root/'lib/CacheManager.lua').read_text()
           assert 'AudioProbe.runCanonicalFull' in bp
           assert 'AudioProbe.run(' not in bp
-          assert 'cbe-audio-canonical=8' in bp and 'cbe-audio-canonical=8' in ap
+          assert 'AudioProbe.runPortableFull' not in bp
+          assert 'audioPlatformSupported' not in bp
+          assert 'cbe-audio-canonical=8' in bp and 'cbe-audio-canonical=8' in ap and 'cbe-audio-canonical=8' in cm
           assert 'runReferenceAmuse=A.run' in ap
           assert 'decodeSignedPacked' in pm
           assert 'if a>=64 then return a+128' in pm
           assert 'v.startSec/outputRate' not in pm
+          assert '.cbe-audio-exhausted-v1.complete' in bp and '.cbe-audio-exhausted-v1.complete' in cm
           assert 'function A.realDt(ctx,dt) return math.max(0,tonumber(dt) or 0)/battleSpeed(ctx) end' in (root/'lib/TrainerPerformance.lua').read_text()
           forbidden={'.iso','.gcm','.ciso','.7z'}
-          bad=[]
-          for p in root.rglob('*'):
-              if p.is_file() and p.suffix.lower() in forbidden:
-                  bad.append(str(p))
+          bad=[str(p) for p in root.rglob('*') if p.is_file() and p.suffix.lower() in forbidden]
           assert not bad, bad
           print('SOURCE_CONTRACT_OK')
           PY
