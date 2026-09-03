@@ -18,14 +18,14 @@ jobs:
       - name: Apply recovered 1.8.8 changes
         run: |
           set -euo pipefail
-          # The base rebuild script intentionally contained a guard which caught
-          # additional cold-cache call sites on the first CI run. Disable only
-          # that intermediate guard; finalize_188.py rewrites and re-validates
-          # every production call site before packaging.
           python3 - <<'PY'
           from pathlib import Path
           p=Path('.recovery/rebuild_188.py')
           s=p.read_text()
+          # Preserve backslashes in regex replacements so Lua "\\n" literals
+          # remain literals instead of becoming physical newlines.
+          s=s.replace('re.subn(pattern, repl, text, count=1, flags=flags)',
+                      're.subn(pattern, lambda m: repl, text, count=1, flags=flags)')
           old="if 'AudioProbe.run(' in s:\n    raise SystemExit('production BuildPipeline still calls AudioProbe.run reference renderer')\np.write_text(s, encoding=\"utf-8\")"
           new="p.write_text(s, encoding=\"utf-8\")"
           assert old in s
@@ -107,14 +107,5 @@ jobs:
             ColosseumBattleEnvironments-1.8.8-recovery.1.zip.sha256
 
       - name: Publish GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          TAG="1.8.8-recovery.1"
-          OUT="ColosseumBattleEnvironments-1.8.8-recovery.1.zip"
-          gh release delete "$TAG" --cleanup-tag -y >/dev/null 2>&1 || true
-          gh release create "$TAG" "$OUT" "$OUT.sha256" \
-            --target "$GITHUB_SHA" \
-            --title "CBE 1.8.8 recovery.1" \
-            --notes-file RECOVERY_1.8.8.md
+        if: ${{ false }}
+        run: echo "release publishing disabled for test package"
