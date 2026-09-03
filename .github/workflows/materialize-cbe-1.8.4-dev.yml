@@ -1,0 +1,53 @@
+name: Materialize CBE 1.8.4 dev
+
+on:
+  push:
+    paths:
+      - '.materialize/READY-1.8.4'
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download and validate exact CBE 1.8.4 release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 2 \
+            'https://github.com/HighDrexler/Colosseum-Battle-Environments-1.0-BETA/releases/download/1.8.4/ColosseumBattleEnvironments-1.8.4.zip' \
+            -o /tmp/ColosseumBattleEnvironments-1.8.4.zip
+          echo 'ef1028d307d20369d67d3ca00570d4633a23b6188f5fe25e1cda2bf352dde572  /tmp/ColosseumBattleEnvironments-1.8.4.zip' | sha256sum -c -
+          rm -rf /tmp/cbe184
+          mkdir -p /tmp/cbe184
+          unzip -q /tmp/ColosseumBattleEnvironments-1.8.4.zip -d /tmp/cbe184
+          test -f /tmp/cbe184/main.lua
+          test -f /tmp/cbe184/manifest.json
+          test -f /tmp/cbe184/mod.card
+          grep -q '"version": "1.8.4-capture-member-hsd.1"' /tmp/cbe184/manifest.json
+          test "$(find /tmp/cbe184 -type f | wc -l)" -eq 132
+      - name: Replace dev tree with exact 1.8.4 build
+        shell: bash
+        run: |
+          set -euo pipefail
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a /tmp/cbe184/. .
+          test -f main.lua
+          test -f manifest.json
+          test -f mod.card
+          grep -q '"version": "1.8.4-capture-member-hsd.1"' manifest.json
+          test "$(find . -type f ! -path './.git/*' | wc -l)" -eq 132
+      - name: Commit exact 1.8.4 tree to dev
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'HighDrexler'
+          git config user.email 'actions@users.noreply.github.com'
+          git add -A
+          git commit -m 'Replace dev with Colosseum Battle Environments 1.8.4'
+          git push --force origin HEAD:dev
