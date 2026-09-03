@@ -2,12 +2,26 @@ from pathlib import Path
 import re
 
 ROOT=Path(__file__).resolve().parents[1]
-
-# The full cold-cache builder has its own soundtrack branch after visual verify.
-# Replace that entire platform split with the same canonical renderer used by
-# the audio-only repair path.
 p=ROOT/'extract/BuildPipeline.lua'
 s=p.read_text(encoding='utf-8')
+
+# Existing verified visual runtime: canonical cache hit or the common audio-only
+# repair path. Remove the old platform split here first so the cold-cache rewrite
+# below cannot accidentally begin at this earlier occurrence.
+early_pattern=r'''  if visualReady\(mod\) then\n    if audioReady\(mod\) then\n      return \{state="READY",visualReady=true,audioReady=true,message="Persistent generated runtime already present; audio cache reused\."\}\n    end\n.*?    return audioOnly\(mod,progress\)\n  end\n'''
+early_replacement='''  if visualReady(mod) then
+    if audioReady(mod) then
+      return {state="READY",visualReady=true,audioReady=true,message="Persistent generated runtime already present; canonical audio cache reused."}
+    end
+    return audioOnly(mod,progress)
+  end
+'''
+s,n=re.subn(early_pattern,lambda m: early_replacement,s,count=1,flags=re.S)
+if n!=1:
+    raise SystemExit(f'visual-ready audio fastpath patch failed: {n}')
+
+# Full cold-cache builder: after visual verification, run the same canonical
+# renderer on every host instead of the old Windows/non-Windows split.
 pattern=r'''    local audioSupported,osName=audioPlatformSupported\(\)\n.*?    return \{state="READY",visualReady=true,audioReady=true,files=#disc\.files,fsys=fsysCount,trainerResolved=state\.trainer_resolved,trainerTotal=state\.trainer_total,trainerDiagnostic=state\.trainer_diagnostic,message=state\.message\}\n'''
 replacement='''    state.current_stage="audio";state.audio_ready=0
     state.message="Generating canonical source-backed Colosseum soundtrack cache";saveState();update("CANONICAL AUDIO 1/24",8,9)
@@ -27,9 +41,8 @@ s,n=re.subn(pattern,lambda m: replacement,s,count=1,flags=re.S)
 if n!=1:
     raise SystemExit(f'cold-cache audio block patch failed: {n}')
 
-# The outer build pcall is the one and only failure boundary for a cold-cache
-# canonical render. A real attempted failure writes the exhaustion marker so
-# ordinary relaunches do not repeat the expensive render loop.
+# A real attempted canonical failure is fail-open only for the already-verified
+# visual runtime and records exhaustion so ordinary boots do not recache forever.
 pattern=r'''    if \(failedStage=="audio" or failedStage=="audio_portable"\) and visualSurvived then\n.*?      return \{state="READY / AUDIO OPTIONAL",visualReady=true,audioReady=false,audioUnavailable=true,trainerResolved=state\.trainer_resolved,trainerTotal=state\.trainer_total,trainerDiagnostic=state\.trainer_diagnostic,trainerFirstError=state\.trainer_first_error,trainerSourceError=state\.trainer_source_error,message=state\.message\}\n    end'''
 replacement='''    if (failedStage=="audio" or failedStage=="audio_portable") and visualSurvived then
       state.current_stage="ready_visual";state.audio_ready=0
