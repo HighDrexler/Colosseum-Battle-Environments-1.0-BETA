@@ -1,0 +1,112 @@
+name: Build CBE 1.8.8 recovery
+
+on:
+  push:
+    branches: [ recovery-1.8.8-audio ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout recovery source
+        uses: actions/checkout@v4
+
+      - name: Apply recovered 1.8.8 changes
+        run: |
+          python3 .recovery/rebuild_188.py
+          # Postfix a recovery-script typo before validation: startSec is already seconds.
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('extract/PortableMusyX.lua')
+          s=p.read_text()
+          s=s.replace('v.keyoff=max(0,absSec-v.startSec/outputRate)','v.keyoff=max(0,absSec-v.startSec)')
+          p.write_text(s)
+          PY
+
+      - name: Install Lua 5.4
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lua5.4 zip
+
+      - name: Validate package source
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib, re
+          root=pathlib.Path('.')
+          manifest=json.loads((root/'manifest.json').read_text())
+          main=(root/'main.lua').read_text()
+          assert manifest['version']=='1.8.8-recovery.1', manifest['version']
+          assert 'local VERSION="1.8.8-recovery.1"' in main
+          bp=(root/'extract/BuildPipeline.lua').read_text()
+          ap=(root/'extract/AudioProbe.lua').read_text()
+          pm=(root/'extract/PortableMusyX.lua').read_text()
+          assert 'AudioProbe.runCanonicalFull' in bp
+          assert 'AudioProbe.run(' not in bp
+          assert 'cbe-audio-canonical=8' in bp and 'cbe-audio-canonical=8' in ap
+          assert 'runReferenceAmuse=A.run' in ap
+          assert 'decodeSignedPacked' in pm
+          assert 'if a>=64 then return a+128' in pm
+          assert 'v.startSec/outputRate' not in pm
+          assert 'function A.realDt(ctx,dt) return math.max(0,tonumber(dt) or 0)/battleSpeed(ctx) end' in (root/'lib/TrainerPerformance.lua').read_text()
+          forbidden={'.iso','.gcm','.ciso','.7z'}
+          bad=[]
+          for p in root.rglob('*'):
+              if p.is_file() and p.suffix.lower() in forbidden:
+                  bad.append(str(p))
+          assert not bad, bad
+          print('SOURCE_CONTRACT_OK')
+          PY
+          count=0
+          while IFS= read -r -d '' f; do
+            luac5.4 -p "$f"
+            count=$((count+1))
+          done < <(find . -type f -name '*.lua' -not -path './.git/*' -print0)
+          echo "LUA_PARSE_OK $count"
+
+      - name: Build launcher-ready ZIP
+        run: |
+          set -euo pipefail
+          OUT="ColosseumBattleEnvironments-1.8.8-recovery.1.zip"
+          rm -f "$OUT" "$OUT.sha256"
+          zip -q -r "$OUT" . \
+            -x '.git/*' '.github/*' '.recovery/*' '.materialize/*' \
+               '*.zip' '*.sha256'
+          unzip -t "$OUT"
+          python3 - <<'PY'
+          import json, zipfile
+          z=zipfile.ZipFile('ColosseumBattleEnvironments-1.8.8-recovery.1.zip')
+          names=set(z.namelist())
+          assert 'main.lua' in names
+          assert 'manifest.json' in names
+          assert 'mod.card' in names
+          m=json.loads(z.read('manifest.json'))
+          assert m['version']=='1.8.8-recovery.1'
+          print('ZIP_ROOT_OK', len(names))
+          PY
+          sha256sum "$OUT" | tee "$OUT.sha256"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CBE-1.8.8-recovery.1
+          path: |
+            ColosseumBattleEnvironments-1.8.8-recovery.1.zip
+            ColosseumBattleEnvironments-1.8.8-recovery.1.zip.sha256
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="1.8.8-recovery.1"
+          OUT="ColosseumBattleEnvironments-1.8.8-recovery.1.zip"
+          gh release delete "$TAG" --cleanup-tag -y >/dev/null 2>&1 || true
+          gh release create "$TAG" "$OUT" "$OUT.sha256" \
+            --target "$GITHUB_SHA" \
+            --title "CBE 1.8.8 recovery.1" \
+            --notes-file RECOVERY_1.8.8.md
