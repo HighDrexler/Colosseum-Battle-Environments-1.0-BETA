@@ -156,6 +156,10 @@ function H.begin(battle)
     s.ownershipOnly=true
     s.beginError=tostring(why)
     H.lastError=tostring(why)
+    local m=V.mod
+    if m and m.cache and type(m.cache.write)=="function" then
+      pcall(m.cache.write,m.cache,"build/android_battle_render_error.txt",("stage=Arena.begin\nerror=%s\ngeneration=%s\n"):format(tostring(why),tostring(battle and battle.__cbeGeneration or "?")))
+    end
     local level=(why=="arena definition unavailable" or why=="arena declined") and "warn" or "error"
     log(level,"standalone arena begin failed under retained CBE ownership: %s",tostring(why))
     return false
@@ -167,12 +171,19 @@ function H.begin(battle)
   return true
 end
 
+local releaseGen1PresentationFaints
+
 function H.update(dt)
   local s=H.session
   if not (s and s.started) then return end
   dt=tonumber(dt) or 0
   s.context.progress=(s.context.progress or 0)+dt
   syncBattlers(s)
+  -- Gen 1 commits lethal HP in battle logic before the queued HP drain/faint
+  -- presentation is visible. Release a buffered KO only when the engine says
+  -- its actual faint slide has begun, so CBE cannot collapse/remove the model
+  -- while the HP bar is still draining (especially obvious at 4x).
+  if releaseGen1PresentationFaints then releaseGen1PresentationFaints(s) end
   if syncCameraOwnership(s) then pcall(Camera.update,Camera,s.context,dt) end
   if Arena then
     local ok,err=pcall(Arena.update,Arena,s.context,dt,s.context.arena)
@@ -212,8 +223,8 @@ local function stashSemantic(s,name,payload)
   local side=semanticSide(s,name,payload)
   local buckets=s.pendingSemantics and s.pendingSemantics[kind]
   local bucket=buckets and side and buckets[side]
-  if bucket then bucket[#bucket+1]=payload end
-  return true
+  if bucket then bucket[#bucket+1]=payload;return true end
+  return false
 end
 
 local function takeSemantic(s,kind,side)
@@ -239,6 +250,35 @@ local function visiblePayload(s,battle,kind,side,event)
   if kind=="move" then out.moveId=(event and event.move) or out.moveId end
   out.presentationBoundary=true
   return out
+end
+
+releaseGen1PresentationFaints=function(s)
+  local battle=s and s.battle
+  if not battle then return end
+  local gen2=Compat and Compat.isGen2Battle and Compat.isGen2Battle(battle)
+  if gen2 or battle.__cbePresentationQueueSync~=true then return end
+  for _,side in ipairs({"player","enemy"}) do
+    local bucket=s.pendingSemantics and s.pendingSemantics.faint and s.pendingSemantics.faint[side]
+    if type(bucket)=="table" and #bucket>0 then
+      local battler=battle[side]
+      local active=false
+      if battler and type(battle.fxFaintActive)=="function" then
+        local ok,value=pcall(battle.fxFaintActive,battle,battler)
+        active=ok and value==true
+      end
+      -- `battler.fainted` flips from the same queued faint action. Keep it as a
+      -- compatibility fallback for engine revisions that do not expose
+      -- fxFaintActive, never as the early HP==0 semantic used by onFaint().
+      if not active and battler and battler.fainted==true then active=true end
+      if active then
+        H.presentationFaintEvents=(H.presentationFaintEvents or 0)+1
+        H.gen1PresentationFaintEvents=(H.gen1PresentationFaintEvents or 0)+1
+        H.event("battle.presentation_faint",visiblePayload(s,battle,"faint",side,{
+          side=side,presentationBoundary="gen1-faint-slide",
+        }))
+      end
+    end
+  end
 end
 
 local CAPTURE_ANIMS={
@@ -314,8 +354,10 @@ function H.event(name,payload)
   -- keeps Pokemon, trainers, FX and camera on the SAME visible frame instead of
   -- allowing one subsystem to react several text/animation rows early.
   local gen2=Compat and Compat.isGen2Battle and Compat.isGen2Battle(s.battle)
-  if gen2 and (name=="battle.move_used" or name=="battle.damage_dealt" or name=="battle.fainted") then
-    stashSemantic(s,name,payload)
+  local rawQueueSemantic=name=="battle.move_used" or name=="battle.damage_dealt" or name=="battle.fainted"
+  local deferGen1Faint=(not gen2) and name=="battle.fainted"
+    and s.battle and s.battle.__cbePresentationQueueSync==true
+  if ((gen2 and rawQueueSemantic) or deferGen1Faint) and stashSemantic(s,name,payload) then
     return
   end
   -- Switches replace BattleState.player/enemy. Refresh the presentation
@@ -352,6 +394,12 @@ function H.event(name,payload)
   end
 end
 
+local function persistRenderError(stage,err)
+  local msg=("stage=%s\nerror=%s\nframes=%s\ngeneration=%s\n"):format(tostring(stage),tostring(err),tostring(H.frames or 0),tostring(H.session and H.session.battle and H.session.battle.__cbeGeneration or "?"))
+  local m=V.mod
+  if m and m.cache and type(m.cache.write)=="function" then pcall(m.cache.write,m.cache,"build/android_battle_render_error.txt",msg) end
+end
+
 local function render(s)
   local battle=Compat and Compat.sync(s.battle) or s.battle
   s.battle=battle;s.context.battle=battle;s.context.game=(battle and battle.game) or s.context.game
@@ -375,9 +423,12 @@ local function render(s)
     if CurrentSprites then CurrentSprites:drawWorld(s.context) end
   end)
   if not ok then
-    H.lastError=tostring(surface);log("error","standalone arena render failed: %s",tostring(surface));return nil
+    H.lastError=tostring(surface);persistRenderError("Arena.render",surface);log("error","standalone arena render failed: %s",tostring(surface));return nil
   end
-  if not surface or surface==true or surface==V.FALLBACK then return nil end
+  if not surface or surface==true or surface==V.FALLBACK then
+    persistRenderError("Arena.render.return",surface)
+    return nil
+  end
   local gen2=Compat and Compat.isGen2Battle(battle)
   local renderer=battle.game and battle.game.renderer
   if not gen2 then
@@ -417,8 +468,19 @@ local function cbeModelsEnabled(battle)
 end
 
 local function captureHidesNativeEnemy(battle)
-  if not (PlayerTrainer and type(PlayerTrainer.captureStatus)=="function") then return false end
-  local ok,status=pcall(PlayerTrainer.captureStatus,PlayerTrainer,{battle=battle,game=battle and battle.game})
+  if not PlayerTrainer then return false end
+  local ctx={battle=battle,game=battle and battle.game}
+  -- captureHidesEnemy carries the successful-catch terminal latch through the
+  -- Pokédex/nickname flow. captureStatus.active intentionally ends when the
+  -- cinematic ends, so using only it allowed the native enemy picture to pop
+  -- back in immediately after a successful catch.
+  if type(PlayerTrainer.captureHidesEnemy)=="function" then
+    local ok,hidden=pcall(PlayerTrainer.captureHidesEnemy,PlayerTrainer,ctx)
+    if ok then return hidden==true end
+  end
+  -- Compatibility fallback for older PlayerTrainer implementations only.
+  if type(PlayerTrainer.captureStatus)~="function" then return false end
+  local ok,status=pcall(PlayerTrainer.captureStatus,PlayerTrainer,ctx)
   return ok and type(status)=="table" and status.active==true
 end
 
@@ -494,7 +556,20 @@ local function withoutGen2Field(view,battle,fn,fieldW,fieldH)
       local side=back and "player" or "enemy"
       local trainerHidden=V.NativeTrainerSprites and type(V.NativeTrainerSprites.hides)=="function"
         and V.NativeTrainerSprites:hides(battle,side)
-      if H.suppressesNativeSide(battle,side) or trainerHidden then return end
+      -- Gen 2 uses the same drawPic entry point for both battler pictures and
+      -- the player/enemy TRAINER intro pictures.  The generic CBE Pokemon-side
+      -- suppressor must never be applied to a trainer call: on Windows a 3D
+      -- trainer backend fault then caused BOTH the 3D actor and the native
+      -- fallback trainer to disappear.  Trainer ownership is exclusively
+      -- capability-driven by NativeTrainerSprites; Pokemon ownership remains
+      -- side-driven for ordinary battler pictures.
+      local trainerCall=(back and battle and battle.showPlayerBack==true)
+        or ((not back) and battle and battle.showEnemyTrainer==true)
+      if trainerCall then
+        if trainerHidden then return end
+      elseif H.suppressesNativeSide(battle,side) then
+        return
+      end
       return inheritedDrawPic(self,mon,back,...)
     end
   end
@@ -539,10 +614,91 @@ local function withoutBattleField(battle,fn)
   return res
 end
 
+local function installGen1FrameIsolation(req)
+  -- Gen 1 composites CBE through Renderer.worldOverride. The engine's stock
+  -- worldOverride contract assumes that canvas is PHYSICAL-window-sized and
+  -- therefore blits it at 1/dpi. CBE intentionally renders its Android 3D
+  -- world at a smaller logical/capped resolution to keep the color+depth
+  -- working set sane. On a 2x-density phone that old contract consequently
+  -- shrank the already-smaller arena again, producing the exact half-width /
+  -- half-height top-left image reported with Mobile Battle UI.
+  --
+  -- Gold is unaffected because its battle compositor explicitly scales the
+  -- CBE surface into the Gen 2 battle target. Mirror that behavior ONLY at
+  -- Gen 1's final worldOverride draw: preserve the low-resolution 3D render,
+  -- but scale the finished surface to the renderer's live playfield rectangle.
+  local okRenderer,Renderer=pcall(req,"src.render.Renderer")
+  if not okRenderer or type(Renderer)~="table" or type(Renderer.endFrame)~="function" then return false end
+  if Renderer.endFrame==H.frameWrapper then return true end
+  local inner=Renderer.endFrame
+  H.frameEpoch=(H.frameEpoch or 0)+1
+  local epoch=H.frameEpoch
+  H.frameWrapper=function(self,...)
+    if epoch~=H.frameEpoch then return inner(self,...) end
+    local args={...}
+    local session=H.session
+    local battle=session and session.battle
+    local gen2=Compat and Compat.isGen2Battle and Compat.isGen2Battle(battle)
+    local override=session and session.started and not gen2 and self.worldOverride or nil
+    local g=love and love.graphics
+    local originalDraw=g and g.draw
+    local patchedDraw=false
+
+    if override and g then
+      -- endFrame is a physical-window compositor and must always begin in
+      -- identity screen space. HUD/touch overlays after endFrame are also
+      -- screen-space consumers, so identity is the correct outgoing state.
+      if g.origin then g.origin() end
+      if g.setScissor then g.setScissor() end
+      H.gen1FrameResets=(H.gen1FrameResets or 0)+1
+
+      local rx,ry,rw,rh
+      if type(self.frameRects)=="function" then
+        local okR,R=pcall(self.frameRects,self)
+        if okR and type(R)=="table" then
+          rx,ry,rw,rh=tonumber(R.vux),tonumber(R.vuy),tonumber(R.vuw),tonumber(R.vuh)
+        end
+      end
+      if not (rx and ry and rw and rh and rw>0 and rh>0) and type(self.playfieldRect)=="function" then
+        local okR,x,y,w,h=pcall(self.playfieldRect,self)
+        if okR then rx,ry,rw,rh=tonumber(x),tonumber(y),tonumber(w),tonumber(h) end
+      end
+
+      if originalDraw and rx and ry and rw and rh and rw>0 and rh>0 then
+        g.draw=function(drawable,x,y,r,sx,sy,...)
+          if drawable==override then
+            local okD,sw,sh=pcall(drawable.getDimensions,drawable)
+            sw,sh=tonumber(sw),tonumber(sh)
+            if okD and sw and sh and sw>0 and sh>0 then
+              local flipY=(tonumber(sy) or 1)<0
+              x=rx
+              y=flipY and (ry+rh) or ry
+              sx=rw/sw
+              sy=(flipY and -1 or 1)*(rh/sh)
+              H.gen1ViewportRescales=(H.gen1ViewportRescales or 0)+1
+              H.gen1ViewportLast={sourceW=sw,sourceH=sh,targetW=rw,targetH=rh,scaleX=sx,scaleY=sy}
+            end
+          end
+          return originalDraw(drawable,x,y,r,sx,sy,...)
+        end
+        patchedDraw=true
+      end
+    end
+
+    local results={pcall(inner,self,unpack(args))}
+    if patchedDraw and g then g.draw=originalDraw end
+    if not results[1] then error(results[2],0) end
+    return unpack(results,2)
+  end
+  Renderer.endFrame=H.frameWrapper
+  return true
+end
+
 function H.install(force)
   local req=V.engineRequire or require
   local ok,BattleState=pcall(req,"src.battle.BattleState")
   if not ok or type(BattleState)~="table" then H.lastError=tostring(BattleState);return false end
+  installGen1FrameIsolation(req)
 
   if type(BattleState.drawPicsLayer)=="function" and BattleState.drawPicsLayer~=H.picsWrapper then
     local inner=BattleState.drawPicsLayer
@@ -804,6 +960,11 @@ function H.install(force)
         drawGen2Surface(surface,w,h)
         return withoutGen2Field(self,battle,function() return inner(self,w,h,unpack(args)) end,w,h)
       end
+      if owns and Compat and Compat.isGen2Battle(battle) then
+        -- Never turn a CBE renderer fault into an apparently successful vanilla
+        -- battle. Preserve HUD/input while keeping the native paper field out.
+        return withoutGen2Field(self,battle,function() return inner(self,w,h,unpack(args)) end,w,h)
+      end
       return inner(self,w,h,unpack(args))
     end
     BattleState.drawWidescreen=H.wideWrapper
@@ -831,9 +992,9 @@ function H.status()
   return {installed=H.installed,active=s~=nil,started=s and s.started==true,ownershipOnly=s and s.ownershipOnly==true,generation=(s and s.battle and s.battle.__cbeGeneration) or 1,arena=s and s.context.arena and s.context.arena.id or nil,
     actor="current-sprites",playerSpecies=ps and ps.mon and ps.mon.species or nil,enemySpecies=es and es.mon and es.mon.species or nil,
     cameraActive=s and s.cameraActive==true,cameraMode=not s and "inactive" or (s.cameraActive and "cinematic" or "neutral-static"),frames=H.frames,
-    externalPresentation=s and s.externalPresentation or nil,externalFrames=H.externalFrames,presentationMoveEvents=H.presentationMoveEvents,presentationDamageEvents=H.presentationDamageEvents,presentationFaintEvents=H.presentationFaintEvents,
+    externalPresentation=s and s.externalPresentation or nil,externalFrames=H.externalFrames,presentationMoveEvents=H.presentationMoveEvents,presentationDamageEvents=H.presentationDamageEvents,presentationFaintEvents=H.presentationFaintEvents,gen1PresentationFaintEvents=H.gen1PresentationFaintEvents or 0,
     captureQueueHolds=H.captureQueueHolds or 0,captureRowsStripped=H.captureRowsStripped or 0,captureUiSuppressed=H.captureUiSuppressed or 0,
-    captureFlow=s and s.captureHold and "cbe-wall-clock-hold" or nil,
+    captureFlow=s and s.captureHold and "cbe-wall-clock-hold" or nil,gen1FrameResets=H.gen1FrameResets or 0,gen1ViewportRescales=H.gen1ViewportRescales or 0,gen1ViewportLast=H.gen1ViewportLast,
     error=H.lastError,updateError=H.lastUpdateError,contract="CBE BattleState/world/camera/trainer stage is absolute on Gen 1 + Gen 2 while Arenas ON; render failure never delegates"}
 end
 return H

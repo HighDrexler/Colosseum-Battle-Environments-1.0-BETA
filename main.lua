@@ -1,5 +1,5 @@
 local mod=...
-local VERSION="1.6.1"
+local VERSION="1.8.4-capture-member-hsd.1"
 mod.exports.version=VERSION
 
 local function package(path,arg)
@@ -16,6 +16,15 @@ end
 local NativeLauncherCompat=package("lib/NativeLauncherCompat.lua")
 local launcherCompat=NativeLauncherCompat.install(mod)
 local BuildProgressUI=package("lib/BuildProgressUI.lua")
+
+local function platformOS()
+  if love and love.system and type(love.system.getOS)=="function" then
+    local ok,v=pcall(love.system.getOS);if ok and v then return tostring(v) end
+  end
+  return "Unknown"
+end
+local PLATFORM_OS=platformOS()
+local IS_ANDROID=PLATFORM_OS=="Android"
 
 -- Build the user-owned Colosseum source into an installation-scoped runtime
 -- before any battle provider is allowed to acquire generated content.
@@ -53,7 +62,9 @@ local function runBuild()
   local HSD=package("extract/HSD.lua",{GXTexture=GXTexture})
   local ArenaBuilder=package("extract/ArenaBuilder.lua",{HSD=HSD,FSYS=FSYS})
   local TransitionBuilder=package("extract/TransitionBuilder.lua")
-  local AudioProbe=package("extract/AudioProbe.lua",{FSYS=FSYS})
+  local PortableMusyX=package("extract/PortableMusyX.lua")
+  local AudioProbe=package("extract/AudioProbe.lua",{FSYS=FSYS,PortableMusyX=PortableMusyX})
+  local WazaSfxBuilder=package("extract/WazaSfxBuilder.lua",{FSYS=FSYS,PortableMusyX=PortableMusyX})
   local TrainerExtractor=package("extract/TrainerExtractor.lua",{HSD=HSD,FSYS=FSYS})
   local ColosseumDex=package("lib/ColosseumDex.lua")
   local PKXMetadata=package("extract/PKXMetadata.lua",{FSYS=FSYS,ColosseumDex=ColosseumDex})
@@ -69,8 +80,9 @@ local function runBuild()
   local BuildPipeline=package("extract/BuildPipeline.lua",{
     GameCubeDisc=GameCubeDisc,FSYS=FSYS,GXTexture=GXTexture,HSD=HSD,
     ArenaBuilder=ArenaBuilder,TrainerExtractor=TrainerExtractor,
-    TransitionBuilder=TransitionBuilder,AudioProbe=AudioProbe,
+    TransitionBuilder=TransitionBuilder,AudioProbe=AudioProbe,WazaSfxBuilder=WazaSfxBuilder,
     PokemonExtractor=PokemonExtractor,MoveFXExtractor=MoveFXExtractor,FormatProbe=FormatProbe,CameraProbe=CameraProbe,ColosseumDex=ColosseumDex,
+    LauncherCompat=launcherCompat,BuildVersion=VERSION,PlatformOS=PLATFORM_OS,
   })
   BuildPipelineRef=BuildPipeline
   extractionStatus={state="RUNNING",visualReady=false,audioReady=false,message="Starting GC6E01 source build."}
@@ -124,11 +136,14 @@ end
 
 local Mat4=module("Mat4");namespace.Mat4=Mat4
 local GeneratedAssets=loadModule("GeneratedAssets")
+local RuntimeMeshCache=loadModule("RuntimeMeshCache")
 namespace.MoveFXExtractor=MoveFXExtractorRef
 local MoveFXVM=loadModule("MoveFXVM")
 local WazaSequenceRuntime=loadModule("WazaSequenceRuntime")
 local GenerationCompat=loadModule("GenerationCompat")
 local TrainerRig=loadModule("TrainerRig")
+-- Shared trainer morph binding. MUST load before Trainer/PlayerTrainer.
+local TrainerMorph=loadModule("TrainerMorph")
 local TrainerPerformance=loadModule("TrainerPerformance")
 local BattleSides=loadModule("BattleSides")
 local BattleDirector=loadModule("BattleDirector")
@@ -211,13 +226,55 @@ if runtimeAllowed then
       if game then
         Music.attachGame(game)
         if ArenaCatalog.sync then ArenaCatalog.sync(game) end
-        -- Shift arena/trainer cache parsing and GPU allocation to the normal
-        -- game-ready seam rather than the battle transition's final black
-        -- frame. This is presentation-only prewarming; battle ownership/state
-        -- is not started. Arena/model caches and the lead Pokemon's source WZX
-        -- banks may be warmed here so visible battle frames never perform disc decode.
-        if Arena and type(Arena.prewarm)=="function" then
-          pcall(Arena.prewarm,Arena,{game=game,battle=nil,phase="prewarm",progress=1,services={cbeStandalone=true}})
+        -- PERFORMANCE CACHE POLICY (1.7.10): all heavyweight materialization
+        -- happens at an explicit readiness seam, never in ordinary input.step.
+        -- On Android, AUTO holds exactly the two arenas it can resolve to
+        -- (Water trainer battles + Wildlands wild battles). Arena.lua also
+        -- writes compact float32 runtime mesh sidecars, so later sessions and
+        -- LRU reloads bypass the giant human-readable vertex Lua caches.
+        local warmCtx={game=game,battle=nil,phase="game-ready-prewarm",progress=1,services={cbeStandalone=true,androidResidentWarm=IS_ANDROID}}
+        local selected=ArenaCatalog and type(ArenaCatalog.selected)=="function" and ArenaCatalog.selected(game) or "auto"
+        if IS_ANDROID and Arena then
+          if selected=="auto" and type(Arena.prewarmAutoPair)=="function" then
+            pcall(Arena.prewarmAutoPair,Arena,warmCtx)
+          elseif selected=="random" and ArenaCatalog and type(ArenaCatalog.primeRandom)=="function" then
+            local okPrime,def=pcall(ArenaCatalog.primeRandom,game)
+            if okPrime and type(def)=="table" and type(Arena.prewarmDefinition)=="function" then
+              pcall(Arena.prewarmDefinition,Arena,warmCtx,def.id)
+            elseif type(Arena.prewarmResident)=="function" then
+              pcall(Arena.prewarmResident,Arena,warmCtx)
+            end
+          elseif type(Arena.prewarmDefinition)=="function" then
+            pcall(Arena.prewarmDefinition,Arena,warmCtx,selected)
+          elseif type(Arena.prewarmResident)=="function" then
+            pcall(Arena.prewarmResident,Arena,warmCtx)
+          end
+        elseif Arena and type(Arena.prewarm)=="function" then
+          pcall(Arena.prewarm,Arena,warmCtx)
+        end
+
+        -- Allocate the bounded Android battle framebuffer once at game-ready.
+        -- Arena geometry was already resident in 1.7.9, but the first battle
+        -- could still pay a color/depth canvas allocation + driver setup on its
+        -- first CBE render. The mobile surface is capped by Arena.mobileCanvasSize
+        -- (~720p), so this is a modest fixed VRAM cost rather than a full native-
+        -- resolution phone framebuffer. Resize/orientation changes still rebuild
+        -- it lazily through ensureCanvas().
+        if IS_ANDROID and Arena and type(Arena.prewarmFramebuffer)=="function" then
+          pcall(Arena.prewarmFramebuffer,Arena)
+        end
+
+        -- Prime the player's authored trainer actor once at game-ready.
+        if PlayerTrainer and type(PlayerTrainer.prewarm)=="function" then pcall(PlayerTrainer.prewarm,PlayerTrainer,warmCtx) end
+
+        -- TrainerRoster's game-ready plan is intentionally tiny (configured
+        -- rival + common/forced enemy). Drain it here rather than pacing it
+        -- through overworld input, where an upload can coincide with an
+        -- encounter and prevent the transition from drawing.
+        if IS_ANDROID and Trainer and type(Trainer.queuePrewarm)=="function" then
+          pcall(Trainer.queuePrewarm,Trainer,game)
+          if type(Trainer.drainPrewarm)=="function" then pcall(Trainer.drainPrewarm,Trainer,game,2)
+          elseif type(Trainer.pumpPrewarm)=="function" then pcall(Trainer.pumpPrewarm,Trainer,game) end
         end
         if CurrentSpriteModels and type(CurrentSpriteModels.prewarm)=="function" then
           pcall(CurrentSpriteModels.prewarm,CurrentSpriteModels)
@@ -225,16 +282,28 @@ if runtimeAllowed then
         if WazaHandlers and type(WazaHandlers.prewarm)=="function" then
           pcall(WazaHandlers.prewarm)
         end
-        if PokemonActors and type(PokemonActors.prewarmParty)=="function" then
+
+        -- Materialize ALL already-extracted party base bodies now, but do not
+        -- start any new Pokemon extraction and do not upload native action
+        -- banks. Runtime binary sidecars make this bounded and much cheaper
+        -- than the old full prewarmParty path.
+        if IS_ANDROID and PokemonActors and type(PokemonActors.prewarmPartyBase)=="function" then
+          pcall(PokemonActors.prewarmPartyBase,game)
+        elseif PokemonActors and type(PokemonActors.prewarmParty)=="function" then
           pcall(PokemonActors.prewarmParty,game)
         end
-        -- Warm the lead Pokemon's four WZX banks while the normal game-ready
-        -- screen is active. This moves the most common source FX decode away
-        -- from the first battle transition; BattleDirector completes only the
-        -- still-missing current battler banks before its world opens.
+
         if MoveFXExtractorRef and type(MoveFXExtractorRef.queueParty)=="function" then
-          pcall(MoveFXExtractorRef.queueParty,game,1)
-          if type(MoveFXExtractorRef.pumpPrefetch)=="function" then pcall(MoveFXExtractorRef.pumpPrefetch,4) end
+          -- 1.7.11's generated cache already contains every Gen-I/II WZX bank,
+          -- so resolving all six party movesets here is cache-only work: no
+          -- GameCube image access and no GPU upload. This removes first-use
+          -- effect metadata stalls later in battle while models/audio themselves
+          -- remain bounded/lazy. Older/incomplete caches still only QUEUE misses.
+          pcall(MoveFXExtractorRef.queueParty,game,6)
+          if type(MoveFXExtractorRef.pumpPrefetch)=="function" then pcall(MoveFXExtractorRef.pumpPrefetch,IS_ANDROID and 2 or 4) end
+        end
+        if IS_ANDROID and mod.log and mod.log.info then
+          pcall(mod.log.info,mod.log,"CBE Android performance-polish policy active: state-change guard + resident working sets + runtime mesh sidecars + preallocated mobile framebuffer")
         end
       end
     end)

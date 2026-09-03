@@ -1,21 +1,25 @@
 local V=...
 local mod=V.mod
 local GeneratedAssets=V.GeneratedAssets
-local C={schema=16,lastAction=nil,cacheVersion=2,extractorRevision=12}
+local C={schema=17,lastAction=nil,cacheVersion=2,extractorRevision=15}
 local AUDIO_MARKER="cbe-audio=3\nassets=24\nsource=GC6E01\n"
-local ARENA_MARKER=[=[cbe-arena=6
-water=GC6E01/M1_water_colo.fsys/M1_water_colo.dat/source-hsd-scene
-orre=GC6E01/T1_ancient_colo.fsys/T1_ancient_colo.dat/source-hsd-scene
-realgam=GC6E01/D4_casino_colo.fsys/D4_casino_colo.dat/source-hsd-scene
-wildlands=grounded-solid-grass
+local PORTABLE_AUDIO_MARKER="cbe-audio-portable=core2\nsource=GC6E01\ntransition=dsp92\ndecoder=fresh-history\n"
+local PORTABLE_AUDIO_FULL_MARKER="cbe-audio-portable=4\nsource=GC6E01\nassets=24\nrate=32000\nrenderer=lua-musyx-battle-fidelity-v3-loop-boundary\n"
+local ARENA_MARKER=[=[cbe-arena=7
+water=GC6E01/M1_water_colo.fsys/M1_water_colo.dat/source-hsd-scene-v32
+orre=GC6E01/T1_ancient_colo.fsys/T1_ancient_colo.dat/source-hsd-scene-v32
+realgam=GC6E01/D4_casino_colo.fsys/D4_casino_colo.dat/source-hsd-scene-v32
+wildlands=grounded-solid-grass-v18
 routing=battle-start-binding-reset
 vertex-contract=hsd-normal-not-tint
+material-contract=source-diffuse-ambient-specular-shininess
 texture-wrap=source-gx
-summit=GC6E01/D2_crater_colo.fsys/D2_crater_colo.dat/source-hsd-scene
+summit=GC6E01/D2_crater_colo.fsys/D2_crater_colo.dat/source-hsd-scene-v32
+source-parity=water+orre+realgam+summit-full-refresh
 mt-battle-material=exact-source-gx;neutral-backdrop;extended-depth
 orre-distance=full-T1-scene;realgam-distance=full-D4-scene;extended-depth
 ]=]
-local TRAINER_IDENTITY_MARKER=[=[cbe-trainer-identity=11
+local TRAINER_IDENTITY_MARKER=[=[cbe-trainer-identity=12
 red=people_archive.fsys/akami_m_b1.dat
 leaf=people_archive.fsys/akami_f_b1.dat
 wes=field_common.fsys/ken_b1.dat
@@ -26,7 +30,7 @@ cooltrainer_f=people_archive.fsys/traner_f_b1.dat
 dakim=people_archive.fsys/battleyama_b1.dat
 nascour=people_archive.fsys/boss999_b1.dat
 miror_b=people_archive.fsys/boss555_b1.dat
-pose=native-hsd-scene-root;clip1-nonbind-base;coherent-clipfamilies-v6;source-hand-topology;exact-end-effector;procedural=residual-only
+pose=native-hsd-scene-root;clip1-nonbind-base;dense-clipfamilies-v7;five-sample-adjacent-interpolation;source-hand-topology;exact-end-effector;procedural=residual-only
 ]=]
 local RUNTIME_CORE={
   "cache/M1_water_cache.lua","cache/orre_colosseum_cache.lua",
@@ -63,7 +67,7 @@ local COMPONENTS={
   capture={"cache/capture/index.lua"},
   transition={"assets/transition/wipe_ball00.rgba","assets/transition/wipe_ball01.rgba"},
 }
-local STAGES={"disc","fsys","arenas","trainers","capture","transition","audio","verify"}
+local STAGES={"disc","fsys","arenas","trainers","capture","transition","audio_portable","audio","verify"}
 
 local function importInfo()
   if not (mod.imports and type(mod.imports.info)=="function") then return nil end
@@ -103,17 +107,25 @@ function C.inspect()
   for _,p in ipairs(RUNTIME_CORE) do if not exists(p) then runtimeMissing[#runtimeMissing+1]=p end end
   local audioMissing={}
   for _,p in ipairs(AUDIO_CORE) do if not exists(p) then audioMissing[#audioMissing+1]=p end end
-  local trainerIdentityMarker=read(".cbe-trainer-identity-v11.complete")
-  local arenaMarker=read(".cbe-arena-v6.complete")
-  local visualReady=#runtimeMissing==0 and visualMarker=="cbe-runtime=2\nextractor=12\n" and trainerIdentityMarker==TRAINER_IDENTITY_MARKER and arenaMarker==ARENA_MARKER
+  local trainerIdentityMarker=read(".cbe-trainer-identity-v12.complete")
+  local arenaMarker=read(".cbe-arena-v7.complete")
+  local visualReady=#runtimeMissing==0 and visualMarker=="cbe-runtime=2\nextractor=15\n" and trainerIdentityMarker==TRAINER_IDENTITY_MARKER and arenaMarker==ARENA_MARKER
   local audioMarker=read(".cbe-audio-v1.complete")
-  local audioReady=#audioMissing==0 and audioMarker==AUDIO_MARKER
-  local fullRuntimeReady=visualReady and audioReady and marker=="cbe-runtime=2\nextractor=12\n"
+  local portableAudioMarker=read(".cbe-audio-portable-v1.complete")
+  local portableAudioPrimaryMarker=read(".cbe-audio-portable-v4.complete")
+  local portableAudioFallbackMarker=read("build/audio_portable_v4.complete")
+  local portableAudioFullMarker=(portableAudioPrimaryMarker==PORTABLE_AUDIO_FULL_MARKER and portableAudioPrimaryMarker) or portableAudioFallbackMarker
+  local portableWav=read("assets/audio/colosseum_battle_transition.wav")
+  local portableAudioCoreReady=portableAudioMarker==PORTABLE_AUDIO_MARKER and type(portableWav)=="string" and #portableWav>=44 and portableWav:sub(1,4)=="RIFF" and portableWav:sub(9,12)=="WAVE"
+  local portableAudioReady=#audioMissing==0 and portableAudioCoreReady and (portableAudioPrimaryMarker==PORTABLE_AUDIO_FULL_MARKER or portableAudioFallbackMarker==PORTABLE_AUDIO_FULL_MARKER)
+  local audioReady=#audioMissing==0 and (audioMarker==AUDIO_MARKER or portableAudioReady)
+  local fullRuntimeReady=visualReady and audioReady and marker=="cbe-runtime=2\nextractor=15\n"
   local runtimeReady=visualReady
   local counts={};for id,paths in pairs(COMPONENTS) do counts[id]=count(paths) end
   local stage={};for _,id in ipairs(STAGES) do stage[id]=exists("build/stage_"..id..".complete") end
   local status
   if fullRuntimeReady then status="RUNTIME READY"
+  elseif runtimeReady and portableAudioCoreReady and not audioReady then status="RUNTIME READY / PORTABLE AUDIO CORE"
   elseif runtimeReady and not audioReady then status="RUNTIME READY / COLOSSEUM AUDIO UNAVAILABLE"
   elseif state.current_stage=="arena_repair_failed" then status="ARENA CACHE REPAIR FAILED"
   elseif state.current_stage=="trainer_identity_failed" then status="TRAINER CACHE REPAIR FAILED"
@@ -122,9 +134,9 @@ function C.inspect()
   elseif romReady then status="ROM IMPORTED / BUILD PENDING"
   else status="IMPORT REQUIRED" end
   return {
-    schema=C.schema,ready=runtimeReady,runtimeReady=runtimeReady,fullRuntimeReady=fullRuntimeReady,visualReady=visualReady,audioReady=audioReady,
+    schema=C.schema,ready=runtimeReady,runtimeReady=runtimeReady,fullRuntimeReady=fullRuntimeReady,visualReady=visualReady,audioReady=audioReady,portableAudioReady=portableAudioReady,portableAudioCoreReady=portableAudioCoreReady,
     sourceReady=romReady,sourceImported=romReady,sourceStatus=status,source=status,
-    generated=visualReady or runtimeReady or exists("build/generated_paths.lua"),generatedRuntime=runtimeReady,marker=marker,visualMarker=visualMarker,audioMarker=audioMarker,trainerIdentityMarker=trainerIdentityMarker,arenaMarker=arenaMarker,
+    generated=visualReady or runtimeReady or exists("build/generated_paths.lua"),generatedRuntime=runtimeReady,marker=marker,visualMarker=visualMarker,audioMarker=audioMarker,portableAudioMarker=portableAudioMarker,portableAudioFullMarker=portableAudioFullMarker,trainerIdentityMarker=trainerIdentityMarker,arenaMarker=arenaMarker,
     files=tonumber(state.fst_files) or 0,sourceFiles=tonumber(state.fst_files) or 0,
     sourceBytes=romReady and (tonumber(rom.size) or 1459978240) or 0,
     sourceSizeLabel=prettyBytes(romReady and (tonumber(rom.size) or 1459978240) or 0),
@@ -173,6 +185,10 @@ function C.resetGenerated()
     end
     GeneratedAssets.delete("cache/pokemon/manifest.lua")
   end
+  -- 1.7.4 can create compact metadata sidecars at runtime for species whose
+  -- model cache predates that format. They may not appear in the historical
+  -- species manifest, so clear them explicitly with the generated runtime.
+  for dex=1,251 do GeneratedAssets.delete(("cache/pokemon/%d/metadata_v1.lua"):format(dex)) end
   GeneratedAssets.delete("build/format_probe.txt")
   GeneratedAssets.delete("build/camera_probe.txt")
 
@@ -185,7 +201,7 @@ function C.resetGenerated()
     if chunk then ok,paths=pcall(chunk) end
     if ok and type(paths)=="table" then for _,path in ipairs(paths) do GeneratedAssets.delete(path) end end
   end
-  for _,path in ipairs({".cbe-runtime-v2.complete",".cbe-visual-v2.complete",".cbe-audio-v1.complete",".cbe-trainer-identity-v1.complete",".cbe-trainer-identity-v2.complete",".cbe-trainer-identity-v3.complete",".cbe-trainer-identity-v4.complete",".cbe-trainer-identity-v5.complete",".cbe-trainer-identity-v6.complete",".cbe-trainer-identity-v7.complete",".cbe-trainer-identity-v8.complete",".cbe-trainer-identity-v9.complete",".cbe-trainer-identity-v10.complete",".cbe-trainer-identity-v11.complete",".cbe-arena-v2.complete",".cbe-arena-v3.complete",".cbe-arena-v4.complete",".cbe-arena-v5.complete",".cbe-arena-v6.complete","build/error.txt","build/audio_warning.txt","build/state.txt","build/generated_paths.lua","build/stage_trainers.pending","build/stage_audio.pending"}) do GeneratedAssets.delete(path) end
+  for _,path in ipairs({".cbe-runtime-v2.complete",".cbe-visual-v2.complete",".cbe-audio-v1.complete",".cbe-audio-portable-v1.complete",".cbe-audio-portable-v2.complete",".cbe-audio-portable-v3.complete",".cbe-audio-portable-v3.pending",".cbe-audio-portable-v4.complete",".cbe-audio-portable-v4.pending","build/audio_portable_v4.complete","build/audio_portable_v4.migrating",".cbe-trainer-identity-v1.complete",".cbe-trainer-identity-v2.complete",".cbe-trainer-identity-v3.complete",".cbe-trainer-identity-v4.complete",".cbe-trainer-identity-v5.complete",".cbe-trainer-identity-v6.complete",".cbe-trainer-identity-v7.complete",".cbe-trainer-identity-v8.complete",".cbe-trainer-identity-v9.complete",".cbe-trainer-identity-v10.complete",".cbe-trainer-identity-v11.complete",".cbe-trainer-identity-v12.complete",".cbe-arena-v2.complete",".cbe-arena-v3.complete",".cbe-arena-v4.complete",".cbe-arena-v5.complete",".cbe-arena-v6.complete",".cbe-arena-v7.complete","build/error.txt","build/audio_warning.txt","build/state.txt","build/generated_paths.lua","build/stage_trainers.pending","build/stage_audio.pending"}) do GeneratedAssets.delete(path) end
   for _,id in ipairs(STAGES) do GeneratedAssets.delete("build/stage_"..id..".complete");GeneratedAssets.delete("build/stage_"..id..".pending") end
   C.lastAction="Generated CBE runtime cleared. Reload CBE to rebuild from the imported disc."
   return true,C.lastAction

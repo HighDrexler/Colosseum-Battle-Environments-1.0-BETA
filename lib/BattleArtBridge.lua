@@ -13,7 +13,7 @@
 local V=...
 local B={installed=false,owner=nil,owners={},reason=nil}
 local ModLookup=V.ModLookup
-local IDS={"BATTLE_ART_VOXEL_FORK","DRAMATIC_SHAPE","DRAMALESS_SHAPE","scott_kanto_dramatic"}
+local IDS={"BATTLE_ART_VOXEL_GEN2","BATTLE_ART_VOXEL_FORK","DRAMATIC_SHAPE","DRAMALESS_SHAPE","scott_kanto_dramatic"}
 
 local function arenaOwnsStage(state,battle)
   local C=V and V.ArenaCatalog
@@ -81,7 +81,7 @@ function B.install()
       B.owners[id]=true
       B.owner=B.owner or id
       installedAny=true
-    elseif seen[id] and (id=="BATTLE_ART_VOXEL_FORK" or id=="DRAMATIC_SHAPE"
+    elseif seen[id] and (id=="BATTLE_ART_VOXEL_GEN2" or id=="BATTLE_ART_VOXEL_FORK" or id=="DRAMATIC_SHAPE"
         or id=="DRAMALESS_SHAPE" or id=="scott_kanto_dramatic") then
       reasons[#reasons+1]=id..":"..tostring(why)
     end

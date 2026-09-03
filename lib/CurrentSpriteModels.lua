@@ -1,8 +1,9 @@
 -- Generic 2D battler provider for StadiumBattleFX Battle Presentation API v1.
 --
--- This deliberately does NOT choose Pokemon artwork.  It presents whatever
--- image the engine has already resolved on battle.player/enemy.sprite.  That
--- keeps Colosseum environments independent from Battle Art, Crystal/Gen 5
+-- This deliberately does NOT choose a Pokemon art package. It follows the
+-- engine's live pokemon.sprite resolution seam (then portable battleSprites)
+-- and only falls back to battle.player/enemy.sprite when nobody overrides it.
+-- That keeps Colosseum environments independent from Battle Art, Crystal/Gen 5
 -- sprite packs, ROM art, and future providers that use the normal sprite seam.
 -- When COLOSSEUM MODELS is ON, however, CBE's GC6E01 actor service is the
 -- authoritative 3D battle actor provider in both generations.
@@ -28,7 +29,7 @@ local OWNER=(V.mod and V.mod.id) or "COLOSSEUM_BATTLE_ENVIRONMENTS"
 local ModLookup=V.ModLookup
 local registeredCapabilities={battleActors={},battleSprites={},battlePresentation={}}
 local seenEventPayload=setmetatable({},{__mode="k"})
-local BATTLE_ART_IDS={"BATTLE_ART_VOXEL_FORK","DRAMATIC_SHAPE"}
+local BATTLE_ART_IDS={"BATTLE_ART_VOXEL_GEN2","BATTLE_ART_VOXEL_FORK","DRAMATIC_SHAPE"}
 local STADIUM_ID="STADIUM_BATTLE_FX"
 local STADIUM2_ID="STADIUM2_OVERWORLD_MODELS"
 if ModLookup and type(ModLookup.remember)=="function" then
@@ -350,6 +351,29 @@ local function ourArena(context)
   return id:find("^COLOSSEUM_BATTLE_ENVIRONMENTS:")~=nil
 end
 
+-- WazaSequence is started from BattleDirector on the semantic move boundary,
+-- which intentionally receives a lean {battle,game} context before the rich
+-- arena compositor context is forwarded. Requiring context.arena here made the
+-- type-3 particle handler reject every otherwise-valid source move at start;
+-- the native Crystal/GB animation then became the only visible FX. Accept a
+-- verified live CBE compositor as equivalent ownership and let the next rich
+-- render/update frame lock the actual actor-space basis.
+local function cbeFxWorldActive(context)
+  if ourArena(context) then return true end
+  local host=V and V.StandaloneHost
+  if host and type(host.status)=="function" then
+    local ok,st=pcall(host.status)
+    if ok and type(st)=="table" and st.active==true then return true end
+  end
+  local bridge=V and V.StadiumBridge
+  local battle=context and context.battle
+  if bridge and type(bridge.ownsArena)=="function" then
+    local ok,owned=pcall(bridge.ownsArena,battle)
+    if ok and owned==true then return true end
+  end
+  return false
+end
+
 -- Resolve the exact portable 3D actor provider CBE would use for a Pokemon
 -- information surface (Party/Summary) without starting or mutating a battle
 -- presentation session. This is intentionally read-only: UI mods may ask for
@@ -408,6 +432,53 @@ local function battleArtWantsWorldSprites()
   -- Colosseum arena. If Battle Art is active at all, preserve the art it has
   -- resolved (STATIC / ANIMATED / ROM / MODDED) inside our environment.
   return battleArtRuntime() ~= nil
+end
+
+-- Battle Art 2.x does not publish its selected battle Pokemon exclusively
+-- through pokemon.sprite. STATIC/ANIMATED modes intentionally install prepared
+-- Image objects directly on the live battler, while MODDED yields ownership to
+-- whichever lower sprite provider won the engine seam. CBE therefore consumes
+-- Battle Art through its exported compatibility library when COLOSSEUM MODELS
+-- is OFF.
+--
+-- `advance` is true from update() and false from the draw consumer boundary.
+-- GenerationCompat gives Gold a stable Gen-1-shaped facade, so the same art
+-- managers work in both generations without writing transient sprite fields
+-- onto the user's saved Gen 2 party records.
+local function syncBattleArtSpecies(context,dt,advance)
+  if not (context and context.battle) then return false end
+  if cbePokemonModelsEnabled(context) then P.spriteOwner=nil;return false end
+  local runtime=battleArtRuntime()
+  local art=runtime and runtime.art
+  if not art then return false end
+  local battle=context.battle
+  local animated=P.animated
+
+  -- Advance atlas playback exactly once per update. The final draw path calls
+  -- this with advance=false after GenerationCompat has refreshed Gold's native
+  -- picture fields; reassert below restores the selected frame without ticking
+  -- its clock twice.
+  if advance and animated and type(animated.update)=="function" then
+    pcall(animated.update,battle,math.max(0,tonumber(dt) or 0))
+  end
+
+  -- STATIC mode is installed here. In ANIMATED mode BattleArt.apply() releases
+  -- stale static ownership but does not overwrite AnimatedBattleArt's manager.
+  -- In MODDED mode it is intentionally a species no-op, leaving the generic
+  -- pokemon.sprite / other-provider fallback below authoritative.
+  if type(art.apply)=="function" then pcall(art.apply,battle) end
+
+  if animated and type(animated.reassert)=="function" then
+    if battle.enemy then pcall(animated.reassert,battle.enemy) end
+    if battle.player then pcall(animated.reassert,battle.player) end
+  end
+  local owns=true
+  if type(art.ownsSpeciesArt)=="function" then
+    local ok,value=pcall(art.ownsSpeciesArt)
+    owns=ok and value~=false
+  end
+  P.spriteOwner=owns and runtime.id or nil
+  return owns
 end
 
 local function liveBattler(context,side)
@@ -733,8 +804,55 @@ local function driveRetiringActor(context,record)
   end
 end
 
+local EnginePokemonSprites,EngineAssets
+local function engineResolvedSprite(context,side,b,current)
+  -- CBE's standalone Gen 2 arena does not ask BattleState to draw its native
+  -- picture layer, so simply reusing battler.sprite can strand us on the ROM
+  -- image even when another mod owns the sanctioned pokemon.sprite seam.
+  -- Resolve that seam again here and use it ONLY when it actually selects a
+  -- different path. This preserves Battle Arts/custom packs without replacing
+  -- Gold's already-palette-processed native image with a raw source bitmap.
+  local mon=b and b.mon
+  local game=(context and context.game) or (context and context.battle and context.battle.game)
+  local data=game and game.data
+  local species=mon and mon.species
+  if not (data and species) then return current,false end
+  local req=V.engineRequire or require
+  if EnginePokemonSprites==nil then
+    local ok,value=pcall(req,"src.pokemon.Sprites")
+    EnginePokemonSprites=ok and value or false
+  end
+  if EngineAssets==nil then
+    local ok,value=pcall(req,"src.render.Assets")
+    EngineAssets=ok and value or false
+  end
+  if not (type(EnginePokemonSprites)=="table" and type(EnginePokemonSprites.path)=="function"
+      and type(EngineAssets)=="table" and type(EngineAssets.image)=="function") then
+    return current,false
+  end
+  local def=data.pokemon and data.pokemon[species]
+  local facing=side=="player" and "back" or "front"
+  local vanilla=def and (facing=="back" and def.spriteBack or def.spriteFront) or nil
+  local ok,path,trueColor=pcall(EnginePokemonSprites.path,data,species,facing,{mon=mon,kind="battle"})
+  if not ok or type(path)~="string" or path=="" then return current,false end
+  -- A changed path is an explicit external-art decision. trueColor is advisory
+  -- metadata and by itself must not make us reload the unchanged ROM image.
+  if vanilla and path==vanilla then return current,false end
+  local okImage,resolved=pcall(EngineAssets.image,path)
+  if not (okImage and resolved and type(resolved.getDimensions)=="function") then
+    return current,false
+  end
+  if resolved.setFilter then pcall(resolved.setFilter,resolved,"nearest","nearest") end
+  return resolved,true
+end
+
 local function imageFor(context,side)
   if not visible(context,side) then return nil end
+  -- StandaloneHost re-syncs Gold's presentation facade immediately before the
+  -- world pass, which refreshes b.sprite from the native BattleState. Reapply
+  -- Battle Art at the consumer boundary so STATIC/ANIMATED selections survive
+  -- that sync; no playback time advances here.
+  local battleArtOwns=syncBattleArtSpecies(context,0,false)
   local battle=context.battle
   local b=liveBattler(context,side)
   local image=b and b.sprite
@@ -742,22 +860,57 @@ local function imageFor(context,side)
     local ok,resolved=pcall(battle.picImage,battle,image)
     if ok and resolved then image=resolved end
   end
-  local spriteApi,spriteHandle=portableSpriteService(context)
-  P.spriteApi=spriteApi;P.spriteOwner=spriteHandle and spriteHandle.id or nil
+
+  -- First recover the engine's live sprite-selection seam. This is what lets
+  -- Battle Arts, Crystal/custom sprite packs and future pokemon.sprite owners
+  -- stay authoritative when COLOSSEUM MODELS is OFF.
+  local seamOwned=false
+  local spriteApi,spriteHandle
   P.spriteError=nil
-  if spriteApi then
-    local ok,resolved=pcall(spriteApi.resolve,context,side,b,image)
-    if ok then
-      if type(resolved)=="table" and type(resolved.getDimensions)~="function"
-          and resolved.image~=nil then resolved=resolved.image end
-      if resolved~=nil and resolved~=false then image=resolved end
-    else
-      P.spriteError=tostring(resolved)
+
+  if not battleArtOwns then
+    local seamImage
+    seamImage,seamOwned=engineResolvedSprite(context,side,b,image)
+    if seamOwned then image=seamImage end
+
+    -- A portable battleSprites provider is more explicit than a generic path
+    -- hook. It is consulted only when Battle Art has itself yielded species
+    -- ownership (MODDED) or is absent; BATTLE ART ownership must not be undone
+    -- by a second provider after BattleArt.apply selected the user's package.
+    spriteApi,spriteHandle=portableSpriteService(context)
+    P.spriteApi=spriteApi
+    if spriteHandle then
+      P.spriteOwner=spriteHandle.id
+    elseif seamOwned then
+      P.spriteOwner="engine:pokemon.sprite"
+    elseif not battleArtWantsWorldSprites() then
+      P.spriteOwner=nil
     end
+    if spriteApi then
+      local ok,resolved=pcall(spriteApi.resolve,context,side,b,image)
+      if ok then
+        if type(resolved)=="table" and type(resolved.getDimensions)~="function"
+            and resolved.image~=nil then resolved=resolved.image end
+        if resolved~=nil and resolved~=false then image=resolved end
+      else
+        P.spriteError=tostring(resolved)
+      end
+    end
+  else
+    P.spriteApi=nil
   end
   if not (image and type(image.getDimensions)=="function") then return nil end
   return image,b
 end
+
+-- Constant side-iteration orders. These table literals used to be rebuilt on
+-- every frame at each of the five loops below.
+local SIDES_EP={"enemy","player"}
+local SIDES_PE={"player","enemy"}
+-- Reused faint-clip quad; g.newQuad allocated a new LOVE object every frame a
+-- Pokemon was fainting, which is exactly the moment the frame budget is
+-- tightest.
+local faintQuad=nil
 
 local function anchor(context,side)
   local arena=context and context.arena
@@ -847,7 +1000,7 @@ local function stageMoveFx(context,side,spec,target,role,wazaEntry,wazaSerial)
   local executable=MoveFXVM and type(MoveFXVM.start)=="function"
     and ((type(wazaEntry)=="table" and type(MoveFXVM.hasEntry)=="function" and MoveFXVM.hasEntry(spec,wazaEntry,role))
       or (wazaEntry==nil and roleHasSource(spec,role)))
-  if not (side and ourArena(context) and type(spec)=="table"
+  if not (side and cbeFxWorldActive(context) and type(spec)=="table"
       and type(spec.textures)=="table" and #spec.textures>0
       and type(spec.generatorPrograms)=="table" and #spec.generatorPrograms>0
       and executable) then
@@ -996,7 +1149,7 @@ end
 -- style-derived cue time to launch particles: GPT1 has its own sequence timing.
 local function directedMoveFx(context)
   if not (Director and type(Director.consumeFxCue)=="function") then return false end
-  for _,side in ipairs({"player","enemy"}) do pcall(Director.consumeFxCue,Director,context,side) end
+  for _,side in ipairs(SIDES_PE) do pcall(Director.consumeFxCue,Director,context,side) end
   return false
 end
 
@@ -1143,21 +1296,40 @@ local function combatGeometry(context,side,target,attachment,opts)
     units.y=((sourceHeight+targetHeight)*.5)/100
   end
 
-  -- `side` is already the damaged Pokemon for damage-role Waza rows, so the
-  -- live source actor is always the correct scale reference for the entry.
-  local referenceHeight=groundField and ((sourceHeight+targetHeight)*.5) or sourceHeight
+  -- Scale from the live actors rather than species ids or a fixed Colosseum
+  -- unit.  Self/aura effects remain attacker-sized, damage rows remain the
+  -- damaged actor's size, and contact/impact effects use a bounded geometric
+  -- mean of both battlers.  The latter is important for extreme matchups (for
+  -- example a tiny attacker striking Onix): fitting only to the user made the
+  -- hit almost invisible, while fitting only to the target made it comically
+  -- oversized around a small attacker.
+  local interactionHeight=math.sqrt(math.max(.01,sourceHeight*targetHeight))
+  interactionHeight=math.max(math.min(sourceHeight,targetHeight)*.72,
+    math.min(math.max(sourceHeight,targetHeight)*1.12,interactionHeight))
+  local referenceHeight
+  if groundField then referenceHeight=(sourceHeight+targetHeight)*.5
+  elseif role=="damage" then referenceHeight=sourceHeight
+  elseif style=="target" then referenceHeight=targetHeight
+  elseif style=="impact" or style=="contact" then referenceHeight=interactionHeight
+  else referenceHeight=sourceHeight end
+
   local modelTargetSpan
   if groundField then modelTargetSpan=math.max(referenceHeight,fullFightDistance*1.08)
   elseif style=="wave" then modelTargetSpan=math.max(referenceHeight,fullFightDistance*.82)
-  elseif style=="projectile" then modelTargetSpan=math.max(referenceHeight*.80,math.min(fullFightDistance*.72,referenceHeight*2.75))
+  elseif style=="projectile" then
+    -- Projectile bodies originate at the user, but their maximum apparent
+    -- size may grow modestly toward the opponent. Keep this tightly bounded so
+    -- small/large species combinations cannot balloon the source HSD object.
+    local projectileHeight=math.max(sourceHeight*.80,math.min(interactionHeight*1.12,sourceHeight*1.85))
+    modelTargetSpan=math.max(projectileHeight*.80,math.min(fullFightDistance*.72,projectileHeight*2.55))
   elseif role=="damage" then modelTargetSpan=sourceHeight*.92
   elseif style=="target" then modelTargetSpan=targetHeight*.92
-  elseif style=="impact" or style=="contact" then modelTargetSpan=referenceHeight*.82
+  elseif style=="impact" or style=="contact" then modelTargetSpan=interactionHeight*.86
   else modelTargetSpan=referenceHeight end
 
   return {origin=origin,target=goal,right=right,up=up,forward=forward,actor=actor,targetActor=targetActor,
     actorScale=tonumber(actor and actor.worldScale) or 1,attachment=name,style=style,moveId=moveId,role=role,
-    groundField=groundField,sourceVisualHeight=sourceHeight,targetVisualHeight=targetHeight,
+    groundField=groundField,sourceVisualHeight=sourceHeight,targetVisualHeight=targetHeight,interactionVisualHeight=interactionHeight,
     fightDistance=fullFightDistance,sourceUnits=units,referenceVisualHeight=referenceHeight,modelTargetSpan=modelTargetSpan}
 end
 
@@ -1584,7 +1756,7 @@ local function drawStadiumActors(context)
     end
   end
 
-  for _,side in ipairs({"enemy","player"}) do
+  for _,side in ipairs(SIDES_EP) do
     local existing=P.stadiumActors[side] and P.stadiumActors[side].actor
     local actor=actorVisible(context,side,existing) and stadiumActor(context,side) or nil
     local cell=arena[side]
@@ -1668,13 +1840,12 @@ function P:update(context,dt)
   selectPresentation(context,false)
   directedMoveFx(context)
   updateMoveFx(context,dt)
-  -- Battle Art normally advances animated atlases from its staged-world
-  -- session.  Our arena bridge intentionally suppresses that session, so
-  -- advance only its art manager here while leaving every setting untouched.
+  -- CBE suppresses Battle Art's competing world/camera stage, not its Pokemon
+  -- art. With models OFF, advance/install the exact Battle Art 2.x selection
+  -- (ANIMATED / STATIC / ROM / MODDED) onto our generation-neutral battlers.
+  -- With models ON this path is skipped entirely: GC6E01 actors are absolute.
   battleArtRuntime()
-  if P.animated and type(P.animated.update)=="function" and context and context.battle then
-    pcall(P.animated.update,context.battle,dt)
-  end
+  syncBattleArtSpecies(context,dt,true)
   if P.mode=="external" then
     local ok=invokeExternal(context,"update",dt or 0)
     if not ok then
@@ -1703,7 +1874,7 @@ function P:update(context,dt)
       end
     end
 
-    for _,side in ipairs({"player","enemy"}) do
+    for _,side in ipairs(SIDES_PE) do
       syncStadiumActor(context,side)
       local existing=P.stadiumActors[side] and P.stadiumActors[side].actor
       local actor=actorVisible(context,side,existing) and stadiumActor(context,side) or nil
@@ -1758,7 +1929,7 @@ function P:drawWorld(context)
   if self.mode=="external" then
     local ok,value=invokeExternal(context,"drawWorld",0)
     if ok then
-      for _,side in ipairs({"enemy","player"}) do
+      for _,side in ipairs(SIDES_EP) do
         local coveredOk,covered=invokeExternal(context,"covers",side)
         self.drawn[side]=coveredOk and covered==true and visible(context,side)
         if self.drawn[side] then self.presented[side]=true end
@@ -1778,7 +1949,7 @@ function P:drawWorld(context)
   g.setDefaultFilter("nearest","nearest",oldAniso or 1)
   local spriteOk,_,spriteErr=graphicsScope(g,function()
     g.setShader();g.setDepthMode();g.setColor(1,1,1,1)
-    for _,side in ipairs({"enemy","player"}) do
+    for _,side in ipairs(SIDES_EP) do
       -- COLOSSEUM MODELS means exactly that: once CBE's GC6E01 actor service
       -- owns the battle, never fall back to a Game Boy/Battle Art sprite merely
       -- because the actor is intentionally hidden for recall/faint/capture or
@@ -1814,8 +1985,12 @@ function P:drawWorld(context)
           if faint~=nil then
             local visibleH=math.max(0,math.floor(h*(1-faint)+.5))
             if visibleH>0 then
-              local quad=g.newQuad(0,0,w,visibleH,w,h)
-              g.draw(image,quad,px,py,0,sx,s,w*.5,visibleH)
+              if faintQuad and faintQuad.setViewport then
+                pcall(faintQuad.setViewport,faintQuad,0,0,w,visibleH,w,h)
+              else
+                faintQuad=g.newQuad(0,0,w,visibleH,w,h)
+              end
+              g.draw(image,faintQuad,px,py,0,sx,s,w*.5,visibleH)
               self.drawn[side]=true;self.presented[side]=true; any=true
             end
           else
@@ -1876,11 +2051,12 @@ function P:event(context,name,payload)
   local S=V.BattleSides
   local side
   local gen2=context and context.battle and context.battle.__cbeGeneration==2
-  local queueSync=gen2 and context.battle.__cbePresentationQueueSync==true
+  local queueSync=context and context.battle and context.battle.__cbePresentationQueueSync==true
   -- Gen 2 resolves move/damage/faint semantics in its pure battle model before
   -- the screen replays them. StandaloneHost raises presentation_* events at
   -- the actual queue-consumption boundary; all 3D actor reactions follow those.
-  if queueSync and (name=="battle.move_used" or name=="battle.damage_dealt" or name=="battle.fainted") then return end
+  if queueSync and ((gen2 and (name=="battle.move_used" or name=="battle.damage_dealt" or name=="battle.fainted"))
+      or ((not gen2) and name=="battle.fainted")) then return end
   local semantic=name
   if name=="battle.presentation_damage" then semantic="battle.damage_dealt"
   elseif name=="battle.presentation_faint" then semantic="battle.fainted" end
@@ -1928,9 +2104,11 @@ function P:event(context,name,payload)
       animationSlot=actor.nativeSlot and actor.nativeSlot.index or actor.nativeClip
       animationName=actor.nativeActionName or actor.requestedNativeSlot
     end
+    local directorSeq
     if Director and type(Director.bindAttack)=="function" and resolvedId~=nil then
-      pcall(Director.bindAttack,Director,context,side,resolvedId,move,attackDuration,spec,
+      local okBind,bound=pcall(Director.bindAttack,Director,context,side,resolvedId,move,attackDuration,spec,
         wazaTimingPoints,presentationFrames,animationSlot,animationName)
+      if okBind and type(bound)=="table" then directorSeq=bound end
       if not spec and MoveFX and type(MoveFX.mapped)=="function" then
         local okMap,mapped=pcall(MoveFX.mapped,resolvedId,move)
         if okMap and mapped then P.moveFxError="mapped source FX was not prefetched before move playback" end
@@ -1942,6 +2120,15 @@ function P:event(context,name,payload)
     -- longer part of the visible effect path.
     if spec then
       local hasAttackTimeline=roleHasTimeline(spec,"attack")
+      -- BattleDirector normally starts the retail Waza timeline after the actor
+      -- has chosen its source attack slot. If a host/provider path prevented
+      -- that bind from returning a Waza serial, start the SAME source timeline
+      -- here rather than leaving a source-ready move visually empty. Waza's
+      -- per-side supersession/dedup keeps this from creating parallel attacks.
+      if hasAttackTimeline and not (directorSeq and directorSeq.wazaAttackSerial) then
+        local started=startWazaSequence(context,side,spec,nil,"attack",resolvedId,move)
+        if not started then P.moveFxError=P.moveFxError or "source attack Waza timeline could not start" end
+      end
       if not hasAttackTimeline and roleHasSource(spec,"attack") then
         -- Compatibility path for an older cache that has a decoded GPT1 role but
         -- no WazaSequence table. Never run this beside a retail Waza timeline.
@@ -2039,6 +2226,10 @@ end
 function P:finish(context,reason)
   self.drawn.player=false;self.drawn.enemy=false
   self.moveFxActive={}
+  if P.animated and type(P.animated.finish)=="function"
+      and context and context.battle and not cbePokemonModelsEnabled(context) then
+    pcall(P.animated.finish,context.battle)
+  end
   if WazaSequence and type(WazaSequence.finish)=="function" then pcall(WazaSequence.finish,WazaSequence,context,reason or "battle-ended") end
   self.presented.player=false;self.presented.enemy=false
   finishExternal(context,reason or "battle-ended")

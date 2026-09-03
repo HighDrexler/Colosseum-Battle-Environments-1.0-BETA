@@ -4,7 +4,16 @@ local mod, Mat4, Trainer, PlayerTrainer =
 local CurrentSpriteModels=V.CurrentSpriteModels
 local ArenaCatalog=V.ArenaCatalog
 local GeneratedAssets=V.GeneratedAssets
+local RuntimeMeshCache=V.RuntimeMeshCache
 local A = {}
+
+local function platformOS()
+  if love and love.system and type(love.system.getOS)=="function" then
+    local ok,v=pcall(love.system.getOS);if ok and v then return tostring(v) end
+  end
+  return "Unknown"
+end
+local ARENA_ANDROID=platformOS()=="Android"
 
 local function cbePokemonModelsEnabled(ctx)
   local settings=V.BattleSettings
@@ -19,21 +28,32 @@ local function standaloneContext(ctx)
     and ctx.services.cbeStandalone==true
 end
 
+-- The projector reads its matrix and viewport from upvalues that are
+-- refreshed each frame, so the closure and the renderSize table are allocated
+-- once for the process instead of once per frame. Consumers still see the same
+-- services.project(x,y,z) contract and the same live values.
+local projVP,projW,projH=nil,0,0
+local projectService=function(x,y,z)
+  local m=projVP
+  if not m then return nil end
+  local cx=m[1]*x+m[2]*y+m[3]*z+m[4]
+  local cy=m[5]*x+m[6]*y+m[7]*z+m[8]
+  local cw=m[13]*x+m[14]*y+m[15]*z+m[16]
+  if not cw or cw<=1e-6 then return nil end
+  return (cx/cw*.5+.5)*projW,(cy/cw*.5+.5)*projH
+end
+local renderSizeService={width=0,height=0}
 local function installActorServices(ctx,actorVP,stageVP,w,h,figure,pose)
   ctx.services=type(ctx.services)=="table" and ctx.services or {}
   ctx.services.vp=actorVP
   ctx.services.stageVP=stageVP
   ctx.services.figureScale=figure
-  ctx.services.renderSize={width=w,height=h}
+  projVP,projW,projH=actorVP,w,h
+  renderSizeService.width=w;renderSizeService.height=h
+  ctx.services.renderSize=renderSizeService
   ctx.services.camera=ctx.services.camera or {}
   if pose then ctx.services.camera.pose=pose end
-  ctx.services.project=function(x,y,z)
-    local cx=actorVP[1]*x+actorVP[2]*y+actorVP[3]*z+actorVP[4]
-    local cy=actorVP[5]*x+actorVP[6]*y+actorVP[7]*z+actorVP[8]
-    local cw=actorVP[13]*x+actorVP[14]*y+actorVP[15]*z+actorVP[16]
-    if not cw or cw<=1e-6 then return nil end
-    return (cx/cw*.5+.5)*w,(cy/cw*.5+.5)*h
-  end
+  ctx.services.project=projectService
 end
 
 local FORMAT = {
@@ -145,6 +165,49 @@ vec4 position(mat4 transform_projection, vec4 vertex_position) {
   worldPos = world.xyz;
   worldNormal = normalize((model * vec4(localNormal,0.0)).xyz);
   return vp * world;
+}
+]]
+local MOBILE_VERTEX = [[
+uniform mat4 vp;
+uniform mat4 model;
+attribute vec4 VertexTint;
+attribute vec3 VertexNormal;
+varying vec4 tint;
+varying vec3 worldNormal;
+vec4 position(mat4 transform_projection, vec4 vertex_position) {
+  tint = VertexTint;
+  worldNormal = normalize((model * vec4(VertexNormal,0.0)).xyz);
+  return vp * (model * vertex_position);
+}
+]]
+local MOBILE_PIXEL = [[
+uniform float materialAlpha;
+uniform float sceneProfile;
+uniform vec3 materialDiffuse;
+uniform vec3 materialAmbient;
+varying vec4 tint;
+varying vec3 worldNormal;
+vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
+  vec4 tex = Texel(texture,uv) * color * tint;
+  if (tex.a <= 0.012) discard;
+  float ndl = max(dot(normalize(worldNormal),normalize(vec3(0.34,0.83,0.44))),0.0);
+  if (sceneProfile < 0.5) {
+    /* Phenac / Water Colosseum: the source HSD already carries bright diffuse
+       and ambient values. Adding both at full strength on the GLES fast path
+       clipped the limestone floor/walls almost completely white. Keep the
+       authentic pale stone, but restore the grey joints, water recesses and
+       shaded wall faces visible in the GameCube arena. */
+    vec3 light = materialAmbient * 0.22
+      + materialDiffuse * (0.39 + ndl * 0.31);
+    light = clamp(light,vec3(0.16),vec3(0.84));
+    vec3 shaded = tex.rgb * light;
+    float luma = dot(shaded,vec3(0.299,0.587,0.114));
+    shaded = mix(vec3(luma)*vec3(0.965,0.990,1.015),shaded,0.90);
+    shaded = clamp((shaded-vec3(0.46))*0.95+vec3(0.43),vec3(0.0),vec3(0.88));
+    return vec4(shaded,tex.a * materialAlpha);
+  }
+  vec3 light = clamp(materialAmbient + materialDiffuse * (0.42 + ndl*0.58),0.0,1.65);
+  return vec4(tex.rgb * light, tex.a * materialAlpha);
 }
 ]]
 local PIXEL = [[
@@ -373,10 +436,12 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
     float ripple = 0.5 + 0.5*sin(worldPos.x*0.23 + worldPos.z*0.17 + sceneTime*1.18);
     float sparkle = smoothstep(0.78,0.995,0.5+0.5*sin(worldPos.x*1.31 + worldPos.z*1.77 + sceneTime*2.30));
     float glint = pow(max(dot(waterN,halfDir),0.0),18.0) * (0.17 + 0.22*fresnel);
-    vec3 waterTint = mix(vec3(0.070,0.29,0.44),vec3(0.23,0.64,0.78),0.30+0.32*fresnel);
-    float flowBright = materialFlow > 0.5 ? 1.10 : 1.0;
-    shaded = mix(shaded * vec3(0.64,0.86,0.98),waterTint,0.34+0.11*ripple) * flowBright;
-    shaded += vec3(0.56,0.82,0.94)*(glint + sparkle*0.035*fresnel);
+    /* Source Water Colosseum is steel/cool-gray first and blue second. Keep
+       the water reflective without turning the entire venue cyan-white. */
+    vec3 waterTint = mix(vec3(0.040,0.145,0.195),vec3(0.115,0.315,0.375),0.26+0.28*fresnel);
+    float flowBright = materialFlow > 0.5 ? 1.035 : 0.985;
+    shaded = mix(shaded * vec3(0.60,0.76,0.82),waterTint,0.39+0.09*ripple) * flowBright;
+    shaded += vec3(0.30,0.47,0.52)*(glint + sparkle*0.022*fresnel);
     a *= materialFlow > 0.5 ? 0.72 : 0.66;
   } else {
     float dNear = length(worldPos - cameraEye);
@@ -450,7 +515,13 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
   } else if (sceneProfile < .5 && materialMode < .5) {
     float wetStone=1.0-smoothstep(18.0,70.0,abs(worldPos.y));
     float coolFace=clamp(.5+.5*dot(n,normalize(vec3(-.20,.72,.66))),0.0,1.0);
-    shaded += vec3(.003,.009,.014)*wetStone*coolFace;
+    shaded += vec3(.002,.006,.009)*wetStone*coolFace;
+    /* Venue-wide source grade: darker mineral/steel undertones, restrained
+       saturation and protected highlights. This only affects Water profile. */
+    float waterLuma=dot(shaded,vec3(.299,.587,.114));
+    vec3 sourceGray=vec3(waterLuma*.88,waterLuma*.92,waterLuma*.94);
+    shaded=mix(shaded,sourceGray,.27);
+    shaded*=.895;
   } else if (sceneProfile > 1.5 && sceneProfile < 2.5 && materialMode < .5) {
     /* Source-backed D2 opaque materials stay ungraded. */
     shaded *= 1.0;
@@ -562,8 +633,12 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
      lit by both their authored diffuse/ambient values and CBE's venue grade,
      pushing pale Water/Orre masonry into clipped white. Preserve contrast while
      bringing the midrange back toward the reference footage. */
-  if (sceneProfile < .5) shaded *= .885;
-  else if (sceneProfile > 2.5 && sceneProfile < 3.5) shaded *= .915;
+  if (sceneProfile < .5) {
+    // Phenac is pale limestone, not emissive white. Roll the source highlights
+    // back into the photographed midrange while preserving grout and wall shade.
+    shaded *= .78;
+    shaded=clamp((shaded-vec3(.46))*.94+vec3(.43),vec3(0.0),vec3(.90));
+  } else if (sceneProfile > 2.5 && sceneProfile < 3.5) shaded *= .915;
   else if (sceneProfile > 3.5) shaded *= .930;
 
   /* Only the very outer shell blends into atmosphere. The old blue fog began
@@ -598,9 +673,26 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
 ]]
 
 local scene, shader, white
+-- Cache of which uniforms the currently compiled arena shader actually
+-- declares. Invalidated whenever `shader` is rebuilt or released.
+local uniformCache,uniformCacheShader=nil,nil
+-- Baked static sky. See ensureBackdrop().
+local backdropCanvas,backdropKey=nil,nil
+local backdropBakes=0
 local canvas, cw, ch
+local depthCanvas, depthMode, depthActive
 local errorText
 local renderErrors={}
+-- Keep a very small LRU of fully materialized arena scenes on mobile. The old
+-- single-scene policy made AUTO alternate between a resident trainer arena and
+-- a cold wild arena, so one of those two battle types always paid Lua parsing,
+-- texture decode and GPU upload after the transition. Two resident scenes are
+-- enough to cover AUTO without recreating the high-memory "keep everything"
+-- experiment from 1.7.2.
+local residentScenes={}
+local residentUse={}
+local residentSerial=0
+local RESIDENT_LIMIT=ARENA_ANDROID and 2 or 3
 local activeDef=nil
 local STAGE_SCALE = 0.25
 local STAGE_YAW = 0
@@ -872,16 +964,160 @@ local function dropGhostLayer(g)
   if path:find("cache/stages/realgam/source/tex_0d4560_",1,true) and g.xlu and g.noz then return true end
   return false
 end
+local function releaseArenaScene(s)
+  if type(s)~="table" then return end
+  local seen={}
+  local function release(obj)
+    if not obj or seen[obj] then return end
+    seen[obj]=true
+    pcall(function() if type(obj.release)=="function" then obj:release() end end)
+  end
+  for _,bucket in ipairs({s.opaque,s.cutout,s.crowd,s.translucent,s.additive}) do
+    for _,g in ipairs(bucket or {}) do if type(g)=="table" then release(g.mesh) end end
+  end
+  for _,tex in pairs(s.textures or {}) do if type(tex)=="table" then release(tex.image) end end
+end
+local function residentCount()
+  local n=0;for _ in pairs(residentScenes) do n=n+1 end;return n
+end
+local function touchResident(id,s)
+  if not (id and s) then return s end
+  residentSerial=residentSerial+1
+  residentScenes[id]=s;residentUse[id]=residentSerial
+  while residentCount()>RESIDENT_LIMIT do
+    local victim,vstamp
+    for rid,stamp in pairs(residentUse) do
+      if rid~=activeArenaId and residentScenes[rid] and (not vstamp or stamp<vstamp) then victim,vstamp=rid,stamp end
+    end
+    if not victim then break end
+    local old=residentScenes[victim]
+    residentScenes[victim]=nil;residentUse[victim]=nil
+    if old~=scene then releaseArenaScene(old) end
+  end
+  return s
+end
+local function selectResident(id)
+  local s=id and residentScenes[id] or nil
+  if s and activeDef and s.cachePath and s.cachePath~=activeDef.cache then
+    releaseArenaScene(s);residentScenes[id]=nil;residentUse[id]=nil;s=nil
+  end
+  if s then
+    residentSerial=residentSerial+1;residentUse[id]=residentSerial
+  end
+  scene=s
+  return s
+end
+
+-- Arena source caches are intentionally human-readable Lua because they are
+-- extraction/debug artifacts. That format is extremely expensive to parse on
+-- mobile once it contains hundreds of thousands of numeric vertices. Build a
+-- compact runtime sidecar the first time an arena is materialized: tiny Lua
+-- metadata plus tightly-packed float32 vertex streams. Subsequent sessions can
+-- skip both the giant Lua vertex parse and normal reconstruction. The source
+-- cache remains authoritative and any sidecar failure falls back to it.
+local ARENA_RUNTIME_MESH_VERSION=2
+local arenaRuntimeHits,arenaRuntimeWrites=0,0
+local function safeArenaId(id) return tostring(id or "water"):gsub("[^%w_%-]","_") end
+local function arenaRuntimeRoot(id) return "cache/runtime_mesh_v2/arenas/"..safeArenaId(id) end
+local function arenaRuntimeMetaPath(id) return arenaRuntimeRoot(id).."/scene.lua" end
+local function arenaRuntimeBinPath(id,bucket,i)
+  return arenaRuntimeRoot(id)..("/%s_%03d.f32"):format(tostring(bucket or "group"),tonumber(i) or 0)
+end
+local function arenaSourceSize(def)
+  local info=GeneratedAssets and GeneratedAssets.info and GeneratedAssets.info(def and def.cache) or nil
+  return info and tonumber(info.size) or nil
+end
+local function arenaRuntimeUsable(meta,def,sourceSize)
+  if type(meta)~="table" or tonumber(meta.runtimeMeshVersion)~=ARENA_RUNTIME_MESH_VERSION then return false end
+  if not sourceSize or tonumber(meta.sourceSize)~=sourceSize or tostring(meta.sourceCache or "")~=tostring(def and def.cache or "") then return false end
+  local total=0
+  for _,bucket in ipairs({"opaque","cutout","crowd","translucent","additive"}) do
+    local rows=meta[bucket]
+    if type(rows)~="table" then return false end
+    for i,g in ipairs(rows) do
+      local path=type(g)=="table" and (g.runtimeBin or arenaRuntimeBinPath(def.id,bucket,i)) or nil
+      local info=path and GeneratedAssets.info and GeneratedAssets.info(path) or nil
+      local size=info and tonumber(info.size)
+      if not size or size<144 or size%48~=0 then return false end
+      total=total+1
+    end
+  end
+  return total>0
+end
+local function compactArenaEntry(g,textureSpec,runtimeBin)
+  return {runtimeBin=runtimeBin,texture=textureSpec,alpha=g.alpha,noz=g.noz,center=g.center,mode=g.mode,flow=g.flow,detail=g.detail,texelStep=g.texelStep,
+    diffuse=g.diffuse,ambient=g.ambient,specular=g.specular,shininess=g.shininess}
+end
+local function ensureArenaShader(ctx)
+  if shader then return shader end
+  local ok,sh
+  if ARENA_ANDROID then
+    ok,sh=pcall(love.graphics.newShader,MOBILE_VERTEX,MOBILE_PIXEL)
+    if not ok then
+      local mobileErr=sh
+      local okFull,full=pcall(love.graphics.newShader,VERTEX,PIXEL)
+      if okFull then ok,sh=true,full
+      else sh=("mobile=%s; full=%s"):format(tostring(mobileErr),tostring(full)) end
+    else
+      log(ctx,"info","Android GLES-safe arena shader active")
+    end
+  else
+    ok,sh=pcall(love.graphics.newShader,VERTEX,PIXEL)
+  end
+  if not ok then return nil,"shader: "..tostring(sh) end
+  shader=sh
+  uniformCache=nil;uniformCacheShader=nil
+  return shader
+end
+local function loadRuntimeArena(ctx,meta,def)
+  local textures={}
+  local out={opaque={},cutout={},crowd={},translucent={},additive={},bounds=meta.bounds,source=meta.source,textures=textures,
+    culled=tonumber(meta.culled) or 0,oversizeCulled=tonumber(meta.oversizeCulled) or 0,crowdOutliers=tonumber(meta.crowdOutliers) or 0,
+    crowdOriginal=tonumber(meta.crowdOriginal) or 0,crowdKept=tonumber(meta.crowdKept) or 0,crowdPolicy=meta.crowdPolicy,cachePath=def.cache,runtimeSidecar=true}
+  for _,bucket in ipairs({"opaque","cutout","crowd","translucent","additive"}) do
+    for i,g in ipairs(meta[bucket] or {}) do
+      local tex,terr=texture(g.texture,textures);if not tex then releaseArenaScene(out);return nil,terr end
+      local path=g.runtimeBin or arenaRuntimeBinPath(def.id,bucket,i)
+      local mesh,merr=RuntimeMeshCache.meshFromPath(FORMAT,path,12,"static")
+      if not mesh then releaseArenaScene(out);return nil,merr end
+      mesh:setTexture(tex.image)
+      out[bucket][#out[bucket]+1]={mesh=mesh,alpha=tonumber(g.alpha) or 1,noz=g.noz and true or false,center=g.center or {0,0,0},
+        mode=tonumber(g.mode) or 0,flow=tonumber(g.flow) or 0,detail=g.detail,texelStep=g.texelStep or {1,1},diffuse=g.diffuse or {1,1,1},
+        ambient=g.ambient or {1,1,1},specular=g.specular or {0,0,0},shininess=tonumber(g.shininess) or 0}
+    end
+  end
+  arenaRuntimeHits=arenaRuntimeHits+1
+  log(ctx,"info","loaded arena runtime sidecar %s (%d material groups)",tostring(def.id),#out.opaque+#out.cutout+#out.crowd+#out.translucent+#out.additive)
+  return out
+end
 local function loadScene(ctx)
+  if not scene then selectResident(activeArenaId) end
   if scene then return scene end
   if errorText then return nil,errorText end
   if not (love and love.graphics and love.image and love.graphics.newMesh and love.graphics.newShader) then
     errorText="LÖVE 3D graphics API unavailable"; return nil,errorText
   end
-  local cachePath=(activeDef and activeDef.cache) or "cache/M1_water_cache.lua"
+  local def=activeDef or (ArenaCatalog and ArenaCatalog.definition and ArenaCatalog.definition("water")) or {id="water",cache="cache/M1_water_cache.lua"}
+  local cachePath=def.cache or "cache/M1_water_cache.lua"
+  local sourceSize=arenaSourceSize(def)
+  if RuntimeMeshCache and type(RuntimeMeshCache.readLua)=="function" and type(RuntimeMeshCache.meshFromPath)=="function" then
+    local rt=select(1,RuntimeMeshCache.readLua(arenaRuntimeMetaPath(def.id)))
+    if arenaRuntimeUsable(rt,def,sourceSize) then
+      local runtimeScene,rerr=loadRuntimeArena(ctx,rt,def)
+      if runtimeScene then
+        local sh,serr=ensureArenaShader(ctx);if not sh then releaseArenaScene(runtimeScene);errorText=tostring(serr);return nil,errorText end
+        scene=runtimeScene;touchResident(activeArenaId,scene);errorText=nil
+        return scene
+      end
+      log(ctx,"warn","arena runtime sidecar %s unusable at load (%s); falling back to source cache",tostring(def.id),tostring(rerr))
+    end
+  end
   local cache,err=readLua(cachePath)
   if not cache then errorText=tostring(err);return nil,errorText end
   local textures={}; local opaque, cutout, crowd, translucent, additive = {}, {}, {}, {}, {}
+  local runtimeRows={opaque={},cutout={},crowd={},translucent={},additive={}}
+  local runtimeWritable=sourceSize and RuntimeMeshCache and RuntimeMeshCache.supported and RuntimeMeshCache.supported() and type(RuntimeMeshCache.writeRows)=="function"
+  local runtimeAll=runtimeWritable and true or false
   local culled,oversizeCulled,crowdOutliers=0,0,0
   for i,g in ipairs(cache.groups or {}) do
     local center,span,extent=groupStats(g.vertices)
@@ -918,12 +1154,13 @@ local function loadScene(ctx)
         end
         local entry={mesh=mesh,alpha=alpha,noz=g.noz and true or false,center=center,mode=mode,flow=flow,detail=detail,texelStep={1/math.max(1,tw),1/math.max(1,th)},
           diffuse=g.diffuse or {1,1,1},ambient=g.ambient or {1,1,1},specular=g.specular or {0,0,0},shininess=tonumber(g.shininess) or 0}
+        local bucketName,bucket
         if mode==2 then
-          additive[#additive+1]=entry
+          bucketName,bucket="additive",additive
         elseif mode==1 then
           -- Force all water through the transparent pass, even when the source
           -- material happened to be marked opaque for its original TEV setup.
-          translucent[#translucent+1]=entry
+          bucketName,bucket="translucent",translucent
         elseif mode==4 then
           -- The prior support test still admitted four isolated cards high in
           -- empty space (the tiny spectators visibly hanging over waterfalls in
@@ -932,44 +1169,158 @@ local function loadScene(ctx)
           -- gap rather than using a camera-dependent screen heuristic.
           local cpath=tostring(g.texture and g.texture.path or "")
           if cpath:find("cache/stages/orre/crowd_",1,true) or (center[2] or 0) <= 84.0 then
-            crowd[#crowd+1]=entry
+            bucketName,bucket="crowd",crowd
           else
             culled=culled+1;crowdOutliers=crowdOutliers+1
           end
         elseif mode>=3 and mode<3.5 then
-          cutout[#cutout+1]=entry
+          bucketName,bucket="cutout",cutout
         elseif not g.xlu then
-          opaque[#opaque+1]=entry
+          bucketName,bucket="opaque",opaque
         else
-          translucent[#translucent+1]=entry
+          bucketName,bucket="translucent",translucent
+        end
+        if bucket then
+          bucket[#bucket+1]=entry
+          if runtimeWritable then
+            local ri=#runtimeRows[bucketName]+1
+            local bin=arenaRuntimeBinPath(def.id,bucketName,ri)
+            local wok=RuntimeMeshCache.writeRows(bin,meshVertices,12)
+            if wok then runtimeRows[bucketName][ri]=compactArenaEntry(entry,g.texture,bin) else runtimeAll=false end
+          end
         end
       end -- non-empty mesh
     end
   end
-  local ok,sh=pcall(love.graphics.newShader,VERTEX,PIXEL)
-  if not ok then errorText="shader: "..tostring(sh);return nil,errorText end
-  shader=sh
+  local sh,serr=ensureArenaShader(ctx)
+  if not sh then errorText=tostring(serr);return nil,errorText end
   scene={opaque=opaque,cutout=cutout,crowd=crowd,translucent=translucent,additive=additive,bounds=cache.bounds,source=cache.source,textures=textures,culled=culled,oversizeCulled=oversizeCulled,crowdOutliers=crowdOutliers,
-    crowdOriginal=tonumber(cache.crowdOriginal) or 0,crowdKept=#crowd,crowdPolicy=cache.crowdPolicy or ((activeDef and activeDef.crowd) or "none") }
+    crowdOriginal=tonumber(cache.crowdOriginal) or 0,crowdKept=#crowd,crowdPolicy=cache.crowdPolicy or ((activeDef and activeDef.crowd) or "none"),cachePath=cachePath,runtimeSidecar=false }
+  if runtimeAll and RuntimeMeshCache and type(RuntimeMeshCache.writeLua)=="function" then
+    local meta={runtimeMeshVersion=ARENA_RUNTIME_MESH_VERSION,sourceSize=sourceSize,sourceCache=cachePath,bounds=cache.bounds,source=cache.source,
+      culled=culled,oversizeCulled=oversizeCulled,crowdOutliers=crowdOutliers,crowdOriginal=tonumber(cache.crowdOriginal) or 0,crowdKept=#crowd,
+      crowdPolicy=cache.crowdPolicy or ((activeDef and activeDef.crowd) or "none"),opaque=runtimeRows.opaque,cutout=runtimeRows.cutout,crowd=runtimeRows.crowd,
+      translucent=runtimeRows.translucent,additive=runtimeRows.additive}
+    local wok=RuntimeMeshCache.writeLua(arenaRuntimeMetaPath(def.id),meta)
+    if wok then arenaRuntimeWrites=arenaRuntimeWrites+1;log(ctx,"info","wrote compact runtime arena sidecar for %s",tostring(def.id)) end
+  end
   cache=nil
+  touchResident(activeArenaId,scene);errorText=nil
   log(ctx,"info","loaded arena: %d opaque + %d cutout + %d animated crowd + %d translucent + %d additive groups (%d remote/effect groups omitted); crowd cards %d/%d (%s, %d hanging outliers removed) from %s",#opaque,#cutout,#crowd,#translucent,#additive,culled,
     scene.crowdKept,scene.crowdOriginal,tostring(scene.crowdPolicy or "legacy"),scene.crowdOutliers or 0,tostring(scene.source))
   return scene
 end
+-- love.graphics.getSystemLimits() is a driver query, and pixelSize() called
+-- this on Android for EVERY frame. Both the texture limit and the derived
+-- canvas size are fixed for a given window size, so both are cached.
+local sysTextureLimit=nil
+local mcsW,mcsH,mcsOutW,mcsOutH=nil,nil,nil,nil
+local function mobileCanvasSize(w,h)
+  w,h=tonumber(w) or 0,tonumber(h) or 0
+  if w<=0 or h<=0 then return w,h end
+  if mcsW==w and mcsH==h then return mcsOutW,mcsOutH end
+  -- A full physical-resolution RGBA canvas plus depth buffer is an unnecessary
+  -- GPU-memory multiplier on 1440p/4K-density phones. Keep the same aspect/FOV
+  -- but cap Android's offscreen 3D surface to roughly 720p / 1280 max axis.
+  local maxPixels=1280*720;local maxAxis=1280
+  local scale=math.min(1,maxAxis/math.max(w,h),math.sqrt(maxPixels/(w*h)))
+  if sysTextureLimit==nil and love.graphics.getSystemLimits then
+    local ok,limits=pcall(love.graphics.getSystemLimits)
+    sysTextureLimit=(ok and type(limits)=="table" and tonumber(limits.texturesize)) or false
+  end
+  if sysTextureLimit and sysTextureLimit>0 then scale=math.min(scale,sysTextureLimit/math.max(w,h)) end
+  local inW,inH=w,h
+  if scale<1 then
+    w=math.max(320,math.floor(w*scale+0.5));h=math.max(180,math.floor(h*scale+0.5))
+  end
+  mcsW,mcsH,mcsOutW,mcsOutH=inW,inH,w,h
+  return w,h
+end
 local function pixelSize()
+  if ARENA_ANDROID then
+    local w,h=love.graphics.getDimensions();return mobileCanvasSize(w,h)
+  end
   if love.graphics.getPixelDimensions then
     local w,h=love.graphics.getPixelDimensions(); if w and h and w>0 and h>0 then return w,h end
   end
   return love.graphics.getDimensions()
 end
+local function canvasFormats()
+  if not (love.graphics and type(love.graphics.getCanvasFormats)=="function") then return {} end
+  local ok,v=pcall(love.graphics.getCanvasFormats)
+  return ok and type(v)=="table" and v or {}
+end
 local function ensureCanvas(w,h)
   if canvas and cw==w and ch==h then return canvas end
-  canvas=love.graphics.newCanvas(w,h,{dpiscale=1});cw,ch=w,h;return canvas
+  canvas=nil;depthCanvas=nil;depthMode=nil;depthActive=false
+  local colorOpts={dpiscale=1,msaa=0}
+  local okColor,out=pcall(love.graphics.newCanvas,w,h,colorOpts)
+  if not okColor then
+    -- Some mobile LÖVE forks reject newer option keys. Retry the oldest common
+    -- signature before declaring the arena unavailable.
+    okColor,out=pcall(love.graphics.newCanvas,w,h)
+  end
+  if not okColor then error(out) end
+  canvas=out;cw,ch=w,h
+  if ARENA_ANDROID then
+    local formats=canvasFormats()
+    for _,fmt in ipairs({"depth24stencil8","depth16"}) do
+      if formats[fmt]~=false then
+        local okDepth,d=pcall(love.graphics.newCanvas,w,h,{format=fmt,readable=false,dpiscale=1,msaa=0})
+        if okDepth then depthCanvas=d;depthMode="explicit";break end
+      end
+    end
+    if not depthMode then depthMode="auto" end
+  else
+    depthMode="auto"
+  end
+  return canvas
 end
+local function bindArenaCanvas(out)
+  if depthMode=="explicit" and depthCanvas then
+    local ok,err=pcall(love.graphics.setCanvas,{out,depthstencil=depthCanvas})
+    if ok then depthActive=true;return true end
+    log(nil,"warn","explicit Android depth attachment rejected; retrying temporary depth: %s",tostring(err))
+    depthCanvas=nil;depthMode="auto"
+  end
+  if depthMode=="auto" then
+    local ok,err=pcall(love.graphics.setCanvas,{out,depth=true})
+    if ok then depthActive=true;return true end
+    log(nil,"warn","temporary arena depth attachment rejected; using ordered no-depth mobile fallback: %s",tostring(err))
+    depthMode="none"
+  end
+  local ok,err=pcall(love.graphics.setCanvas,out)
+  if not ok then return false,err end
+  depthActive=false
+  return true
+end
+-- Uniform presence is a property of the compiled shader, not of the frame.
+-- The old path ran TWO pcalls (hasUniform + send) for every uniform of every
+-- material group of every frame; drawGroups alone sends nine per group. The
+-- lookup is resolved once per shader object and cached.
+local function sendShader(name,...)
+  local sh=shader
+  if not sh then return false end
+  if uniformCacheShader~=sh then uniformCacheShader=sh;uniformCache={} end
+  local has=uniformCache[name]
+  if has==nil then
+    has=true
+    if type(sh.hasUniform)=="function" then
+      local ok,v=pcall(sh.hasUniform,sh,name)
+      if ok and not v then has=false end
+    end
+    uniformCache[name]=has
+  end
+  if not has then return false end
+  return pcall(sh.send,sh,name,...)
+end
+local UP_Y={0,1,0}
 local function viewProjection(ctx,w,h)
   local camera=ctx and ctx.services and ctx.services.camera
   local pose=camera and camera.pose
   if not (pose and pose.eye and pose.focus and pose.fov) then
+    -- Deliberately a fresh table: consumers receive this pose through
+    -- ctx.services.camera.pose and must never share a module-level default.
     pose={eye={54,24,13},focus={0,6,0},fov=math.rad(40)}
   end
   local eye,focus=pose.eye,pose.focus
@@ -991,55 +1342,74 @@ local function viewProjection(ctx,w,h)
     or 265
   local far=math.max(baseFar,dist+tail)
   local p=Mat4.perspective(pose.fov,w/h,near,far)
-  p=Mat4.mul(Mat4.scale(1,-1,1),p)
-  return Mat4.mul(p,Mat4.lookAt(eye,focus,{0,1,0})), pose
+  -- scale(1,-1,1) * p only negates the second row of p; doing that directly
+  -- avoids building a scale matrix and running a full 4x4 multiply per frame.
+  p[5],p[6],p[7],p[8]=-p[5],-p[6],-p[7],-p[8]
+  return Mat4.mul(p,Mat4.lookAt(eye,focus,UP_Y)), pose
 end
 local function setStageState(vp,model,writeDepth,pose)
-  love.graphics.setDepthMode("lequal",writeDepth and true or false)
+  if depthActive then love.graphics.setDepthMode("lequal",writeDepth and true or false) else love.graphics.setDepthMode() end
   if love.graphics.setMeshCullMode then love.graphics.setMeshCullMode("none") end
   love.graphics.setBlendMode("alpha","alphamultiply")
   love.graphics.setColor(1,1,1,1)
   love.graphics.setShader(shader)
-  shader:send("vp","row",vp);shader:send("model","row",model)
-  shader:send("sceneTime",sceneTime)
-  shader:send("sceneRadiusWorld",math.max(20,(BATTLE_VERTEX_RADIUS_RAW or 415)*(STAGE_SCALE or 0.25)+8))
+  sendShader("vp","row",vp);sendShader("model","row",model)
+  sendShader("sceneTime",sceneTime)
+  sendShader("sceneRadiusWorld",math.max(20,(BATTLE_VERTEX_RADIUS_RAW or 415)*(STAGE_SCALE or 0.25)+8))
   local profile=(activeDef and activeDef.profile) or "water"
-  shader:send("sceneProfile",profile=="realgam" and 4 or (profile=="orre" and 3 or (profile=="summit" and 2 or (profile=="outdoor" and 1 or 0))))
-  shader:send("cameraEye",pose and pose.eye or {54,24,13})
+  sendShader("sceneProfile",profile=="realgam" and 4 or (profile=="orre" and 3 or (profile=="summit" and 2 or (profile=="outdoor" and 1 or 0))))
+  sendShader("cameraEye",pose and pose.eye or {54,24,13})
+end
+-- Shared immutable fallbacks. These were allocated fresh for every material
+-- group that omitted the field, on every frame.
+local WHITE3={1,1,1}
+local BLACK3={0,0,0}
+local UNIT2={1,1}
+local function drawGroup(g)
+  sendShader("materialAlpha",g.alpha or 1)
+  sendShader("materialMode",g.mode or 0)
+  sendShader("materialFlow",g.flow or 0)
+  sendShader("materialDiffuse",g.diffuse or WHITE3)
+  sendShader("materialAmbient",g.ambient or WHITE3)
+  sendShader("materialSpecular",g.specular or BLACK3)
+  sendShader("materialShininess",g.shininess or 0)
+  sendShader("materialDetail",g.detail or 0)
+  sendShader("texelStep",g.texelStep or UNIT2)
+  love.graphics.draw(g.mesh)
 end
 local function drawGroups(groups)
-  for _,g in ipairs(groups) do
-    shader:send("materialAlpha",g.alpha or 1)
-    shader:send("materialMode",g.mode or 0)
-    shader:send("materialFlow",g.flow or 0)
-    shader:send("materialDiffuse",g.diffuse or {1,1,1})
-    shader:send("materialAmbient",g.ambient or {1,1,1})
-    shader:send("materialSpecular",g.specular or {0,0,0})
-    shader:send("materialShininess",g.shininess or 0)
-    shader:send("materialDetail",g.detail or 0)
-    shader:send("texelStep",g.texelStep or {1,1})
-    love.graphics.draw(g.mesh)
-  end
+  for i=1,#groups do drawGroup(groups[i]) end
 end
 local function drawCrowd(groups,vp,baseModel,pose)
-  for _,g in ipairs(groups or {}) do
-    local c=g.center or {0,0,0}
+  if not groups then return end
+  -- Both of these are constant for the whole crowd pass; they used to be
+  -- re-derived inside the per-sector loop.
+  local exactSourceCrowd=scene and scene.crowdPolicy=="source-hsd-crowd"
+  local profile=activeDef and activeDef.profile
+  local cull=(not exactSourceCrowd) and pose and pose.eye
+    and (profile=="orre" or profile=="realgam")
+  local ex,ey,ez
+  if cull then ex,ey,ez=pose.eye[1] or 0,pose.eye[2] or 0,pose.eye[3] or 0 end
+  local sc=STAGE_SCALE or 0.25
+  for i=1,#groups do
+    local g=groups[i]
+    local c=g.center or BLACK3
     -- Sector batches retain a meaningful center, so the whole camera-side
     -- gallery sector can be hidden behind its architecture in one decision.
     local skip=false
-    local exactSourceCrowd=scene and scene.crowdPolicy=="source-hsd-crowd"
-    if not exactSourceCrowd and pose and pose.eye and activeDef and (activeDef.profile=="orre" or activeDef.profile=="realgam") then
-      local sc=STAGE_SCALE or 0.25
+    if cull then
       local wx,wz=(c[1] or 0)*sc,(c[3] or 0)*sc
-      local dx=wx-(pose.eye[1] or 0)
-      local dy=(c[2] or 0)*sc-(pose.eye[2] or 0)
-      local dz=wz-(pose.eye[3] or 0)
-      local sameCameraHemisphere=(wx*(pose.eye[1] or 0)+wz*(pose.eye[3] or 0))>0
+      local dx=wx-ex
+      local dy=(c[2] or 0)*sc-ey
+      local dz=wz-ez
+      local sameCameraHemisphere=(wx*ex+wz*ez)>0
       skip=sameCameraHemisphere or (dx*dx+dy*dy+dz*dz)<34*34
     end
     if not skip then
       setStageState(vp,baseModel,true,pose)
-      drawGroups({g})
+      -- Was drawGroups({g}): one throwaway table per visible crowd sector
+      -- per frame.
+      drawGroup(g)
     end
   end
 end
@@ -1059,7 +1429,24 @@ local function projectWorldToBackdrop(vp,x,y,z,w,h)
   return (nx*.5+.5)*w,(ny*.5+.5)*h
 end
 
-local function drawBackdrop(w,h,vp)
+-- ---------------------------------------------------------------------------
+-- BACKDROP
+--
+-- Every profile below painted its sky as 40-72 individually filled screen-wide
+-- rectangles, plus source card draws, on EVERY frame -- for artwork that does
+-- not change between frames at all. On a phone that is 40-72 extra draw calls
+-- and state changes per frame before a single piece of arena geometry is
+-- submitted, which is a large part of why Colosseum models felt heavy next to
+-- the UI.
+--
+-- paintBackdropStatic() below is the ORIGINAL painter, unchanged in what it
+-- draws. It is now rendered once into a cached canvas keyed by
+-- profile/size/scene and blitted thereafter. The only genuinely per-frame
+-- elements -- Outdoor Wild's drifting cloud cards and its vp-projected sun --
+-- are split out into paintBackdropDynamic() and still drawn live every frame.
+-- Nothing about the resulting image changes.
+-- ---------------------------------------------------------------------------
+local function paintBackdropStatic(w,h)
   love.graphics.setShader()
   love.graphics.setDepthMode()
   love.graphics.setBlendMode("alpha","alphamultiply")
@@ -1075,30 +1462,18 @@ local function drawBackdrop(w,h,vp)
   -- quiet layered sky/cloud deck in screen space so the 3D stage still owns
   -- all silhouettes and depth.
   if profile=="water" then
-    -- Water Colosseum background fidelity: keep the venue's restrained cool
-    -- identity, but give open camera angles actual atmospheric depth instead
-    -- of a single dark-blue gradient.
-    local skyEntry,cloudEntry
-    if scene and scene.textures then
-      skyEntry=texture({path="cache/stages/d2_crater/textures/tex_0c2120_256x256_f14.rgba",w=256,h=256},scene.textures)
-      cloudEntry=texture({path="cache/stages/d2_crater/textures/tex_0d6920_128x128_f1.rgba",w=128,h=128},scene.textures)
-    end
+    -- Phenac / Water Colosseum is an enclosed limestone stadium. The previous
+    -- pass borrowed Mt. Battle sky/cloud textures behind it, which could turn
+    -- gaps in the authentic source shell into an outdoor blue-sky scene. Keep
+    -- the backdrop purely neutral and architectural; the extracted M1 HSD owns
+    -- every visible wall, balcony, banner, fountain and water surface.
+    local a={.075,.105,.115};local b={.205,.235,.235}
     for i=0,55 do
       local t=i/55;local u=t*t*(3-2*t);local y=i*h/55
-      love.graphics.setColor(.035+.10*u,.090+.19*u,.165+.21*u,1)
+      love.graphics.setColor(a[1]+(b[1]-a[1])*u,a[2]+(b[2]-a[2])*u,a[3]+(b[3]-a[3])*u,1)
       love.graphics.rectangle("fill",0,y,w,math.ceil(h/55)+2)
     end
-    if skyEntry and skyEntry.image then
-      love.graphics.setColor(.76,.90,1.00,.11)
-      love.graphics.draw(skyEntry.image,0,0,0,w/256,h/256)
-    end
-    if cloudEntry and cloudEntry.image then
-      local d=(sceneTime*.85)%(w*.80)
-      love.graphics.setColor(.70,.85,.92,.025)
-      love.graphics.draw(cloudEntry.image,-w*.36+d,h*.20,0,w/128*.92,h/128*.18)
-      love.graphics.draw(cloudEntry.image,w*.38+d-w*.80,h*.27,0,w/128*.84,h/128*.16)
-    end
-    love.graphics.setColor(.11,.29,.38,.05);love.graphics.rectangle("fill",0,h*.78,w,h*.22)
+    love.graphics.setColor(.12,.17,.18,.08);love.graphics.rectangle("fill",0,h*.76,w,h*.24)
     love.graphics.setColor(1,1,1,1)
     return
   elseif profile=="summit" then
@@ -1190,25 +1565,9 @@ local function drawBackdrop(w,h,vp)
       love.graphics.setColor(.95,.98,1.00,.08)
       love.graphics.draw(skyEntry.image,0,0,0,w/256,h/256)
     end
-    -- Fixed late-afternoon sun filtering through the forest edge.
-    local sx,sy=projectWorldToBackdrop(vp,-210.0,118.0,145.0,w,h)
-    if sx and sy and sx>-w*.18 and sx<w*1.18 and sy>-h*.16 and sy<h*.72 then
-      love.graphics.setColor(1.00,.68,.28,.035);love.graphics.ellipse("fill",sx,sy,w*.12,h*.11)
-      love.graphics.setColor(1.00,.84,.48,.080);love.graphics.ellipse("fill",sx,sy,w*.060,h*.056)
-      love.graphics.setColor(1.00,.95,.74,.20);love.graphics.ellipse("fill",sx,sy,w*.020,h*.019)
-    end
-    if cloudEntry and cloudEntry.image then
-      local d=(sceneTime*2.3)%(w*.66)
-      love.graphics.setColor(.96,.98,1.00,.075)
-      love.graphics.draw(cloudEntry.image,-w*.28-d,h*.10,0,w/128*.94,h/128*.25)
-      love.graphics.draw(cloudEntry.image, w*.46-d,h*.16,0,w/128*.86,h/128*.23)
-      local d2=(sceneTime*1.7)%(w*.74)
-      love.graphics.setColor(.86,.94,.89,.045)
-      love.graphics.draw(cloudEntry.image,-w*.18+d2,h*.53,0,w/128*.78,h/128*.15)
-    end
-    -- Pale blue-green distance haze behind the tree line, never brown dust.
-    love.graphics.setColor(.67,.82,.75,.055);love.graphics.rectangle("fill",0,h*.73,w,h*.27)
-    love.graphics.setColor(.32,.50,.37,.025);love.graphics.rectangle("fill",0,h*.90,w,h*.10)
+    -- The sun and the drifting cloud cards depend on the live camera and on
+    -- sceneTime, so they are NOT baked; paintBackdropDynamic draws them every
+    -- frame, in exactly this position in the layer order.
     love.graphics.setColor(1,1,1,1)
     return
   end
@@ -1222,6 +1581,89 @@ local function drawBackdrop(w,h,vp)
   love.graphics.setColor(1,1,1,1)
 end
 
+-- Per-frame backdrop elements. Only Outdoor Wild has any: the camera-projected
+-- sun and the two drifting cloud bands, followed by its haze. Byte-for-byte
+-- the same draw sequence that used to sit inline in the outdoor branch.
+local function paintBackdropDynamic(w,h,vp)
+  local profile=(activeDef and activeDef.profile) or "water"
+  if profile~="outdoor" then return end
+  love.graphics.setShader()
+  love.graphics.setDepthMode()
+  love.graphics.setBlendMode("alpha","alphamultiply")
+  local cloudEntry
+  if scene and scene.textures then
+    cloudEntry=texture({path="cache/stages/d2_crater/textures/tex_0d6920_128x128_f1.rgba",w=128,h=128},scene.textures)
+  end
+  -- Fixed late-afternoon sun filtering through the forest edge.
+  local sx,sy=projectWorldToBackdrop(vp,-210.0,118.0,145.0,w,h)
+  if sx and sy and sx>-w*.18 and sx<w*1.18 and sy>-h*.16 and sy<h*.72 then
+    love.graphics.setColor(1.00,.68,.28,.035);love.graphics.ellipse("fill",sx,sy,w*.12,h*.11)
+    love.graphics.setColor(1.00,.84,.48,.080);love.graphics.ellipse("fill",sx,sy,w*.060,h*.056)
+    love.graphics.setColor(1.00,.95,.74,.20);love.graphics.ellipse("fill",sx,sy,w*.020,h*.019)
+  end
+  if cloudEntry and cloudEntry.image then
+    local d=(sceneTime*2.3)%(w*.66)
+    love.graphics.setColor(.96,.98,1.00,.075)
+    love.graphics.draw(cloudEntry.image,-w*.28-d,h*.10,0,w/128*.94,h/128*.25)
+    love.graphics.draw(cloudEntry.image, w*.46-d,h*.16,0,w/128*.86,h/128*.23)
+    local d2=(sceneTime*1.7)%(w*.74)
+    love.graphics.setColor(.86,.94,.89,.045)
+    love.graphics.draw(cloudEntry.image,-w*.18+d2,h*.53,0,w/128*.78,h/128*.15)
+  end
+  -- Pale blue-green distance haze behind the tree line, never brown dust.
+  love.graphics.setColor(.67,.82,.75,.055);love.graphics.rectangle("fill",0,h*.73,w,h*.27)
+  love.graphics.setColor(.32,.50,.37,.025);love.graphics.rectangle("fill",0,h*.90,w,h*.10)
+  love.graphics.setColor(1,1,1,1)
+end
+
+-- Bake the static sky once per (profile, framebuffer size, loaded scene).
+-- Must be called with no arena canvas bound; A:render does this immediately
+-- before it binds the arena framebuffer.
+local function ensureBackdrop(w,h)
+  local key=tostring(activeDef and activeDef.profile or "water").."|"..tostring(w).."x"..tostring(h)
+    .."|"..tostring(scene).."|"..tostring(activeDef)
+  if backdropCanvas and backdropKey==key then return backdropCanvas end
+  if backdropCanvas then pcall(function() if backdropCanvas.release then backdropCanvas:release() end end) end
+  backdropCanvas=nil;backdropKey=nil
+  local okNew,bc=pcall(love.graphics.newCanvas,w,h,{dpiscale=1,msaa=0})
+  if not okNew then okNew,bc=pcall(love.graphics.newCanvas,w,h) end
+  if not okNew or not bc then return nil end
+  local prior=love.graphics.getCanvas()
+  local ok=pcall(function()
+    love.graphics.push("all")
+    if love.graphics.origin then love.graphics.origin() end
+    if love.graphics.setScissor then love.graphics.setScissor() end
+    love.graphics.setCanvas(bc)
+    love.graphics.clear(0,0,0,0)
+    paintBackdropStatic(w,h)
+    love.graphics.setCanvas(prior)
+    love.graphics.pop()
+  end)
+  if not ok then
+    pcall(love.graphics.setCanvas,prior)
+    pcall(function() if bc.release then bc:release() end end)
+    return nil
+  end
+  backdropCanvas=bc;backdropKey=key
+  backdropBakes=backdropBakes+1
+  return backdropCanvas
+end
+
+local function drawBackdrop(w,h,vp,baked)
+  if baked then
+    love.graphics.setShader()
+    love.graphics.setDepthMode()
+    love.graphics.setBlendMode("alpha","alphamultiply")
+    love.graphics.setColor(1,1,1,1)
+    love.graphics.draw(baked,0,0)
+  else
+    -- Canvas unavailable on this backend: fall back to the original
+    -- immediate-mode painter so the arena still renders correctly.
+    paintBackdropStatic(w,h)
+  end
+  paintBackdropDynamic(w,h,vp)
+end
+
 local function worldCenter(c)
   local x,y,z=(c[1] or 0)*STAGE_SCALE,(c[2] or 0)*STAGE_SCALE,(c[3] or 0)*STAGE_SCALE
   if STAGE_YAW~=0 then
@@ -1230,15 +1672,30 @@ local function worldCenter(c)
   end
   return x,y,z
 end
+-- Back-to-front sort for the no-depth-write transparency pass.
+--
+-- The comparator used to call worldCenter() twice per comparison, and
+-- worldCenter runs math.cos/math.sin whenever the stage is yawed. That is
+-- O(n log n) trig every frame. Each group's squared eye distance is now
+-- computed exactly once per frame and the sort compares plain numbers.
+-- Ordering is identical.
+local sortKey=setmetatable({},{__mode="k"})
 local function drawTransparent(groups,eye)
-  if #groups<2 then return drawGroups(groups) end
+  local n=#groups
+  if n<2 then return drawGroups(groups) end
   local ex,ey,ez=eye[1],eye[2],eye[3]
-  table.sort(groups,function(a,b)
-    local ax,ay,az=worldCenter(a.center); local bx,by,bz=worldCenter(b.center)
-    local ad=(ax-ex)^2+(ay-ey)^2+(az-ez)^2
-    local bd=(bx-ex)^2+(by-ey)^2+(bz-ez)^2
-    return ad>bd
-  end)
+  local cs,sn=1,0
+  local yawed=STAGE_YAW~=0
+  if yawed then cs,sn=math.cos(STAGE_YAW),math.sin(STAGE_YAW) end
+  for i=1,n do
+    local g=groups[i]
+    local c=g.center or BLACK3
+    local x,y,z=(c[1] or 0)*STAGE_SCALE,(c[2] or 0)*STAGE_SCALE,(c[3] or 0)*STAGE_SCALE
+    if yawed then x,z=cs*x+sn*z,-sn*x+cs*z end
+    local dx,dy,dz=x-ex,y-ey,z-ez
+    sortKey[g]=dx*dx+dy*dy+dz*dz
+  end
+  table.sort(groups,function(a,b) return sortKey[a]>sortKey[b] end)
   drawGroups(groups)
 end
 local function updateAnchors(arena)
@@ -1263,21 +1720,19 @@ function A:available(ctx)
   if def and not cacheAvailable(def) then return false end
   return love and love.graphics and love.graphics.newCanvas and true or false
 end
-function A:arena(ctx)
-  local battle=ctx and ctx.battle
-  local game=(ctx and ctx.game) or (battle and battle.game)
-  local def,selected
-  if ArenaCatalog and ArenaCatalog.resolve then def,selected=ArenaCatalog.resolve(game,battle) end
-  def=def or (ArenaCatalog and ArenaCatalog.definition and ArenaCatalog.definition("water")) or {id="water",cache="cache/M1_water_cache.lua",stageScale=0.25,stageYaw=0,sceneRadiusRaw=430,maxGroupSpanRaw=920,vertexRadiusRaw=415,camera={side=58,back=14,height=24,lookX=0,lookY=6,frameH=50},pokemon={player={0,14.5},enemy={0,-14.5}},figureScale=0.38}
+local function activateDefinition(ctx,def,selected)
+  if not def then return nil end
   if not cacheAvailable(def) then
     log(ctx,"warn","arena cache unavailable: %s",tostring(def and def.cache))
     return nil
   end
-  if activeArenaId~=(def.id or "water") or (activeDef and activeDef.cache~=def.cache) then
-    scene=nil;errorText=nil;canvas=nil;cw=nil;ch=nil
+  local nextId=def.id or "water"
+  if activeArenaId~=nextId or (activeDef and activeDef.cache~=def.cache) then
+    scene=nil;errorText=nil
   end
   activeDef=def
-  activeArenaId=def.id or "water"
+  activeArenaId=nextId
+  selectResident(activeArenaId)
   if def.pokemon then
     VIS_PLAYER={def.pokemon.player[1],def.pokemon.player[2]}
     VIS_ENEMY={def.pokemon.enemy[1],def.pokemon.enemy[2]}
@@ -1288,8 +1743,6 @@ function A:arena(ctx)
   BATTLE_MAX_GROUP_SPAN_RAW=tonumber(def.maxGroupSpanRaw) or 920
   BATTLE_VERTEX_RADIUS_RAW=tonumber(def.vertexRadiusRaw) or 415
   figureScale=tonumber(def.figureScale) or DEFAULT_FIGURE_SCALE
-  -- The human actors are configured from the exact same immutable battle
-  -- profile before StadiumBattleFX acquires the camera provider.
   if PlayerTrainer and type(PlayerTrainer.setArenaProfile)=="function" then PlayerTrainer:setArenaProfile(def) end
   if Trainer and type(Trainer.setArenaProfile)=="function" then Trainer:setArenaProfile(def) end
   local arena={
@@ -1302,20 +1755,78 @@ function A:arena(ctx)
     _cbeArenaId=activeArenaId,
   }
   updateAnchors(arena)
-  log(ctx,"info","arena acquire selected=%s resolved=%s cache=%s",tostring(selected),tostring(activeArenaId),tostring(def.cache))
   return arena
 end
-function A:prewarm(ctx)
+
+function A:arena(ctx)
+  local battle=ctx and ctx.battle
+  local game=(ctx and ctx.game) or (battle and battle.game)
+  local def,selected
+  if ArenaCatalog and ArenaCatalog.resolve then def,selected=ArenaCatalog.resolve(game,battle) end
+  def=def or (ArenaCatalog and ArenaCatalog.definition and ArenaCatalog.definition("water")) or {id="water",cache="cache/M1_water_cache.lua",stageScale=0.25,stageYaw=0,sceneRadiusRaw=430,maxGroupSpanRaw=920,vertexRadiusRaw=415,camera={side=58,back=14,height=24,lookX=0,lookY=6,frameH=50},pokemon={player={0,14.5},enemy={0,-14.5}},figureScale=0.38}
+  local arena=activateDefinition(ctx,def,selected)
+  if arena then log(ctx,"info","arena acquire selected=%s resolved=%s cache=%s",tostring(selected),tostring(activeArenaId),tostring(def.cache)) end
+  return arena
+end
+
+-- Materialize a specific arena definition without consuming/binding a battle.
+-- This is the game-ready path used by AUTO to keep both Water (trainer) and
+-- Wildlands (wild/safari) resident. The active presentation profile is restored
+-- afterwards so prewarming cannot change the user's next selection.
+function A:prewarmDefinition(ctx,id)
+  ctx=type(ctx)=="table" and ctx or {}
+  local def=ArenaCatalog and ArenaCatalog.definition and ArenaCatalog.definition(id) or nil
+  if not def then return false,"unknown arena "..tostring(id) end
+  local oldDef=activeDef
+  local oldId=activeArenaId
+  local oldError=errorText
+  local arena=activateDefinition(ctx,def,id)
+  if not arena then return false,"arena unavailable" end
+  local warmed,err=loadScene(ctx)
+  local restore=oldDef or (ArenaCatalog and ArenaCatalog.definition and ArenaCatalog.definition(oldId or "water"))
+  if restore then activateDefinition(ctx,restore,oldId) else scene=nil;activeDef=nil;activeArenaId=oldId or "water";errorText=oldError end
+  if not warmed then return false,err end
+  return true,arena
+end
+
+function A:prewarmAutoPair(ctx)
+  ctx=type(ctx)=="table" and ctx or {}
+  local okWater,errWater=self:prewarmDefinition(ctx,"water")
+  local okWild,errWild=self:prewarmDefinition(ctx,"outdoor_wild")
+  if not okWater then return false,errWater end
+  if not okWild then return false,errWild end
+  return true,{water=true,outdoor_wild=true}
+end
+
+function A:prewarmResident(ctx)
   ctx=type(ctx)=="table" and ctx or {}
   local arena=self:arena(ctx)
   if not arena then return false,"arena unavailable" end
   local scene0,err=loadScene(ctx)
   if not scene0 then return false,err end
-  local w,h=pixelSize()
-  if w and h and w>0 and h>0 then pcall(ensureCanvas,w,h) end
+  -- Android wants the expensive generated-cache parse, texture decode, mesh
+  -- upload and trainer construction paid while the overworld is already live,
+  -- but not a depth/color framebuffer sitting around before battle. The canvas
+  -- remains battle-lazy; the reusable arena/trainer GPU scene stays resident.
   if Trainer and type(Trainer.prewarm)=="function" then pcall(Trainer.prewarm,Trainer,ctx) end
   if PlayerTrainer and type(PlayerTrainer.prewarm)=="function" then pcall(PlayerTrainer.prewarm,PlayerTrainer,ctx) end
   return true,arena
+end
+
+function A:prewarmFramebuffer()
+  if not (love and love.graphics) then return false,"graphics unavailable" end
+  local w,h=pixelSize()
+  if not (w and h and w>0 and h>0) then return false,"invalid framebuffer size" end
+  local ok,out=pcall(ensureCanvas,w,h)
+  if not ok then return false,tostring(out) end
+  return out~=nil,{width=w,height=h,mode=depthMode}
+end
+
+function A:prewarm(ctx)
+  local ok,arenaOrErr=self:prewarmResident(ctx)
+  if not ok then return false,arenaOrErr end
+  self:prewarmFramebuffer()
+  return true,arenaOrErr
 end
 
 function A:begin(ctx,arena)
@@ -1366,9 +1877,21 @@ function A:render(ctx,arena,drawActors)
   local prior=love.graphics.getCanvas(); local pushed=false
   local good,why=pcall(function()
     love.graphics.push("all"); pushed=true
-    love.graphics.setCanvas({out,depth=true})
-    love.graphics.clear(0.025,0.075,0.145,1,true,true)
-    drawBackdrop(w,h,vp)
+    -- UI mods are allowed to draw in a scaled logical coordinate space. A
+    -- Mobile Battle UI 0.5x transform leaking into this offscreen world pass
+    -- shrinks CBE to exactly one quarter of the viewport at the top-left.
+    -- Render the 3D environment from a clean pixel-space transform/scissor;
+    -- push/pop restores the caller's HUD state immediately afterward.
+    if love.graphics.origin then love.graphics.origin() end
+    if love.graphics.setScissor then love.graphics.setScissor() end
+    -- Bake the static sky BEFORE the arena framebuffer is bound, so the
+    -- one-off canvas render never disturbs the live depth attachment.
+    local baked=ensureBackdrop(w,h)
+    local bound,bindErr=bindArenaCanvas(out)
+    if not bound then error("arena framebuffer bind: "..tostring(bindErr)) end
+    if depthActive then love.graphics.clear(0.025,0.075,0.145,1,true,true)
+    else love.graphics.clear(0.025,0.075,0.145,1) end
+    drawBackdrop(w,h,vp,baked)
 
     -- 1) True solid geometry and binary-alpha cutouts establish scene depth.
     setStageState(vp,model,true,pose)
@@ -1447,9 +1970,27 @@ function A:finish(ctx,reason)
   if Trainer then Trainer:finish(ctx,reason) end
   if PlayerTrainer then PlayerTrainer:finish(ctx,reason) end
 end
-function A:invalidate() canvas=nil;cw=nil;ch=nil end
+function A:invalidate()
+  canvas=nil;depthCanvas=nil;depthMode=nil;depthActive=false;cw=nil;ch=nil
+  if backdropCanvas then pcall(function() if backdropCanvas.release then backdropCanvas:release() end end) end
+  backdropCanvas=nil;backdropKey=nil
+end
 function A:resetRuntime()
-  scene=nil;shader=nil;white=nil;canvas=nil;cw=nil;ch=nil;errorText=nil;renderErrors={};sceneTime=0
+  local released={}
+  for id,s in pairs(residentScenes) do
+    if s and not released[s] then releaseArenaScene(s);released[s]=true end
+    residentScenes[id]=nil;residentUse[id]=nil
+  end
+  if scene and not released[scene] then releaseArenaScene(scene) end
+  pcall(function() if shader and shader.release then shader:release() end end)
+  pcall(function() if white and white.release then white:release() end end)
+  pcall(function() if canvas and canvas.release then canvas:release() end end)
+  pcall(function() if depthCanvas and depthCanvas.release then depthCanvas:release() end end)
+  pcall(function() if backdropCanvas and backdropCanvas.release then backdropCanvas:release() end end)
+  backdropCanvas=nil;backdropKey=nil
+  scene=nil;shader=nil;white=nil;canvas=nil;depthCanvas=nil;depthMode=nil;depthActive=false;cw=nil;ch=nil;errorText=nil;renderErrors={};sceneTime=0
+  uniformCache=nil;uniformCacheShader=nil
+  residentScenes={};residentUse={};residentSerial=0;activeDef=nil;activeArenaId="water"
   if Trainer and type(Trainer.resetRuntime)=="function" then pcall(Trainer.resetRuntime,Trainer) end
   if PlayerTrainer and type(PlayerTrainer.resetRuntime)=="function" then pcall(PlayerTrainer.resetRuntime,PlayerTrainer) end
   return true
@@ -1468,7 +2009,9 @@ function A:status()
     crowdOriginal=scene and scene.crowdOriginal or 0,
     crowdPolicy=scene and scene.crowdPolicy or nil,
     crowdOutliers=scene and scene.crowdOutliers or 0,
-    activeArena=activeArenaId,cache=activeDef and activeDef.cache or nil,profile=activeDef and activeDef.profile or nil,source=scene and scene.source or nil,
+    activeArena=activeArenaId,cache=activeDef and activeDef.cache or nil,profile=activeDef and activeDef.profile or nil,source=scene and scene.source or nil,framebufferMode=depthMode,depthActive=depthActive,android=ARENA_ANDROID,
+    backdropBaked=backdropCanvas~=nil,backdropBakes=backdropBakes,
+    residentScenes=residentCount(),residentLimit=RESIDENT_LIMIT,runtimeSidecar=scene and scene.runtimeSidecar==true or false,runtimeMeshHits=arenaRuntimeHits,runtimeMeshWrites=arenaRuntimeWrites,
   }
 end
 return A

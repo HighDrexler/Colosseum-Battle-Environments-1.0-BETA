@@ -1,6 +1,14 @@
 local V=...
+local function platformOS()
+  if love and love.system and type(love.system.getOS)=="function" then
+    local ok,v=pcall(love.system.getOS);if ok and v then return tostring(v) end
+  end
+  return "Unknown"
+end
+local ANDROID_RUNTIME=platformOS()=="Android"
 local mod,Mat4=V.mod,V.Mat4
 local GeneratedAssets=V.GeneratedAssets
+local RuntimeMeshCache=V.RuntimeMeshCache
 local Dex=V.ColosseumDex
 local A={version=1}
 
@@ -146,7 +154,15 @@ local extractor,discOpener
 local metadataReader
 local pendingExtract={}
 local sourceMetadata={}
-local perf={sceneLoads=0,sceneHits=0,actionBuilds=0,actionPrewarms=0,actorAcquires=0,residentAcquireHits=0,reactionClamps=0,reactionFallbacks=0,actionDrawFallbacks=0,floorClamps=0}
+local sceneUseSerial=0
+local idleWarmQueue={}
+local idleWarmSeen={}
+local idleWarmGame=nil
+local idleWarmNextAt=0
+local actionWarmQueue={}
+local actionWarmSeen={}
+local actionWarmNextAt=0
+local perf={sceneLoads=0,sceneHits=0,actionBuilds=0,actionPrewarms=0,actorAcquires=0,residentAcquireHits=0,reactionClamps=0,reactionFallbacks=0,actionDrawFallbacks=0,floorClamps=0,idleWarmLoads=0,idleWarmMs=0,residentTrimKept=0,residentTrimReleased=0,runtimeBaseHits=0,runtimeBaseWrites=0,runtimeActionHits=0,runtimeActionWrites=0}
 
 local function log(level,fmt,...)
   local l=mod and mod.log
@@ -161,6 +177,77 @@ local function readLua(path)
   if not ok then return nil,value end
   return value
 end
+local function runtimeRoot(dex) return ("cache/pokemon/%d/runtime_mesh_v1"):format(tonumber(dex) or 0) end
+local function runtimeBasePath(dex) return runtimeRoot(dex).."/base.lua" end
+local function runtimeBaseBinPath(dex,i) return runtimeRoot(dex)..("/base_%02d.f32"):format(tonumber(i) or 0) end
+local function runtimeActionTag(name) return tostring(name or "action"):gsub("[^%w_%-]","_") end
+local function runtimeActionManifestPath(dex,name) return runtimeRoot(dex).."/action_"..runtimeActionTag(name)..".lua" end
+local function runtimeActionBinPath(dex,name,i) return runtimeRoot(dex).."/action_"..runtimeActionTag(name)..("_%02d.f32"):format(tonumber(i) or 0) end
+local function runtimeActionFloorPath(dex,name) return runtimeRoot(dex).."/action_"..runtimeActionTag(name).."_floor.lua" end
+local function sourceRevision(dex)
+  if not (extractor and type(extractor.revPath)=="function") then return nil end
+  local body=GeneratedAssets.read(extractor.revPath(dex))
+  return type(body)=="string" and body or nil
+end
+local function validRuntimeMeta(meta,stamp)
+  return type(meta)=="table" and tonumber(meta.runtimeMeshVersion)==1 and type(stamp)=="string" and meta.stamp==stamp
+end
+local function runtimeBinLooksValid(path,stride)
+  if not (path and GeneratedAssets and type(GeneratedAssets.info)=="function") then return false end
+  local info=GeneratedAssets.info(path)
+  local size=info and tonumber(info.size)
+  local bytesPerVertex=(tonumber(stride) or 44)*4
+  return size and size>=bytesPerVertex and size%bytesPerVertex==0
+end
+local function runtimeBaseUsable(meta,stamp,dex)
+  if not validRuntimeMeta(meta,stamp) or type(meta.groups)~="table" or #meta.groups==0 then return false end
+  for i,g in ipairs(meta.groups) do
+    local path=type(g)=="table" and (g.runtimeBin or runtimeBaseBinPath(dex,i)) or nil
+    if not path or not runtimeBinLooksValid(path,44) then return false end
+  end
+  return true
+end
+local function copyWithoutVertices(g)
+  local out={}
+  for k,v in pairs(g or {}) do if k~="vertices" and k~="verticesPacked" then out[k]=v end end
+  return out
+end
+local function writeRuntimeBase(dex,cache,floorMin,stamp)
+  if not (RuntimeMeshCache and RuntimeMeshCache.writeLua and type(stamp)=="string") then return false end
+  local out={runtimeMeshVersion=1,stamp=stamp,floorMinY=floorMin}
+  for k,v in pairs(cache or {}) do if k~="groups" then out[k]=v end end
+  out.groups={}
+  for i,g in ipairs(cache.groups or {}) do
+    local c=copyWithoutVertices(g);c.runtimeBin=runtimeBaseBinPath(dex,i);out.groups[i]=c
+  end
+  local ok=RuntimeMeshCache.writeLua(runtimeBasePath(dex),out)
+  if ok then perf.runtimeBaseWrites=(perf.runtimeBaseWrites or 0)+1 end
+  return ok
+end
+
+local function compactMetadataLua(metadata)
+  if type(metadata)~="table" then return nil end
+  local function q(v) return string.format("%q",tostring(v)) end
+  local out={"return {revision=1,bodyMap={"}
+  local bodyKeys={"origin","mouth","chest","tail","eye_left","eye_right","hand_left","hand_right","additional_1","additional_2","additional_3","additional_4","foot_left","foot_right","center","additional_5"}
+  for _,key in ipairs(bodyKeys) do out[#out+1]="["..q(key).."]="..tostring(tonumber(metadata.bodyMap and metadata.bodyMap[key]) or -1).."," end
+  out[#out+1]="},slots={"
+  for key,slot in pairs(metadata.slots or {}) do
+    if type(key)=="string" and type(slot)=="table" then
+      out[#out+1]="["..q(key).."]={animationIndex="..tostring(tonumber(slot.animationIndex) or -1)..",duration="..string.format("%.9g",tonumber(slot.duration) or 0).."},"
+    end
+  end
+  out[#out+1]="}}\n"
+  return table.concat(out)
+end
+local function metadataCachePath(dex) return ("cache/pokemon/%d/metadata_v1.lua"):format(tonumber(dex) or 0) end
+local function writeMetadataCache(dex,metadata)
+  if not (mod and mod.cache and type(mod.cache.write)=="function") then return false end
+  local src=compactMetadataLua(metadata);if not src then return false end
+  local ok,a=pcall(mod.cache.write,mod.cache,metadataCachePath(dex),src)
+  return ok and a~=false and a~=nil
+end
+
 local function imageFromRaw(spec)
   local bytes,err=GeneratedAssets.read(spec.path)
   if not bytes then return nil,err or ("missing "..tostring(spec.path)) end
@@ -239,13 +326,20 @@ local function loadScene(dex)
     return nil,"LOVE mesh API unavailable"
   end
   local path=extractor and extractor.cachePath(dex) or ("cache/pokemon/%d/model_cache.lua"):format(dex)
-  local cache,err=readLua(path)
+  local stamp=sourceRevision(dex)
+  local cache,err,fromRuntime
+  if RuntimeMeshCache and type(RuntimeMeshCache.readLua)=="function" then
+    local rt=select(1,RuntimeMeshCache.readLua(runtimeBasePath(dex)))
+    if runtimeBaseUsable(rt,stamp,dex) then cache=rt;fromRuntime=true;perf.runtimeBaseHits=(perf.runtimeBaseHits or 0)+1 end
+  end
+  if not cache then cache,err=readLua(path) end
   if not cache then sceneErrors[dex]=tostring(err);return nil,sceneErrors[dex] end
   local sh,serr=ensureShader()
   if not sh then sceneErrors[dex]=tostring(serr);return nil,sceneErrors[dex] end
 
   local textures,groups={},{}
-  local sceneFloorMinY=math.huge
+  local sceneFloorMinY=tonumber(cache.floorMinY) or math.huge
+  local runtimeBaseComplete=(RuntimeMeshCache and RuntimeMeshCache.supported and RuntimeMeshCache.supported()) and true or false
   for i,g in ipairs(cache.groups or {}) do
     local img
     if g.texture then
@@ -257,24 +351,32 @@ local function loadScene(dex)
         textures[g.texture.path]=img
       end
     end
-    local vertices,verr=decodedVertices(g)
-    if not vertices then
-      sceneErrors[dex]=("dex %d mesh %d vertex cache: %s"):format(dex,i,tostring(verr))
-      return nil,sceneErrors[dex]
+    local mesh,verr,vertices
+    local binPath=g.runtimeBin or runtimeBaseBinPath(dex,i)
+    if fromRuntime and RuntimeMeshCache and type(RuntimeMeshCache.meshFromPath)=="function" then
+      mesh,verr=RuntimeMeshCache.meshFromPath(FORMAT,binPath,44,"static")
     end
-    -- Cache the ACTUAL lowest authored vertex, not merely the model origin.
-    -- Several airborne Colosseum models have geometry below local Y=0; treating
-    -- the origin as the arena floor is why Pidgey/Pidgeotto could clip through
-    -- a perfectly flat stage. The world transform uses this lower bound as a
-    -- presentation collision plane without modifying source vertices.
-    for _,v in ipairs(vertices) do
-      local y=tonumber(v[2])
-      if y and y<sceneFloorMinY then sceneFloorMinY=y end
-    end
-    local ok,mesh=pcall(love.graphics.newMesh,FORMAT,vertices,"triangles","static")
-    if not ok then
-      sceneErrors[dex]=("dex %d mesh %d: %s"):format(dex,i,tostring(mesh))
-      return nil,sceneErrors[dex]
+    if not mesh then
+      vertices,verr=decodedVertices(g)
+      if not vertices then
+        sceneErrors[dex]=("dex %d mesh %d vertex cache: %s"):format(dex,i,tostring(verr))
+        return nil,sceneErrors[dex]
+      end
+      -- Cache the ACTUAL lowest authored vertex, not merely the model origin.
+      for _,v in ipairs(vertices) do
+        local y=tonumber(v[2])
+        if y and y<sceneFloorMinY then sceneFloorMinY=y end
+      end
+      local ok,built=pcall(love.graphics.newMesh,FORMAT,vertices,"triangles","static")
+      if not ok then
+        sceneErrors[dex]=("dex %d mesh %d: %s"):format(dex,i,tostring(built))
+        return nil,sceneErrors[dex]
+      end
+      mesh=built
+      if runtimeBaseComplete then
+        local wok=RuntimeMeshCache.writeRows(binPath,vertices,44)
+        if not wok then runtimeBaseComplete=false end
+      end
     end
     if img then mesh:setTexture(img) end
     local d=g.diffuse or {1,1,1}
@@ -353,7 +455,36 @@ local function loadScene(dex)
     perf.reactionClamps=(perf.reactionClamps or 0)+changed
     return changed
   end
+  local function buildRuntimeActionGroups(name,count,floorSlots)
+    if not (RuntimeMeshCache and type(RuntimeMeshCache.meshFromPath)=="function") then return nil end
+    count=math.floor(tonumber(count) or 0);if count<=0 or count~=#groups then return nil end
+    local agroups={}
+    for i=1,count do
+      local baseg=groups[i];if not baseg then return nil end
+      local mesh=select(1,RuntimeMeshCache.meshFromPath(FORMAT,runtimeActionBinPath(dex,name,i),44,"static"))
+      if not mesh then
+        for _,g in ipairs(agroups) do pcall(function() if g.mesh and g.mesh.release then g.mesh:release() end end) end
+        return nil
+      end
+      if baseg.image then mesh:setTexture(baseg.image) end
+      agroups[i]={mesh=mesh,image=baseg.image,textured=baseg.textured,diffuse=baseg.diffuse,alpha=baseg.alpha,
+        xlu=baseg.xlu,noz=baseg.noz,renderFlags=baseg.renderFlags,shadow=baseg.shadow,effect=baseg.effect,textureSlot=baseg.textureSlot}
+    end
+    if type(floorSlots)~="table" then
+      local fm=select(1,RuntimeMeshCache.readLua(runtimeActionFloorPath(dex,name)))
+      if validRuntimeMeta(fm,stamp) then floorSlots=fm.floorMinYSlots end
+    end
+    agroups._floorMinYSlots=type(floorSlots)=="table" and floorSlots or nil
+    return agroups
+  end
+
   local function buildActionGroups(rawGroups,name)
+    local floorMeta=RuntimeMeshCache and RuntimeMeshCache.readLua and select(1,RuntimeMeshCache.readLua(runtimeActionFloorPath(dex,name))) or nil
+    if validRuntimeMeta(floorMeta,stamp) then
+      local direct=buildRuntimeActionGroups(name,tonumber(floorMeta.groupCount) or #groups,floorMeta.floorMinYSlots)
+      if direct then return direct end
+    end
+    if type(rawGroups)~="table" then return nil end
     stabilizeReactionRows(rawGroups,name)
     local agroups={};local valid=true
     local minYSlots={}
@@ -394,6 +525,15 @@ local function loadScene(dex)
     if not valid or #agroups~=#groups then return nil end
     for i=1,13 do if minYSlots[i]==math.huge then minYSlots[i]=sceneFloorMinY end end
     agroups._floorMinYSlots=minYSlots
+    if RuntimeMeshCache and RuntimeMeshCache.supported and RuntimeMeshCache.supported() and type(stamp)=="string" then
+      local all=true
+      for i,ag in ipairs(rawGroups or {}) do
+        local rows=ag.vertices or decodedVertices(ag)
+        local ok=rows and RuntimeMeshCache.writeRows(runtimeActionBinPath(dex,name,i),rows,44)
+        if not ok then all=false;break end
+      end
+      if all then RuntimeMeshCache.writeLua(runtimeActionFloorPath(dex,name),{runtimeMeshVersion=1,stamp=stamp,groupCount=#groups,floorMinYSlots=minYSlots}) end
+    end
     return agroups
   end
 
@@ -450,6 +590,11 @@ local function loadScene(dex)
     placeholderGroupsRemoved=tonumber(cache.placeholderGroupsRemoved) or 0,
     placeholderVertsRemoved=tonumber(cache.placeholderVertsRemoved) or 0,
   }
+  scene._buildRuntimeActionGroups=buildRuntimeActionGroups
+  scene._runtimeStamp=stamp
+  if not fromRuntime and runtimeBaseComplete and type(stamp)=="string" then
+    writeRuntimeBase(dex,cache,(sceneFloorMinY~=math.huge and sceneFloorMinY) or (cache.bounds and cache.bounds.min and tonumber(cache.bounds.min[2])) or 0,stamp)
+  end
   scenes[dex]=scene
   perf.sceneLoads=perf.sceneLoads+1
   local actionCount=0;for _ in pairs(actionSpecs) do actionCount=actionCount+1 end
@@ -463,6 +608,40 @@ end
 -- body immediately, while exact attack/damage/faint banks can be built when
 -- they are first requested. The compact packed strings remain untouched until
 -- then, which cuts both transition CPU and resident RAM/VRAM substantially.
+local function runtimeActionEntry(scene,name,meta)
+  if not (validRuntimeMeta(meta,scene and scene._runtimeStamp) and scene._buildRuntimeActionGroups) then return nil end
+  if meta.alias then return {alias=tostring(meta.alias),clip=tonumber(meta.clip),duration=tonumber(meta.duration) or 0} end
+  if type(meta.pages)=="table" and #meta.pages>0 then
+    local pages={}
+    for pi,page in ipairs(meta.pages) do
+      local pgroups=scene._buildRuntimeActionGroups(name.."/page"..pi,tonumber(page.groupCount),page.floorMinYSlots)
+      if not pgroups then return nil end
+      pages[#pages+1]={groups=pgroups,startPhase=tonumber(page.startPhase) or 0,endPhase=tonumber(page.endPhase) or 1,
+        morphFrames=tonumber(page.morphFrames) or 0,jointPositions=page.jointPositions or {},jointFrames=page.jointFrames or {},
+        floorMinYSlots=pgroups._floorMinYSlots,validSlots=page.validSlots,dense=true}
+    end
+    return {pages=pages,dense=true,clip=tonumber(meta.clip) or -1,duration=tonumber(meta.duration) or 0,
+      frameSpacing=tonumber(meta.frameSpacing) or 1,totalIntervals=tonumber(meta.totalIntervals) or 0}
+  end
+  local agroups=scene._buildRuntimeActionGroups(name,tonumber(meta.groupCount),meta.floorMinYSlots)
+  if not agroups then return nil end
+  return {groups=agroups,clip=tonumber(meta.clip) or -1,duration=tonumber(meta.duration) or 0,frameSpacing=tonumber(meta.frameSpacing) or 1,
+    morphFrames=tonumber(meta.morphFrames) or 0,jointPositions=meta.jointPositions or {},jointFrames=meta.jointFrames or {},
+    floorMinYSlots=agroups._floorMinYSlots,validSlots=meta.validSlots}
+end
+local function runtimeActionMeta(scene,name,a)
+  if not (scene and a and type(scene._runtimeStamp)=="string") then return nil end
+  local out={runtimeMeshVersion=1,stamp=scene._runtimeStamp,clip=a.clip,duration=a.duration,frameSpacing=a.frameSpacing,
+    totalIntervals=a.totalIntervals,morphFrames=a.morphFrames,jointPositions=a.jointPositions,jointFrames=a.jointFrames,validSlots=a.validSlots}
+  if a.alias then out.alias=a.alias
+  elseif type(a.pages)=="table" then
+    out.pages={}
+    for i,p in ipairs(a.pages) do out.pages[i]={startPhase=p.startPhase,endPhase=p.endPhase,morphFrames=p.morphFrames,
+      jointPositions=p.jointPositions,jointFrames=p.jointFrames,validSlots=p.validSlots,groupCount=type(p.groups)=="table" and #p.groups or 0} end
+  else out.groupCount=type(a.groups)=="table" and #a.groups or 0 end
+  return out
+end
+
 local function materializeSceneAction(scene,name)
   if not (scene and name) then return nil end
   if scene.actions and scene.actions[name] then return scene.actions[name] end
@@ -472,6 +651,17 @@ local function materializeSceneAction(scene,name)
   if type(a)~="table" then
     scene.actionFailures[name]=true
     return nil
+  end
+
+  if RuntimeMeshCache and type(RuntimeMeshCache.readLua)=="function" then
+    local meta=select(1,RuntimeMeshCache.readLua(runtimeActionManifestPath(scene.dex,name)))
+    local runtimeEntry=runtimeActionEntry(scene,name,meta)
+    if runtimeEntry then
+      scene.actions[name]=runtimeEntry
+      if scene.actionSpecs then scene.actionSpecs[name]=nil end
+      perf.actionBuilds=perf.actionBuilds+1;perf.runtimeActionHits=(perf.runtimeActionHits or 0)+1
+      return runtimeEntry
+    end
   end
 
   -- v4 caches keep large native banks in separate files so model_cache.lua can
@@ -532,6 +722,10 @@ local function materializeSceneAction(scene,name)
   end
 
   scene.actions[name]=entry
+  if RuntimeMeshCache and type(RuntimeMeshCache.writeLua)=="function" then
+    local meta=runtimeActionMeta(scene,name,a)
+    if meta and RuntimeMeshCache.writeLua(runtimeActionManifestPath(scene.dex,name),meta) then perf.runtimeActionWrites=(perf.runtimeActionWrites or 0)+1 end
+  end
   -- Release the packed source payload once its GPU representation exists. Alias
   -- metadata is tiny but clearing it too keeps one ownership rule for all slots.
   if scene.actionSpecs then scene.actionSpecs[name]=nil end
@@ -1157,13 +1351,30 @@ end
 
 function Actor:build() return true end
 
+-- Morph-weight uniform names. Building these with ("w"..i) meant thirteen
+-- string concatenations (and thirteen interning lookups) per actor per frame,
+-- for names that never change.
+local W_UNIFORM={}
+for i=0,12 do W_UNIFORM[i]="w"..i end
+-- Reused scratch for the two per-group vector uniforms. love:send copies the
+-- values immediately, so a single table is safe and removes two allocations
+-- per material group per actor per frame.
+local MATERIAL_RGBA={1,1,1,1}
+local TINT_WHITE={1,1,1,1}
+
+-- Was a closure defined inside Actor:draw, i.e. allocated every frame.
+local function setBaseWeights()
+  shader:send(W_UNIFORM[0],1)
+  for i=1,12 do shader:send(W_UNIFORM[i],0) end
+end
+
 function Actor:draw(matrix)
   local sc=self.scene
   if not (sc and shader) then return false end
   local w=self:frameWeights()
   love.graphics.setShader(shader)
   shader:send("model","row",matrix)
-  for i=0,12 do shader:send("w"..i,w[i+1]) end
+  for i=0,12 do shader:send(W_UNIFORM[i],w[i+1]) end
   local hitU=self.hitAge and clamp(self.hitAge/self:stateDuration("hit"),0,1) or 1
   local spawn=clamp(self.spawnScale==nil and 1 or self.spawnScale,0,1)
   local spawnFlash=(spawn<1 and not self.recallAge and not self.faintAge) and (1-spawn)*0.68 or 0
@@ -1198,17 +1409,13 @@ function Actor:draw(matrix)
   -- Spawn uses a brief white materialization flash through spawnFlash above.
   -- This is intentionally a generic lifecycle cue, not mislabeled as a
   -- Colosseum move/GPT1 effect.
-  shader:send("tintColor",{1,1,1,1})
+  shader:send("tintColor",TINT_WHITE)
   love.graphics.setColor(1,1,1,1)
   -- F5 isolates one group at a time so a stray shape can be identified by
   -- sight instead of guessed at from vertex counts alone.
   local only=A.isolateGroup
   local playback=self:playbackBank()
   local drawGroups=(not self.forceBasePlayback and playback and playback.groups) or sc.groups
-  local function setBaseWeights()
-    shader:send("w0",1)
-    for i=1,12 do shader:send("w"..i,0) end
-  end
   if self.forceBasePlayback then setBaseWeights() end
   local drawFault=false
   for i,grp in ipairs(drawGroups) do
@@ -1216,8 +1423,10 @@ function Actor:draw(matrix)
       -- Preserve the source HSD material state per render group. 1.5.24 threw
       -- this away after extraction, so every untextured material rendered as
       -- opaque white and every alpha-controlled helper surface became solid.
-      local d=grp.diffuse or {1,1,1}
-      shader:send("materialColor",{d[1] or 1,d[2] or 1,d[3] or 1,grp.alpha or 1})
+      local d=grp.diffuse
+      MATERIAL_RGBA[1]=(d and d[1]) or 1;MATERIAL_RGBA[2]=(d and d[2]) or 1
+      MATERIAL_RGBA[3]=(d and d[3]) or 1;MATERIAL_RGBA[4]=grp.alpha or 1
+      shader:send("materialColor",MATERIAL_RGBA)
       shader:send("useTexture",grp.textured and 1 or 0)
       if love.graphics.setDepthMode then
         love.graphics.setDepthMode("lequal",not (grp.noz or grp.xlu))
@@ -1233,8 +1442,10 @@ function Actor:draw(matrix)
     setBaseWeights()
     for i,grp in ipairs(sc.groups) do
       if not only or only==i then
-        local d=grp.diffuse or {1,1,1}
-        shader:send("materialColor",{d[1] or 1,d[2] or 1,d[3] or 1,grp.alpha or 1})
+        local d=grp.diffuse
+        MATERIAL_RGBA[1]=(d and d[1]) or 1;MATERIAL_RGBA[2]=(d and d[2]) or 1
+        MATERIAL_RGBA[3]=(d and d[3]) or 1;MATERIAL_RGBA[4]=grp.alpha or 1
+        shader:send("materialColor",MATERIAL_RGBA)
         shader:send("useTexture",grp.textured and 1 or 0)
         if love.graphics.setDepthMode then love.graphics.setDepthMode("lequal",not (grp.noz or grp.xlu)) end
         if grp.mesh then pcall(love.graphics.draw,grp.mesh) end
@@ -1561,19 +1772,29 @@ function A.acquire(source,dex,variant,opts)
   local scene,serr=resident,nil
   if not scene then scene,serr=loadScene(dex) end
   if not scene then return nil,serr end
+  sceneUseSerial=sceneUseSerial+1;scene.__cbeLastUse=sceneUseSerial
 
   local actor=Actor.new(dex,variant,scene,opts)
   local metadataKey=tostring(dex)..":"..tostring(variant or "normal")
   local metadata=sourceMetadata[metadataKey]
+  if metadata==nil then
+    -- Runtime metadata is tiny but older builds re-opened the 1.46 GB import,
+    -- parsed the species FSYS and inflated the PKX wrapper on the first actor
+    -- acquisition of EVERY app session. Persist the body-map/slot subset next
+    -- to the model cache so a generated visual cache is actually self-serving.
+    local cached=select(1,readLua(metadataCachePath(dex)))
+    if type(cached)=="table" and tonumber(cached.revision)==1 then metadata=cached end
+  end
   if metadata==nil and metadataReader and discOpener then
     local okDisc,disc=pcall(discOpener)
     if okDisc and disc then
       local okMeta,value,metaErr=pcall(metadataReader.inspectSpecies,disc,dex,variant)
-      if okMeta and value then metadata=value
+      if okMeta and value then metadata=value;pcall(writeMetadataCache,dex,value)
       else log("warn","PKX metadata unavailable for dex %d: %s",dex,tostring(okMeta and metaErr or value)) end
     end
-    sourceMetadata[metadataKey]=metadata or false
-  elseif metadata==false then metadata=nil end
+  end
+  sourceMetadata[metadataKey]=metadata or false
+  if metadata==false then metadata=nil end
   actor.sourceMetadata=metadata
   actor:selectNativeSlot("idle")
   A._liveActors=A._liveActors or setmetatable({},{__mode="v"})
@@ -1982,17 +2203,146 @@ function A.status()
       actionPrewarms=perf.actionPrewarms,actorAcquires=perf.actorAcquires,residentAcquireHits=perf.residentAcquireHits,
       battlePrewarms=perf.battlePrewarms or 0,battlePrewarmMs=perf.battlePrewarmMs or 0,
       switchPrewarms=perf.switchPrewarms or 0,floorClamps=perf.floorClamps or 0,
+      idleWarmLoads=perf.idleWarmLoads or 0,idleWarmMs=perf.idleWarmMs or 0,idleWarmPending=#idleWarmQueue,
+      residentTrimKept=perf.residentTrimKept or 0,residentTrimReleased=perf.residentTrimReleased or 0,
       reactionClamps=perf.reactionClamps or 0,reactionFallbacks=perf.reactionFallbacks or 0,
-      actionDrawFallbacks=perf.actionDrawFallbacks or 0},
+      actionDrawFallbacks=perf.actionDrawFallbacks or 0,deferredActionWarms=perf.deferredActionWarms or 0,
+      deferredActionPending=#actionWarmQueue,runtimeBaseHits=perf.runtimeBaseHits or 0,runtimeBaseWrites=perf.runtimeBaseWrites or 0,
+      runtimeActionHits=perf.runtimeActionHits or 0,runtimeActionWrites=perf.runtimeActionWrites or 0},
   }
 end
 
+local function releaseLoveObject(obj,seen)
+  if obj==nil then return end
+  seen=seen or {}
+  if seen[obj] then return end
+  seen[obj]=true
+  pcall(function()
+    local release=obj.release
+    if type(release)=="function" then release(obj) end
+  end)
+end
+
+local function releaseGroups(groups,seen)
+  if type(groups)~="table" then return end
+  for _,g in ipairs(groups) do
+    if type(g)=="table" then
+      releaseLoveObject(g.mesh,seen)
+      releaseLoveObject(g.image,seen)
+    end
+  end
+end
+
+-- Android devices have a smaller shared RAM/VRAM budget than desktop, but
+-- purging EVERY Pokemon after EVERY battle turns the generated cache back into
+-- a repeated parse/upload tax. Keep a small player-party working set resident
+-- and release everything else. Disk caches are never deleted here.
+function A.trimRuntimeMemory(opts)
+  opts=type(opts)=="table" and opts or {}
+  local keep={}
+  local game=opts.game
+  local keepParty=math.max(0,math.floor(tonumber(opts.keepParty) or 0))
+  if game and keepParty>0 and type(game.save)=="table" then
+    local party=game.save.party or game.save.pokemon or game.save.team
+    local added=0
+    if type(party)=="table" then
+      for _,mon in ipairs(party) do
+        local species=type(mon)=="table" and ((mon.mon and mon.mon.species) or mon.species) or nil
+        local def=species~=nil and game.data and game.data.pokemon and game.data.pokemon[species] or nil
+        local dex=tonumber(def and (def.dex or def.index or def.number)) or tonumber(species)
+        if dex and scenes[dex] and not keep[dex] then
+          keep[dex]=true;added=added+1
+          if added>=keepParty then break end
+        end
+      end
+    end
+  end
+  local keepRecent=math.max(0,math.floor(tonumber(opts.keepRecent) or 0))
+  if keepRecent>0 then
+    local recent={}
+    for dex,scene in pairs(scenes) do
+      if not keep[dex] and type(scene)=="table" then recent[#recent+1]={dex=dex,use=tonumber(scene.__cbeLastUse) or 0} end
+    end
+    table.sort(recent,function(a,b)return a.use>b.use end)
+    for i=1,math.min(keepRecent,#recent) do keep[recent[i].dex]=true end
+  end
+  -- Soft resident cap: do not churn GPU scenes at every battle boundary while
+  -- the total working set is still modest. 1.7.9 always collapsed immediately
+  -- to party+2-recent, which meant routes with 3-5 encounter species could
+  -- repeatedly evict/re-upload the same bodies. Keep everything up to the cap;
+  -- only when it is exceeded do the party/recent priorities above become an
+  -- actual eviction policy. This preserves low-memory boundedness without
+  -- manufacturing a reload tax after every battle.
+  local softLimit=math.max(0,math.floor(tonumber(opts.softLimit) or 0))
+  if softLimit>0 then
+    local total,mandatory=0,0
+    for dex,scene in pairs(scenes) do
+      if type(scene)=="table" then
+        total=total+1
+        if keep[dex] then mandatory=mandatory+1 end
+      end
+    end
+    if total<=softLimit then
+      for dex,scene in pairs(scenes) do if type(scene)=="table" then keep[dex]=true end end
+    else
+      local fill={}
+      for dex,scene in pairs(scenes) do
+        if type(scene)=="table" and not keep[dex] then
+          fill[#fill+1]={dex=dex,use=tonumber(scene.__cbeLastUse) or 0}
+        end
+      end
+      table.sort(fill,function(a,b)return a.use>b.use end)
+      local slots=math.max(0,softLimit-mandatory)
+      for i=1,math.min(slots,#fill) do keep[fill[i].dex]=true end
+    end
+  end
+  local seen={};local kept,released=0,0
+  for dex,scene in pairs(scenes) do
+    if keep[dex] then
+      kept=kept+1
+    elseif type(scene)=="table" then
+      releaseGroups(scene.groups,seen)
+      if type(scene.textures)=="table" then
+        for _,img in pairs(scene.textures) do releaseLoveObject(img,seen) end
+      end
+      for _,entry in pairs(scene.actions or {}) do
+        if type(entry)=="table" then
+          releaseGroups(entry.groups,seen)
+          for _,page in ipairs(entry.pages or {}) do if type(page)=="table" then releaseGroups(page.groups,seen) end end
+        end
+      end
+      scenes[dex]=nil;sceneErrors[dex]=nil;pendingExtract[dex]=nil
+      released=released+1
+    end
+  end
+  perf.residentTrimKept=(perf.residentTrimKept or 0)+kept
+  perf.residentTrimReleased=(perf.residentTrimReleased or 0)+released
+  -- Do not force a full Lua GC here. On mobile that stop-the-world collection
+  -- can land immediately before the next battle/menu open. Released GPU objects
+  -- are already explicitly released; BattleRuntime advances Lua GC incrementally
+  -- during ordinary overworld frames.
+  local q={}
+  for _,row in ipairs(actionWarmQueue) do if row.scene and scenes[row.scene.dex]==row.scene then q[#q+1]=row else actionWarmSeen[row.id]=nil end end
+  actionWarmQueue=q
+  return true,{kept=kept,released=released}
+end
+
 function A.resetRuntime()
-  scenes={};sceneErrors={};pendingExtract={};sourceMetadata={};shader=nil
+  A.cancelPartyPrewarm()
+  A.trimRuntimeMemory({keepParty=0,keepRecent=0})
+  shader=nil;sceneUseSerial=0;sourceMetadata={}
+  actionWarmQueue={};actionWarmSeen={};actionWarmNextAt=0
   perf={sceneLoads=0,sceneHits=0,actionBuilds=0,actionPrewarms=0,actorAcquires=0,residentAcquireHits=0,
-    battlePrewarms=0,battlePrewarmMs=0,switchPrewarms=0,floorClamps=0,
-    reactionClamps=0,reactionFallbacks=0,actionDrawFallbacks=0}
+    battlePrewarms=0,battlePrewarmMs=0,switchPrewarms=0,floorClamps=0,idleWarmLoads=0,idleWarmMs=0,
+    residentTrimKept=0,residentTrimReleased=0,reactionClamps=0,reactionFallbacks=0,actionDrawFallbacks=0,
+    runtimeBaseHits=0,runtimeBaseWrites=0,runtimeActionHits=0,runtimeActionWrites=0,deferredActionWarms=0}
   return true
+end
+
+function A.gcStep(k)
+  if type(collectgarbage)~="function" then return false end
+  local ok=pcall(collectgarbage,"step",math.max(16,math.floor(tonumber(k) or 64)))
+  return ok
 end
 
 -- Forget every cached species so the next send-out re-extracts from the disc.
@@ -2007,6 +2357,7 @@ function A.rebuildSpecies()
         if pcall(mod.cache.delete,mod.cache,path) then removed=removed+1 end
       end
     end
+    for dex=1,251 do pcall(mod.cache.delete,mod.cache,metadataCachePath(dex)) end
   end
   A.resetRuntime()
   return true,removed
@@ -2032,29 +2383,78 @@ local function resolveSlotMove(game,slot)
   return type(moves)=="table" and id~=nil and (moves[id] or moves[tostring(id)]) or nil
 end
 
-local function warmRequiredActions(scene,game,battler)
-  if not scene then return 0 end
+local function requiredActionKeys(game,battler)
   local wanted={damage=true,faint=true}
   local mon=type(battler)=="table" and (battler.mon or battler) or nil
   local slots=mon and mon.moves or (type(battler)=="table" and battler.moves)
   if type(slots)=="table" then
     for _,slot in pairs(slots) do wanted[moveSlot(resolveSlotMove(game,slot))]=true end
   end
-  local warmed=0
+  local out={}
   for _,key in ipairs({"damage","faint","physicalA","specialC","statusA"}) do
-    if wanted[key] and scene.actionSpecs and scene.actionSpecs[key] and not (scene.actions and scene.actions[key]) then
-      local entry=materializeSceneAction(scene,key)
-      local guard=0
-      while entry and entry.alias and guard<8 do
-        entry=materializeSceneAction(scene,tostring(entry.alias));guard=guard+1
-      end
-      if entry then warmed=warmed+1;perf.actionPrewarms=perf.actionPrewarms+1 end
-    end
+    if wanted[key] then out[#out+1]=key end
+  end
+  return out
+end
+
+local function warmActionKey(scene,key)
+  if not (scene and key and scene.actionSpecs and scene.actionSpecs[key]) then return false end
+  if scene.actions and scene.actions[key] then return true end
+  local entry=materializeSceneAction(scene,key)
+  local guard=0
+  while entry and entry.alias and guard<8 do
+    entry=materializeSceneAction(scene,tostring(entry.alias));guard=guard+1
+  end
+  if entry then perf.actionPrewarms=perf.actionPrewarms+1;return true end
+  return false
+end
+
+local function warmRequiredActions(scene,game,battler)
+  local warmed=0
+  for _,key in ipairs(requiredActionKeys(game,battler)) do
+    if warmActionKey(scene,key) then warmed=warmed+1 end
   end
   return warmed
 end
 
-local function prewarmBattler(game,battler,side,allowExtract)
+local function queueRequiredActions(scene,game,battler)
+  if not scene then return 0 end
+  local added=0
+  for _,key in ipairs(requiredActionKeys(game,battler)) do
+    if scene.actionSpecs and scene.actionSpecs[key] and not (scene.actions and scene.actions[key]) then
+      local id=tostring(scene.dex or "?")..":"..key
+      if not actionWarmSeen[id] then
+        actionWarmSeen[id]=true
+        actionWarmQueue[#actionWarmQueue+1]={scene=scene,key=key,id=id}
+        added=added+1
+      end
+    end
+  end
+  return added
+end
+
+function A.pumpActionPrewarm(maxJobs)
+  maxJobs=math.max(1,math.floor(tonumber(maxJobs) or 1))
+  if #actionWarmQueue==0 then return 0,0 end
+  local clock=(love and love.timer and love.timer.getTime) or os.clock
+  local now=clock and clock() or 0
+  if ANDROID_RUNTIME and now>0 and now<actionWarmNextAt then return 0,#actionWarmQueue end
+  local done=0
+  while done<maxJobs and #actionWarmQueue>0 do
+    local row=table.remove(actionWarmQueue,1)
+    if row then
+      actionWarmSeen[row.id]=nil
+      if row.scene and scenes[row.scene.dex]==row.scene and warmActionKey(row.scene,row.key) then done=done+1 end
+    end
+  end
+  local after=clock and clock() or now
+  if ANDROID_RUNTIME then actionWarmNextAt=(after>0 and after or now)+0.16 end
+  perf.deferredActionWarms=(perf.deferredActionWarms or 0)+done
+  return done,#actionWarmQueue
+end
+
+
+local function prewarmBattler(game,battler,side,allowExtract,warmActions)
   local dex=battlerDex(game,battler)
   if not (dex and Dex.supported(dex)) then return false,"unsupported battler",0 end
   local cached=extractor and mod and mod.cache and type(extractor.isCached)=="function"
@@ -2066,8 +2466,87 @@ local function prewarmBattler(game,battler,side,allowExtract)
   local ctx={game=game,battle={game=game},arena={figureScale=DEFAULT_FIGURE_SCALE},services={prewarm=true}}
   local actor,err=A.acquire("cbe-prewarm",dex,"normal",{context=ctx,battler=battler,side=side})
   if not actor then return false,err,0 end
-  local actions=warmRequiredActions(actor.scene,game,battler)
+  local actions=0
+  if warmActions~=false then actions=warmRequiredActions(actor.scene,game,battler)
+  else queueRequiredActions(actor.scene,game,battler) end
   return true,nil,actions
+end
+local function prewarmBaseBattler(game,battler,side)
+  local dex=battlerDex(game,battler)
+  if not (dex and Dex.supported(dex)) then return false,"unsupported battler",nil end
+  if scenes[dex] then return true,nil,dex end
+  local cached=extractor and mod and mod.cache and type(extractor.isCached)=="function"
+    and extractor.isCached(mod,dex,{skinFix=A.skinFix,renderPassFilter=true,decodeMode=A.decodeMode})
+  if not cached then return false,"not cached",dex end
+  -- Information-surface acquisition intentionally builds only the base/idle
+  -- body. Native attack/damage/faint banks remain packed on disk until battle.
+  -- This makes the persistent cache useful to party/stats/model screens without
+  -- paying the much larger combat-action GPU bill during overworld idle time.
+  local ctx={game=game,battle={game=game},arena={figureScale=DEFAULT_FIGURE_SCALE},services={prewarm=true,informationSurface=true}}
+  local actor,err=A.acquire("cbe-idle-warm",dex,"normal",{context=ctx,battler=battler,side=side})
+  return actor~=nil,err,dex
+end
+
+-- Materialize every already-extracted party Pokemon's BASE body at the
+-- game-ready seam. This deliberately avoids action banks and never starts ISO
+-- extraction. Paying these compact runtime-mesh uploads while the save is
+-- entering the world is preferable to doing one expensive species upload on
+-- an arbitrary overworld frame that may also become an encounter frame.
+function A.prewarmPartyBase(game)
+  idleWarmQueue={};idleWarmSeen={};idleWarmGame=game;idleWarmNextAt=0
+  if type(game)~="table" or type(game.save)~="table" then return 0,0 end
+  local party=game.save.party or game.save.pokemon or game.save.team
+  if type(party)~="table" then return 0,0 end
+  local warmed,failed,seen=0,0,{}
+  for _,mon in ipairs(party) do
+    local dex=battlerDex(game,mon)
+    if dex and Dex.supported(dex) and not seen[dex] then
+      seen[dex]=true
+      local ok=prewarmBaseBattler(game,mon,"player")
+      if ok then warmed=warmed+1 else failed=failed+1 end
+    end
+  end
+  return warmed,failed
+end
+
+function A.queuePartyPrewarm(game)
+  idleWarmQueue={};idleWarmSeen={};idleWarmGame=game;idleWarmNextAt=0
+  if type(game)~="table" or type(game.save)~="table" then return 0 end
+  local party=game.save.party or game.save.pokemon or game.save.team
+  if type(party)~="table" then return 0 end
+  for _,mon in ipairs(party) do
+    local dex=battlerDex(game,mon)
+    if dex and Dex.supported(dex) and not idleWarmSeen[dex] and not scenes[dex] then
+      idleWarmSeen[dex]=true
+      idleWarmQueue[#idleWarmQueue+1]={battler=mon,side="player",dex=dex}
+    end
+  end
+  return #idleWarmQueue
+end
+
+function A.pumpPartyPrewarm(game)
+  game=game or idleWarmGame
+  if not ANDROID_RUNTIME or #idleWarmQueue==0 or type(game)~="table" then return false,#idleWarmQueue end
+  local clock=(love and love.timer and love.timer.getTime) or os.clock
+  local now=clock and clock() or 0
+  if now>0 and now<idleWarmNextAt then return false,#idleWarmQueue end
+  local row=table.remove(idleWarmQueue,1)
+  if not row then return false,0 end
+  local t0=now
+  local ok,err=prewarmBaseBattler(game,row.battler,row.side)
+  local t1=clock and clock() or t0
+  perf.idleWarmLoads=(perf.idleWarmLoads or 0)+(ok and 1 or 0)
+  perf.idleWarmMs=(perf.idleWarmMs or 0)+math.max(0,(t1-t0)*1000)
+  -- Leave breathing room between species uploads. The work happens while the
+  -- overworld is already interactive instead of stacking six models onto one
+  -- battle/menu transition frame.
+  idleWarmNextAt=(t1>0 and t1 or now)+0.55
+  if not ok and err then log("warn","Android cached-party warm dex %s skipped: %s",tostring(row.dex),tostring(err)) end
+  return ok,#idleWarmQueue
+end
+
+function A.cancelPartyPrewarm()
+  idleWarmQueue={};idleWarmSeen={};idleWarmGame=nil;idleWarmNextAt=0
 end
 
 function A.prewarmParty(game)
@@ -2082,7 +2561,7 @@ function A.prewarmParty(game)
     local dex=battlerDex(game,mon)
     if dex and not seen[dex] then
       seen[dex]=true
-      local ok=prewarmBattler(game,mon,"player",false)
+      local ok=prewarmBattler(game,mon,"player",false,true)
       if ok then warmed=warmed+1 end
     end
   end
@@ -2109,8 +2588,14 @@ function A.prewarmBattle(battle)
     local battler=battle and battle[side]
     if battler then
       local dex=battlerDex(game,battler);if dex then seen[dex]=true end
-      local ok,err,actions=prewarmBattler(game,battler,side,true)
-      if ok then out.ready=out.ready+1;out.actions=out.actions+(tonumber(actions) or 0)
+      -- Android pays only the base body/texture upload at battle.started and
+      -- spreads native damage/faint/move-bank uploads across the trainer/sendout
+      -- presentation that follows. This keeps exact source actions while avoiding
+      -- a single multi-bank main-thread spike on the transition boundary.
+      local ok,err,actions=prewarmBattler(game,battler,side,true,not ANDROID_RUNTIME)
+      if ok then
+        out.ready=out.ready+1;out.actions=out.actions+(tonumber(actions) or 0)
+        if ANDROID_RUNTIME then out.deferredActions=(out.deferredActions or 0)+queueRequiredActions(scenes[dex],game,battler) end
       else out.failed=out.failed+1;out.errors[side]=tostring(err) end
     end
   end
@@ -2122,25 +2607,32 @@ function A.prewarmBattle(battle)
   -- extraction for a bench slot: that could turn a six-mon trainer intro into a
   -- long load. An uncached replacement is instead paid for at prewarmSwitch's
   -- authoritative switch boundary before the model becomes visible.
-  local rosters={
-    {side="enemy",list=battle and battle.enemyParty},
-    {side="player",list=battle and battle.playerParty},
-    {side="player",list=game.save and (game.save.party or game.save.pokemon or game.save.team)},
-  }
-  for _,roster in ipairs(rosters) do
-    if type(roster.list)=="table" then
-      for _,mon in ipairs(roster.list) do
-        local dex=battlerDex(game,mon)
-        if dex and not seen[dex] then
-          seen[dex]=true
-          local ok,_,actions=prewarmBattler(game,mon,roster.side,false)
-          if ok then
-            out.rosterReady=out.rosterReady+1
-            out.rosterActions=out.rosterActions+(tonumber(actions) or 0)
+  if not ANDROID_RUNTIME then
+    local rosters={
+      {side="enemy",list=battle and battle.enemyParty},
+      {side="player",list=battle and battle.playerParty},
+      {side="player",list=game.save and (game.save.party or game.save.pokemon or game.save.team)},
+    }
+    for _,roster in ipairs(rosters) do
+      if type(roster.list)=="table" then
+        for _,mon in ipairs(roster.list) do
+          local dex=battlerDex(game,mon)
+          if dex and not seen[dex] then
+            seen[dex]=true
+            local ok,_,actions=prewarmBattler(game,mon,roster.side,false,true)
+            if ok then
+              out.rosterReady=out.rosterReady+1
+              out.rosterActions=out.rosterActions+(tonumber(actions) or 0)
+            end
           end
         end
       end
     end
+  else
+    -- Android keeps only the active pair resident at the arena-entry seam.
+    -- Bench species are prepared at the authoritative switch boundary instead,
+    -- avoiding a six-model + arena + trainer GPU/heap spike on mobile devices.
+    out.androidBenchDeferred=true
   end
 
   local t1=clock and clock() or t0
@@ -2154,8 +2646,14 @@ function A.prewarmSwitch(battle,side,battler)
   local game=battle and battle.game
   battler=battler or (battle and side and battle[side])
   if not (game and battler) then return false,"missing replacement" end
-  local ok,err,actions=prewarmBattler(game,battler,side,true)
-  if ok then perf.switchPrewarms=(perf.switchPrewarms or 0)+1 end
+  local ok,err,actions=prewarmBattler(game,battler,side,true,not ANDROID_RUNTIME)
+  if ok then
+    perf.switchPrewarms=(perf.switchPrewarms or 0)+1
+    if ANDROID_RUNTIME then
+      local dex=battlerDex(game,battler);local sc=dex and scenes[dex]
+      if sc then queueRequiredActions(sc,game,battler) end
+    end
+  end
   return ok,err,actions
 end
 

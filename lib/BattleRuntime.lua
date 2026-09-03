@@ -1,9 +1,12 @@
 local V=...
 local R={installed=false,activeBattle=nil,pendingEnd=nil,finishWrapper=nil,
-  captureSoundWrapper=nil,captureSoundInner=nil,captureSoundBridge=false,nativeCaughtSuppressed=0,modelPrewarm=nil}
+  captureSoundWrapper=nil,captureSoundInner=nil,captureSoundBridge=false,nativeCaughtSuppressed=0,
+  movePlayWrapper=nil,movePlayInner=nil,stereoWrapper=nil,stereoInner=nil,moveSoundBridge=false,nativeMoveSoundsSuppressed=0,
+  modelPrewarm=nil,entryTiming=nil,exitTiming=nil}
 
 local mod=V.mod
 local ArenaCatalog=V.ArenaCatalog
+local Arena=V.Arena
 local BattleArtBridge=V.BattleArtBridge
 local Camera=V.Camera
 local CurrentSpriteModels=V.CurrentSpriteModels
@@ -17,6 +20,31 @@ local Compat=V.GenerationCompat
 local BattleDirector=V.BattleDirector
 local MoveFXOwnership=V.MoveFXOwnership
 local BattleSides=V.BattleSides
+local WazaHandlers=V.WazaHandlers
+local MoveFXExtractor=V.MoveFXExtractor
+
+local function platformOS()
+  if love and love.system and type(love.system.getOS)=="function" then
+    local ok,v=pcall(love.system.getOS);if ok and v then return tostring(v) end
+  end
+  return "Unknown"
+end
+local ANDROID_RUNTIME=platformOS()=="Android"
+local androidActionWarmNextAt=0
+local androidGcNextAt=0
+local function wallNow()
+  if love and love.timer and type(love.timer.getTime)=="function" then
+    local ok,v=pcall(love.timer.getTime);if ok and type(v)=="number" then return v end
+  end
+  return os.clock()
+end
+local function stackTop(game)
+  local stack=game and game.stack
+  if stack and type(stack.top)=="function" then
+    local ok,v=pcall(stack.top,stack);if ok then return v end
+  end
+  return nil
+end
 
 local SEMANTIC_EVENTS={
   "battle.turn_started",
@@ -71,6 +99,33 @@ local function installCaptureSoundBridge()
   end
   Sound.play=R.captureSoundWrapper
   R.captureSoundBridge=true
+
+  local function sourceMoveAudioOwned()
+    if not (R.activeBattle and MoveFXOwnership and type(MoveFXOwnership.ownsNativeAudio)=="function") then return false end
+    local okOwn,owned=pcall(MoveFXOwnership.ownsNativeAudio,MoveFXOwnership,R.activeBattle)
+    return okOwn and owned==true
+  end
+  -- Gen I's animation sound path is Sound.playMove; Gen II's anim_sound maps
+  -- directly to PlayStereoSFX / Sound.playStereo.  Keep both native paths live
+  -- unless the active Waza has a complete generated GameSound set. Missing or
+  -- unrenderable source ids therefore fail open with the stock GB/GBC sound.
+  if type(Sound.playMove)=="function" and Sound.playMove~=R.movePlayWrapper then
+    local innerMove=Sound.playMove;R.movePlayInner=innerMove
+    R.movePlayWrapper=function(...)
+      if sourceMoveAudioOwned() then R.nativeMoveSoundsSuppressed=(R.nativeMoveSoundsSuppressed or 0)+1;return nil end
+      return innerMove(...)
+    end
+    Sound.playMove=R.movePlayWrapper
+  end
+  if type(Sound.playStereo)=="function" and Sound.playStereo~=R.stereoWrapper then
+    local innerStereo=Sound.playStereo;R.stereoInner=innerStereo
+    R.stereoWrapper=function(...)
+      if sourceMoveAudioOwned() then R.nativeMoveSoundsSuppressed=(R.nativeMoveSoundsSuppressed or 0)+1;return nil end
+      return innerStereo(...)
+    end
+    Sound.playStereo=R.stereoWrapper
+  end
+  R.moveSoundBridge=(Sound.playMove==R.movePlayWrapper) or (Sound.playStereo==R.stereoWrapper)
   return true
 end
 
@@ -129,6 +184,7 @@ local function beginBattle(payload)
   local battle=type(payload)=="table" and payload.battle or nil
   battle=Compat and Compat.prepare(battle) or battle
   if not battle then return end
+  local entryStart=wallNow()
   -- Gen1Recomp can recycle the same battle table between encounters.  Clear
   -- any previous arena binding on the authoritative battle.started boundary,
   -- not only on battle.ended, so a missed/late end event can never carry Mt.
@@ -136,6 +192,7 @@ local function beginBattle(payload)
   if ArenaCatalog and ArenaCatalog.releaseBattle then ArenaCatalog.releaseBattle() end
   R.activeBattle=battle
   R.pendingEnd=nil
+  if ANDROID_RUNTIME then androidActionWarmNextAt=wallNow() end
   -- Reclaim this narrow audio seam at the authoritative battle boundary in
   -- case another mod rewrapped Sound.play after mods.loaded.
   installCaptureSoundBridge()
@@ -181,12 +238,18 @@ local function beginBattle(payload)
   -- transition stall; that traded one pause for a much worse visible late
   -- spawn on high-detail Pokemon. Prepare both active battlers and only the
   -- native action banks their current moves require before the arena opens.
+  local modelStart=wallNow()
   if PokemonActors and type(PokemonActors.prewarmBattle)=="function" then
     local okWarm,result=pcall(PokemonActors.prewarmBattle,battle)
     if okWarm then R.modelPrewarm=result else R.modelPrewarm={failed=2,error=tostring(result)} end
   end
+  local modelEnd=wallNow()
 
+  local hostStart=wallNow()
   local began=StandaloneHost.begin(battle)
+  local hostEnd=wallNow()
+  R.entryTiming={totalMs=math.max(0,(hostEnd-entryStart)*1000),modelMs=math.max(0,(modelEnd-modelStart)*1000),
+    hostMs=math.max(0,(hostEnd-hostStart)*1000),began=began and true or false}
   if NativeTrainerSprites then
     if began then NativeTrainerSprites:begin({battle=battle})
     else
@@ -199,13 +262,16 @@ local function beginBattle(payload)
 end
 
 local function finishPresentation(battle,reason)
+  local exitStart=wallNow()
   battle=Compat and Compat.prepare(battle) or battle
   local standaloneWasActive=false
   if StandaloneHost and type(StandaloneHost.status)=="function" then
     local ok,status=pcall(StandaloneHost.status)
     standaloneWasActive=ok and type(status)=="table" and status.active==true
   end
+  local hostFinishStart=wallNow()
   if StandaloneHost then StandaloneHost.finish(reason or "battle.ended") end
+  local hostFinishEnd=wallNow()
   -- A delegated Stadium compositor has no StandaloneHost session to own actor
   -- cleanup. Close CBE's portable actors explicitly at the same authoritative
   -- screen boundary; StandaloneHost already does this when it was active.
@@ -220,6 +286,53 @@ local function finishPresentation(battle,reason)
   if MoveFXOwnership and type(MoveFXOwnership.finish)=="function" then
     pcall(MoveFXOwnership.finish,MoveFXOwnership,contextFor(battle),reason or "battle.ended")
   end
+  -- Android keeps a small runtime-ready working set instead of throwing away
+  -- every parsed/uploaded actor at the end of every battle. 1.7.2's full purge
+  -- protected VRAM, but it also guaranteed that the next battle/Pokemon screen
+  -- paid the Lua parse + texture decode + GPU upload cost again. 1.7.10 keeps a
+  -- bounded multi-battle Pokemon/Waza working set and only evicts after its soft
+  -- cap is exceeded; compact parsed MoveFX specs remain cached on disk/in Lua.
+  local pokemonTrimMs,wazaTrimMs,randomPrimeMs=0,0,0
+  if ANDROID_RUNTIME then
+    if PokemonActors and type(PokemonActors.trimRuntimeMemory)=="function" then
+      local t0=wallNow()
+      -- Keep a bounded eight-species working set. Nothing is released while
+      -- residency is <=8, eliminating the battle-end eviction/reload cycle that
+      -- was still visible as occasional route-to-route stutter in 1.7.9. Once
+      -- above the cap, four party priorities + four recent species win the LRU.
+      pcall(PokemonActors.trimRuntimeMemory,{game=battle and battle.game,keepParty=4,keepRecent=4,softLimit=8})
+      pokemonTrimMs=math.max(0,(wallNow()-t0)*1000)
+    end
+    -- Do not enqueue model materialization back into ordinary overworld input
+    -- frames. An encounter can be accepted inside input.step, so any expensive
+    -- work after the engine step can delay the FIRST transition frame by
+    -- seconds. Missing party bodies are cheap runtime-sidecar reloads at the
+    -- next explicit readiness boundary instead.
+    if WazaHandlers and type(WazaHandlers.trimRuntimeMemory)=="function" then
+      local t0=wallNow();pcall(WazaHandlers.trimRuntimeMemory);wazaTrimMs=math.max(0,(wallNow()-t0)*1000)
+    end
+    -- Do NOT clear MoveFXExtractor.memory here. Those entries are compact
+    -- parsed cache metadata and prevent repeated disk Lua parsing; WazaHandlers
+    -- owns/reclaims the heavyweight GPU-side effect resources above.
+    -- Full collections here created a stop-the-world pause immediately before
+    -- the next menu/battle. GPU objects are explicitly released above; Lua heap
+    -- cleanup is stepped incrementally by the non-battle input hook.
+  end
+
+  -- RANDOM still chooses its next venue immediately, but 1.7.10 deliberately
+  -- does NOT materialize that arena synchronously on the battle-exit seam.
+  -- 1.7.9 moved cold work away from entry but could simply turn it into an
+  -- equally visible hitch while returning to the overworld. Runtime mesh
+  -- sidecars remain persistent, and already-resident arenas stay hot; a truly
+  -- cold random venue is paid behind its next transition instead of freezing
+  -- the previous battle's exit.
+  local game=battle and battle.game
+  if game and ArenaCatalog and type(ArenaCatalog.selected)=="function" and ArenaCatalog.selected(game)=="random"
+      and type(ArenaCatalog.primeRandom)=="function" then
+    local t0=wallNow();pcall(ArenaCatalog.primeRandom,game);randomPrimeMs=math.max(0,(wallNow()-t0)*1000)
+  end
+  R.exitTiming={totalMs=math.max(0,(wallNow()-exitStart)*1000),hostFinishMs=math.max(0,(hostFinishEnd-hostFinishStart)*1000),
+    pokemonTrimMs=pokemonTrimMs,wazaTrimMs=wazaTrimMs,randomPrimeMs=randomPrimeMs}
   R.activeBattle=nil
   R.pendingEnd=nil
 end
@@ -272,9 +385,35 @@ function R.install()
 
   if mod.hooks and type(mod.hooks.wrap)=="function" then
     mod.hooks:wrap("input.step",function(next,game,dt)
+      -- An encounter transition is pushed DURING the engine step. Snapshot the
+      -- stack so CBE can guarantee that no background cache/model job runs
+      -- after that push but before the transition gets its first draw. This was
+      -- the hidden source of the 5-10 second "encounter happened, wipe has not
+      -- appeared yet" pause on slower Android storage/GPUs.
+      local topBefore=stackTop(game)
       local result=next(game,dt)
+      local topAfter=stackTop(game)
+      local stateChanged=topBefore~=topAfter
       if BattleDirector and R.activeBattle and type(BattleDirector.update)=="function" then
         pcall(BattleDirector.update,BattleDirector,contextFor(R.activeBattle),dt)
+      end
+      if ANDROID_RUNTIME then
+        local t=wallNow()
+        if not R.activeBattle then
+          -- Only a tiny incremental GC step remains in interactive overworld
+          -- frames, and even that is skipped on ANY state-transition frame.
+          -- Arena, trainer, Pokemon and MoveFX materialization now happens at
+          -- explicit game-ready/battle-ready seams instead of opportunistically
+          -- inside player input.
+          if not stateChanged and t>=androidGcNextAt and PokemonActors and type(PokemonActors.gcStep)=="function" then
+            pcall(PokemonActors.gcStep,24);androidGcNextAt=t+0.18
+          end
+        elseif not stateChanged and t>=androidActionWarmNextAt and PokemonActors and type(PokemonActors.pumpActionPrewarm)=="function" then
+          -- Native action banks are exact source data but no longer all upload in
+          -- battle.started. Drain one small bank at a time only after the battle
+          -- screen is already stable, independent of battle speed.
+          pcall(PokemonActors.pumpActionPrewarm,1);androidActionWarmNextAt=t+0.18
+        end
       end
       if StandaloneHost then
         -- Last-resort arbitration seam: if a later-priority mod rewrapped
@@ -304,8 +443,10 @@ function R.status()
   return {installed=R.installed,active=R.activeBattle~=nil,pendingEnd=R.pendingEnd~=nil,
     endBoundary=(Compat and Compat.current and Compat.current()==2) and "gen2.screen.finished" or "battle.ended",
     captureSoundBridge=R.captureSoundBridge==true,nativeCaughtSuppressed=R.nativeCaughtSuppressed or 0,
-    modelPrewarm=R.modelPrewarm,
-    captureSuccessAudio="ISO me_snatch owns success; native Caught_Mon suppressed only when source cue is available"}
+    moveSoundBridge=R.moveSoundBridge==true,nativeMoveSoundsSuppressed=R.nativeMoveSoundsSuppressed or 0,
+    modelPrewarm=R.modelPrewarm,entryTiming=R.entryTiming,exitTiming=R.exitTiming,
+    captureSuccessAudio="ISO me_snatch owns success; native Caught_Mon suppressed only when source cue is available",
+    moveAudio="Waza type-5 GameSound owns native battle-animation SFX only when the complete generated snd_se_battle WAV set is present"}
 end
 
 return R

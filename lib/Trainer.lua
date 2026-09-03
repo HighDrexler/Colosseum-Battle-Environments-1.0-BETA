@@ -5,82 +5,26 @@ local mod, Mat4, TrainerRig = V.mod, V.Mat4, V.TrainerRig
 local TrainerPerformance=V.TrainerPerformance
 local BattleSides=V.BattleSides
 local TrainerRoster=V.TrainerRoster
+local RuntimeMeshCache=V.RuntimeMeshCache
+local TrainerMorph=V.TrainerMorph
 local T = {}
 
-local FORMAT = {
-  {"VertexPosition","float",3},
-  {"VertexTexCoord","float",2},
-  {"VertexNormal","float",3},
-  {"BreathPosition","float",3},
-  {"LookPosition","float",3},
-  {"ArmPosition","float",3},
-  {"ShiftPosition","float",3},
-  {"SettlePosition","float",3},
-  {"CommandPosition","float",3},
-  {"BracePosition","float",3},
-  {"ArmWeight","float",1},
-}
+local function platformOS()
+  if love and love.system and type(love.system.getOS)=="function" then
+    local ok,v=pcall(love.system.getOS);if ok and v then return tostring(v) end
+  end
+  return "Unknown"
+end
+local ANDROID_RUNTIME=platformOS()=="Android"
+local WINDOWS_RUNTIME=platformOS()=="Windows"
 
-local VERTEX = [[
-uniform mat4 vp;
-uniform mat4 model;
-uniform float breathMix;
-uniform float lookMix;
-uniform float armMix;
-uniform float shiftMix;
-uniform float settleMix;
-uniform float commandMix;
-uniform float braceMix;
-uniform float sourcePoseGain;
-attribute vec3 VertexNormal;
-attribute vec3 BreathPosition;
-attribute vec3 LookPosition;
-attribute vec3 ArmPosition;
-attribute vec3 ShiftPosition;
-attribute vec3 SettlePosition;
-attribute vec3 CommandPosition;
-attribute vec3 BracePosition;
-varying vec3 worldPos;
-varying vec3 worldNormal;
-
-
-vec4 position(mat4 transform_projection, vec4 vertex_position) {
-  vec3 base = vertex_position.xyz;
-  vec3 p = base;
-  // Source-performance compositor: large body poses are mutually normalized.
-  // This prevents anticipation/release/recovery targets from stacking into an
-  // anatomically impossible action-figure silhouette.
-  /* The source morphs are intentionally treated as pose guides rather than
-     100% rigid limb targets.  Colosseum's animation reads from whole-body
-     silhouette/weight transfer; overdriving these hard-skinned targets is what
-     made elbows and shoulders look like an action figure. */
-  // Source boss poses are model-specific silhouettes, not rigid
-  // action-figure endpoints.  Keep enough morph authority to read the pose,
-  // but let the pelvis/torso performance carry more of the gesture.
-  float wa=max(armMix,0.0)*1.00*sourcePoseGain, ws=max(shiftMix,0.0)*0.96*sourcePoseGain, wt=max(settleMix,0.0)*0.90*sourcePoseGain;
-  float wc=max(commandMix,0.0)*1.00*sourcePoseGain, wb=max(braceMix,0.0)*0.96*sourcePoseGain;
-  float sum=wa+ws+wt+wc+wb;
-  // Native B1 source poses now own decisive gestures. Keep a small ceiling so
-  // interpolation/recovery remains smooth, but do not reduce them to pose hints.
-  float action=clamp(sum,0.0,0.84);
-  if (sum>0.0001) {
-    vec3 target=(ArmPosition*wa+ShiftPosition*ws+SettlePosition*wt+
-                 CommandPosition*wc+BracePosition*wb)/sum;
-    p=mix(base,target,action);
-  }
-  // Breath and look are tiny secondary motion and fade almost completely
-  // during decisive source-style battle gestures.
-  float secondary=1.0-action*0.92;
-  p+=(BreathPosition-base)*breathMix*secondary;
-  p+=(LookPosition-base)*lookMix*secondary;
-  vec3 n = VertexNormal;
-  vec4 world = model * vec4(p,1.0);
-  worldPos = world.xyz;
-  worldNormal = normalize((model * vec4(normalize(n),0.0)).xyz);
-  return vp * world;
-}
-]]
-
+-- Mesh layouts now come from TrainerMorph so Trainer and PlayerTrainer cannot
+-- drift apart. DENSE is the unchanged 44-float cache/sidecar layout; COMPACT
+-- is only used by the CPU fallback binding path.
+local FORMAT=TrainerMorph.DENSE_FORMAT
+local FORMAT_COMPACT=TrainerMorph.COMPACT_FORMAT
+local DENSE_MESH=TrainerMorph.dense()
+local VERTEX=TrainerMorph.VERTEX
 local PIXEL = [[
 uniform vec3 cameraEye;
 uniform vec4 tintColor;
@@ -114,6 +58,9 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
 ]]
 
 local scene, sceneKey, shader, shadowImage, shadowMesh
+local sceneCache,sceneErrors,sceneUseSerial={}, {}, 0
+local prewarmQueue,prewarmSeen,prewarmNextAt={}, {}, 0
+local MAX_RESIDENT_TRAINERS=ANDROID_RUNTIME and 3 or 6
 local ballMeshRed,ballMeshWhite,ballMeshBlack,ballTexture
 local errorText
 local currentModel="dakim"
@@ -157,6 +104,44 @@ local function readLua(path)
   local ok,value=pcall(chunk); if not ok then return nil,value end
   return value
 end
+local TRAINER_RUNTIME_MESH_VERSION=1
+local trainerRuntimeHits,trainerRuntimeWrites,trainerRuntimeFallbacks=0,0,0
+local function trainerRuntimeTag(wanted) return tostring(wanted or "trainer"):gsub("[^%w_%-]","_") end
+local function trainerRuntimeRoot(wanted) return "cache/runtime_mesh_v1/trainers/"..trainerRuntimeTag(wanted) end
+local function trainerRuntimeMetaPath(wanted) return trainerRuntimeRoot(wanted).."/base.lua" end
+local function trainerRuntimeBinPath(wanted,i) return trainerRuntimeRoot(wanted)..("/base_%02d.f32"):format(tonumber(i) or 0) end
+local function trainerSourceSize(cfg)
+  local info=GeneratedAssets and GeneratedAssets.info and GeneratedAssets.info(cfg and cfg.cache) or nil
+  return info and tonumber(info.size) or nil
+end
+local function trainerRuntimeUsable(meta,wanted,sourceSize)
+  if not (RuntimeMeshCache and type(RuntimeMeshCache.readLua)=="function") then return false end
+  if type(meta)~="table" or tonumber(meta.runtimeMeshVersion)~=TRAINER_RUNTIME_MESH_VERSION or tonumber(meta.formatVersion)~=26 then return false end
+  if not sourceSize or tonumber(meta.sourceSize)~=sourceSize or type(meta.groups)~="table" or #meta.groups==0 then return false end
+  for i,g in ipairs(meta.groups) do
+    local path=type(g)=="table" and (g.runtimeBin or trainerRuntimeBinPath(wanted,i)) or nil
+    local info=path and GeneratedAssets.info and GeneratedAssets.info(path) or nil
+    local size=info and tonumber(info.size)
+    if not size or size<176 or size%176~=0 then return false end
+  end
+  return true
+end
+local function trainerGroupCompact(g,wanted,i)
+  local out={}
+  for k,v in pairs(g or {}) do if k~="vertices" and k~="verticesPacked" then out[k]=v end end
+  out.runtimeBin=trainerRuntimeBinPath(wanted,i)
+  return out
+end
+local function writeTrainerRuntimeMeta(wanted,cache,sourceSize)
+  if not (RuntimeMeshCache and RuntimeMeshCache.writeLua and sourceSize) then return false end
+  local out={runtimeMeshVersion=TRAINER_RUNTIME_MESH_VERSION,sourceSize=sourceSize,formatVersion=cache.formatVersion}
+  for k,v in pairs(cache or {}) do if k~="groups" then out[k]=v end end
+  out.groups={}
+  for i,g in ipairs(cache.groups or {}) do out.groups[i]=trainerGroupCompact(g,wanted,i) end
+  local ok=RuntimeMeshCache.writeLua(trainerRuntimeMetaPath(wanted),out)
+  if ok then trainerRuntimeWrites=trainerRuntimeWrites+1 end
+  return ok
+end
 local function imageFromRaw(spec)
   local bytes,readErr=GeneratedAssets.read(spec.path); if not bytes then return nil,readErr or ("missing "..tostring(spec.path)) end
   local ok,data=pcall(love.image.newImageData,spec.w,spec.h,"rgba8",bytes)
@@ -171,10 +156,13 @@ local function imageFromRaw(spec)
   return img
 end
 local function shadowVertex(x,y,z,u,v)
+  if not DENSE_MESH then return TrainerMorph.staticCompactVertex(x,y,z,u,v,0,1,0) end
   -- Same base position is supplied for every morph stream. Shadows never
-  -- morph, but the mesh must still satisfy the GPU-safe 10-attribute format.
+  -- morph, but the mesh must still satisfy the dense source format.
   return {x,y,z,u,v,0,1,0,
-    x,y,z, x,y,z, x,y,z, x,y,z, x,y,z, x,y,z, x,y,z, 0}
+    x,y,z, x,y,z,
+    x,y,z, x,y,z, x,y,z, x,y,z, x,y,z,
+    x,y,z, x,y,z, x,y,z, x,y,z, x,y,z}
 end
 local function ensureShadow()
   if shadowImage and shadowMesh then return true end
@@ -194,13 +182,16 @@ local function ensureShadow()
     shadowVertex(-2.6,0.035,-1.25,0,0), shadowVertex(2.6,0.035,-1.25,1,0), shadowVertex(2.6,0.035,1.25,1,1),
     shadowVertex(-2.6,0.035,-1.25,0,0), shadowVertex(2.6,0.035,1.25,1,1), shadowVertex(-2.6,0.035,1.25,0,1),
   }
-  shadowMesh=love.graphics.newMesh(FORMAT,verts,"triangles","static")
+  shadowMesh=love.graphics.newMesh(DENSE_MESH and FORMAT or FORMAT_COMPACT,verts,"triangles","static")
   shadowMesh:setTexture(shadowImage)
   return true
 end
 local function ballVertex(x,y,z,u,v)
+  if not DENSE_MESH then return TrainerMorph.staticCompactVertex(x,y,z,u,v,0,1,0) end
   return {x,y,z,u,v,0,1,0,
-    x,y,z, x,y,z, x,y,z, x,y,z, x,y,z, x,y,z, x,y,z, 0}
+    x,y,z, x,y,z,
+    x,y,z, x,y,z, x,y,z, x,y,z, x,y,z,
+    x,y,z, x,y,z, x,y,z, x,y,z, x,y,z}
 end
 local function sphereBand(y0,y1,r,segments)
   local out={};segments=segments or 12
@@ -228,7 +219,7 @@ local function ensureBall()
     for _,v in ipairs(sphereBand(-b,-a,1,14)) do white[#white+1]=v end
   end
   for _,v in ipairs(sphereBand(-.10,.10,1.015,14)) do black[#black+1]=v end
-  local function make(vs)local m=love.graphics.newMesh(FORMAT,vs,"triangles","static");m:setTexture(ballTexture);return m end
+  local function make(vs)local m=love.graphics.newMesh(DENSE_MESH and FORMAT or FORMAT_COMPACT,vs,"triangles","static");m:setTexture(ballTexture);return m end
   ballMeshRed,ballMeshWhite,ballMeshBlack=make(red),make(white),make(black)
   return true
 end
@@ -256,50 +247,156 @@ local function applyModelScale()
 end
 
 
-local function loadScene(ctx)
-  local cfg,reason=trainerModelFor(ctx)
+local function releaseLoveObject(obj,seen)
+  if obj==nil then return end
+  seen=seen or {}
+  if seen[obj] then return end
+  seen[obj]=true
+  pcall(function()
+    if type(obj.release)=="function" then obj:release() end
+  end)
+end
+local function releaseScene(entry)
+  if type(entry)~="table" then return end
+  local seen={}
+  for _,g in ipairs(entry.groups or {}) do
+    if type(g)=="table" then releaseLoveObject(g.mesh,seen) end
+  end
+  for _,img in pairs(entry.textures or {}) do releaseLoveObject(img,seen) end
+end
+local function trimSceneCache()
+  local count=0;for _ in pairs(sceneCache) do count=count+1 end
+  while count>MAX_RESIDENT_TRAINERS do
+    local victim,vuse
+    for key,entry in pairs(sceneCache) do
+      if key~=sceneKey then
+        local use=tonumber(entry.__cbeUse) or 0
+        if victim==nil or use<vuse then victim,vuse=key,use end
+      end
+    end
+    if not victim then break end
+    releaseScene(sceneCache[victim]);sceneCache[victim]=nil;sceneErrors[victim]=nil
+    count=count-1
+  end
+end
+local function activateScene(cfg,reason,wanted,entry)
+  sceneUseSerial=sceneUseSerial+1;entry.__cbeUse=sceneUseSerial
+  scene=entry;sceneKey=wanted;currentModel=wanted;currentConfig=cfg;currentReason=reason
+  errorText=nil;applyModelScale()
+  return entry
+end
+local function loadConfig(ctx,cfg,reason)
   if not cfg then return nil,reason or "trainer-model-unavailable" end
   local wanted=tostring(cfg.id or cfg.label or cfg.cache or "trainer")
-  if scene and sceneKey==wanted then currentReason=reason;return scene end
-  if sceneKey~=wanted then scene=nil;errorText=nil;sceneKey=nil end
-  currentModel=wanted
-  currentConfig=cfg
-  currentReason=reason
-  applyModelScale()
-  if errorText then return nil,errorText end
+  local hit=sceneCache[wanted]
+  if hit then return activateScene(cfg,reason,wanted,hit) end
+  local priorErr=sceneErrors[wanted]
+  if priorErr then errorText=priorErr;return nil,priorErr end
+  currentModel=wanted;currentConfig=cfg;currentReason=reason;errorText=nil
   if not (love and love.graphics and love.image and love.graphics.newMesh and love.graphics.newShader) then
-    errorText="LÖVE mesh/shader API unavailable"; return nil,errorText
+    errorText="LÖVE mesh/shader API unavailable";sceneErrors[wanted]=errorText;return nil,errorText
   end
-  local cache,err=readLua(cfg.cache)
-  if not cache then errorText=tostring(err);return nil,errorText end
+  -- Trainer shader is identical for every roster model. Compile it once and
+  -- keep it resident instead of relinking GLSL every time a rival/class model
+  -- changes.
+  if not shader then
+    local ok,sh=pcall(love.graphics.newShader,VERTEX,PIXEL)
+    if not ok or not sh then errorText=(cfg.label or wanted).." shader: "..tostring(sh or "unavailable");sceneErrors[wanted]=errorText;return nil,errorText end
+    shader=sh
+  end
+  local sourceSize=trainerSourceSize(cfg)
+  local cache,err,fromRuntime
+  if DENSE_MESH and RuntimeMeshCache and type(RuntimeMeshCache.readLua)=="function" then
+    local rt=select(1,RuntimeMeshCache.readLua(trainerRuntimeMetaPath(wanted)))
+    if trainerRuntimeUsable(rt,wanted,sourceSize) then cache=rt;fromRuntime=true;trainerRuntimeHits=trainerRuntimeHits+1 end
+  end
+  if not cache then cache,err=readLua(cfg.cache) end
+  if not cache then errorText=tostring(err);sceneErrors[wanted]=errorText;return nil,errorText end
+  if tonumber(cache.formatVersion)~=26 then
+    errorText=(cfg.label or wanted).." trainer cache format "..tostring(cache.formatVersion or "?").." is stale; rebuild required for dense source animation"
+    sceneErrors[wanted]=errorText;return nil,errorText
+  end
   local textures={}; local groups={}
+  local canonicalFallback=nil
   for i,g in ipairs(cache.groups or {}) do
     local path=g.texture and g.texture.path
     local img=path and textures[path] or nil
     if path and not img then
       img,err=imageFromRaw(g.texture)
-      if not img then errorText=tostring(err);return nil,errorText end
+      if not img then errorText=tostring(err);sceneErrors[wanted]=errorText;return nil,errorText end
       textures[path]=img
     end
-    local ok,mesh=pcall(love.graphics.newMesh,FORMAT,g.vertices or {},"triangles","static")
-    if not ok then errorText=(cfg.label or currentModel).." mesh "..i..": "..tostring(mesh);return nil,errorText end
+    local mesh,meshErr
+    local denseVertices
+    local binPath=g.runtimeBin or trainerRuntimeBinPath(wanted,i)
+    if fromRuntime and RuntimeMeshCache and type(RuntimeMeshCache.meshFromPath)=="function" then
+      mesh,meshErr=RuntimeMeshCache.meshFromPath(FORMAT,binPath,44,"static")
+    end
+    if not mesh then
+      -- A compact runtime meta intentionally contains no Lua vertex rows. If a
+      -- platform/backend cannot turn its .f32 sidecar into a Mesh (observed on
+      -- Windows while Android accepted the same cache), never continue with an
+      -- empty vertex table. Reopen the canonical extracted HSD cache for this
+      -- group, draw it immediately, and opportunistically repair the sidecar.
+      local sourceGroup=g
+      if fromRuntime and type(g.vertices)~="table" then
+        if canonicalFallback==nil then
+          local canonical,cerr=readLua(cfg.cache)
+          if type(canonical)=="table" and tonumber(canonical.formatVersion)==26 then canonicalFallback=canonical else canonicalFallback=false;meshErr=tostring(cerr or meshErr or "canonical trainer fallback unavailable") end
+        end
+        if canonicalFallback and canonicalFallback.groups and canonicalFallback.groups[i] then
+          sourceGroup=canonicalFallback.groups[i];trainerRuntimeFallbacks=trainerRuntimeFallbacks+1
+        end
+      end
+      local vertices=sourceGroup and sourceGroup.vertices or {}
+      if type(vertices)~="table" or #vertices==0 then
+        errorText=(cfg.label or wanted).." mesh "..i.." runtime sidecar failed and canonical vertices are unavailable: "..tostring(meshErr or "empty mesh")
+        sceneErrors[wanted]=errorText;return nil,errorText
+      end
+      for _,row in ipairs(vertices) do if type(row)=="table" then row[45]=nil end end
+      denseVertices=vertices
+      if not DENSE_MESH then
+        local compact={}
+        for ri,row in ipairs(denseVertices) do compact[ri]=TrainerMorph.compactVertex(row,nil,nil) end
+        vertices=compact
+      end
+      local ok,built=pcall(love.graphics.newMesh,DENSE_MESH and FORMAT or FORMAT_COMPACT,vertices,"triangles",DENSE_MESH and "static" or "dynamic")
+      if not ok then errorText=(cfg.label or wanted).." mesh "..i..": "..tostring(built);sceneErrors[wanted]=errorText;return nil,errorText end
+      mesh=built
+      if DENSE_MESH and RuntimeMeshCache and RuntimeMeshCache.supported and RuntimeMeshCache.supported() then
+        local wok=RuntimeMeshCache.writeRows(binPath,vertices,44)
+        if not wok then meshErr="runtime sidecar write failed" end
+      end
+    end
     if img then mesh:setTexture(img) end
     local d=g.diffuse or {1,1,1}
     groups[#groups+1]={mesh=mesh,material=g.material,image=img,textured=img~=nil,
       diffuse={tonumber(d[1]) or 1,tonumber(d[2]) or 1,tonumber(d[3]) or 1},
       alpha=tonumber(g.alpha) or 1,xlu=g.xlu==true,noz=g.noz==true,
-      renderFlags=tonumber(g.renderFlags) or 0,shadow=g.shadow==true,effect=g.effect==true}
+      renderFlags=tonumber(g.renderFlags) or 0,shadow=g.shadow==true,effect=g.effect==true,
+      poseSourceRows=(not DENSE_MESH) and denseVertices or nil,posePair=nil}
   end
-  local ok,sh=pcall(love.graphics.newShader,VERTEX,PIXEL)
-  if not ok or not sh then errorText=(cfg.label or currentModel).." shader: "..tostring(sh or "unavailable");return nil,errorText end
-  shader=sh
   local sok,serr=ensureShadow()
-  if not sok then errorText=(cfg.label or currentModel).." shadow: "..tostring(serr);return nil,errorText end
-  scene={groups=groups,bounds=cache.bounds,source=cache.source,textures=textures}
-  sceneKey=currentModel
-  applyModelScale()
-  log(ctx,"info","loaded %s source actor: %d material groups",cfg.label or currentModel,#groups)
-  return scene
+  if not sok then errorText=(cfg.label or wanted).." shadow: "..tostring(serr);sceneErrors[wanted]=errorText;return nil,errorText end
+  if not fromRuntime and RuntimeMeshCache and RuntimeMeshCache.supported and RuntimeMeshCache.supported() and sourceSize then
+    local all=true
+    for i=1,#(cache.groups or {}) do
+      local info=GeneratedAssets.info and GeneratedAssets.info(trainerRuntimeBinPath(wanted,i)) or nil
+      local size=info and tonumber(info.size)
+      if not size or size<176 or size%176~=0 then all=false;break end
+    end
+    if all then writeTrainerRuntimeMeta(wanted,cache,sourceSize) end
+  end
+  local entry={groups=groups,bounds=cache.bounds,source=cache.source,textures=textures}
+  sceneCache[wanted]=entry
+  activateScene(cfg,reason,wanted,entry);trimSceneCache()
+  log(ctx,"info","loaded %s source actor: %d material groups",cfg.label or wanted,#groups)
+  return entry
+end
+
+local function loadScene(ctx)
+  local cfg,reason=trainerModelFor(ctx)
+  return loadConfig(ctx,cfg,reason)
 end
 
 local function battleOf(ctx)
@@ -335,6 +432,49 @@ function T:prewarm(ctx)
   local s,err=loadScene(ctx)
   if s then pcall(ensureBall) end
   return s~=nil,err
+end
+function T:prewarmModel(cfg,ctx,reason)
+  local s,err=loadConfig(ctx or {},cfg,reason or "explicit-prewarm")
+  if s then pcall(ensureBall) end
+  return s~=nil,err
+end
+function T:queuePrewarm(game)
+  prewarmQueue={};prewarmSeen={};prewarmNextAt=0
+  if not (TrainerRoster and type(TrainerRoster.prewarmPlan)=="function") then return 0 end
+  local ok,plan=pcall(TrainerRoster.prewarmPlan,game)
+  if not ok or type(plan)~="table" then return 0 end
+  for _,row in ipairs(plan) do
+    local cfg=row and row.config
+    local key=cfg and tostring(cfg.id or cfg.cache or cfg.label or "trainer")
+    if cfg and key and not sceneCache[key] and not prewarmSeen[key] then
+      prewarmSeen[key]=true;prewarmQueue[#prewarmQueue+1]=row
+    end
+  end
+  return #prewarmQueue
+end
+function T:drainPrewarm(game,limit)
+  limit=math.max(1,math.floor(tonumber(limit) or #prewarmQueue))
+  local warmed=0
+  while #prewarmQueue>0 and warmed<limit do
+    local row=table.remove(prewarmQueue,1)
+    if not row then break end
+    local ok=self:prewarmModel(row.config,{game=game,phase="trainer-game-ready",services={androidResidentWarm=ANDROID_RUNTIME}},row.reason)
+    if ok then warmed=warmed+1 end
+  end
+  prewarmNextAt=0
+  return warmed,#prewarmQueue
+end
+
+function T:pumpPrewarm(game)
+  if #prewarmQueue==0 then return false,0 end
+  local clock=(love and love.timer and love.timer.getTime) or os.clock
+  local now=clock and clock() or 0
+  if now>0 and now<prewarmNextAt then return false,#prewarmQueue end
+  local row=table.remove(prewarmQueue,1);if not row then return false,0 end
+  local ok=self:prewarmModel(row.config,{game=game,phase="trainer-prewarm",services={androidResidentWarm=ANDROID_RUNTIME}},row.reason)
+  local after=clock and clock() or now
+  prewarmNextAt=(after>0 and after or now)+(ANDROID_RUNTIME and .80 or .20)
+  return ok,#prewarmQueue
 end
 function T:shouldRender(ctx)
   local b=battleOf(ctx)
@@ -457,8 +597,9 @@ function T:event(ctx,name,payload)
   payload=type(payload)=="table" and payload or {}
   local b0=battleOf(ctx)
   local gen2=b0 and b0.__cbeGeneration==2
-  local queueSync=gen2 and b0.__cbePresentationQueueSync==true
-  if queueSync and (name=="battle.move_used" or name=="battle.damage_dealt" or name=="battle.fainted") then return end
+  local queueSync=b0 and b0.__cbePresentationQueueSync==true
+  if queueSync and ((gen2 and (name=="battle.move_used" or name=="battle.damage_dealt" or name=="battle.fainted"))
+      or ((not gen2) and name=="battle.fainted")) then return end
   local semantic=name
   if name=="battle.presentation_damage" then semantic="battle.damage_dealt"
   elseif name=="battle.presentation_faint" then semantic="battle.fainted" end
@@ -543,15 +684,7 @@ local function setShader(vp,model,pose,unlit,tint,opacity,motion)
   shader:send("materialColor",{1,1,1,1})
   shader:send("useTexture",1)
   shader:send("flipV",currentModel=="miror_b" and 1 or 0)
-  local breathMix=motion.breath or 0
-  shader:send("breathMix",breathMix)
-  shader:send("lookMix",motion.look or 0)
-  shader:send("armMix",motion.arm or 0)
-  shader:send("shiftMix",motion.shift or 0)
-  shader:send("settleMix",motion.settle or 0)
-  shader:send("commandMix",motion.command or 0)
-  shader:send("braceMix",motion.brace or 0)
-  shader:send("sourcePoseGain",1)
+  TrainerMorph.sendMixes(shader,motion)
 end
 
 function T:drawShadow(ctx,vp,pose)
@@ -578,6 +711,7 @@ function T:draw(ctx,vp,pose)
   if p.progress<0.03 then return end
   local motion=idleMotion()
   local model=animatedModel(p,motion)
+  TrainerMorph.bindPair(s.groups,motion)
   love.graphics.setDepthMode("lequal",true)
   love.graphics.setBlendMode("alpha","alphamultiply")
   if love.graphics.setMeshCullMode then love.graphics.setMeshCullMode("none") end
@@ -648,6 +782,9 @@ end
 
 function T:anchor(y) return {FINAL_X,y or 7.0,FINAL_Z} end
 function T:resetRuntime()
+  local all=sceneCache;sceneCache={};sceneErrors={};sceneUseSerial=0
+  for _,entry in pairs(all or {}) do releaseScene(entry) end
+  prewarmQueue={};prewarmSeen={};prewarmNextAt=0
   scene=nil;sceneKey=nil;shader=nil;shadowImage=nil;shadowMesh=nil;errorText=nil
   currentConfig=nil;currentReason=nil
   ballMeshRed=nil;ballMeshWhite=nil;ballMeshBlack=nil;ballTexture=nil
@@ -661,7 +798,7 @@ function T:status()
     model=(currentConfig and currentConfig.label) or (MODEL_CONFIG[currentModel] and MODEL_CONFIG[currentModel].label) or tostring(currentModel),
     modelSource=currentConfig and currentConfig.source or nil,modelReason=currentReason,
     pose="NativeHSD-clip1-nonbind-shoulder-anchored-throw-enemy",action=actionKind,pendingFrustration=pendingFrustration,modelScale=MODEL_SCALE,final={FINAL_X,0,FINAL_Z},drawFrames=drawFrames,
-    mode=T:getMode(mod and mod.game),bossOnly=false,
+    mode=T:getMode(mod and mod.game),bossOnly=false,residentModels=(function() local n=0;for _ in pairs(sceneCache) do n=n+1 end;return n end)(),prewarmPending=#prewarmQueue,runtimeMeshHits=trainerRuntimeHits,runtimeMeshWrites=trainerRuntimeWrites,runtimeMeshFallbacks=trainerRuntimeFallbacks,morph=TrainerMorph.status(),windowsCompat=WINDOWS_RUNTIME,
   }
 end
 

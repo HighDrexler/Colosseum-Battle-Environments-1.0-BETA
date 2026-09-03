@@ -11,12 +11,11 @@
 --   * Dolphin block-sparse GameCube CISO;
 --   * the same raw/CISO payload behind a small common wrapper/header.
 --
--- Admission is still launcher-owned.  1.6.0's manifest keeps the canonical
--- ISO + known tested CISO MD5s for old launchers and also declares GameCube
--- structural metadata (disc id/revision, CISO/scrubbed support) understood by
--- representation-aware launchers.  CBE itself then performs a stronger second
--- structural check: GameCube magic + FST integrity + the core Colosseum FSYS
--- members actually used by the runtime.  Optional audio is intentionally not
+-- Admission is still launcher-owned. The manifest lists the canonical USA ISO
+-- and one specifically tested CISO digest; stock API-2 launchers validate those
+-- bytes before this entry chunk runs. Once admitted, CBE performs a stronger
+-- second structural check: GameCube magic + FST integrity + the core Colosseum
+-- FSYS members actually used by the runtime. Optional audio is intentionally not
 -- part of source validity.
 local M={}
 
@@ -91,6 +90,13 @@ local function makeLegacyImports(mod,status)
     if not info.size or offset+length>info.size then return nil,"import read exceeds source" end
     if length==0 then return "" end
     if sourceBlob==nil then
+      -- A Colosseum disc is ~1.36 GiB. Materializing it through legacy mod:read
+      -- can OOM/kill Android before Lua can report an error. Large CBE sources
+      -- therefore require the launcher's bounded mod.imports facade.
+      if (tonumber(info.size) or 0) > 128*1024*1024 then
+        status.largeImportBlocked=true
+        return nil,"this Gen1Recomp build lacks bounded mod.imports support for the Colosseum disc; update the Android recomp/launcher before using CBE"
+      end
       local bytes,readErr=mod:read(IMPORT_PATH)
       if type(bytes)~="string" then return nil,readErr or "launcher import could not be read" end
       if #bytes~=info.size then
@@ -370,11 +376,26 @@ function M.install(mod)
     assert(fs and type(fs.read)=="function" and type(fs.write)=="function" and type(fs.getInfo)=="function",
       "Gen1Recomp per-mod filesystem compatibility overlay is unavailable")
     local cache={}
+    local function ensureParent(full)
+      local parent=tostring(full or ""):match("^(.*)/[^/]+$")
+      if not parent or parent=="" then return true end
+      if type(fs.createDirectory)~="function" then return true end
+      local cur=""
+      for part in parent:gmatch("[^/]+") do
+        cur=(cur=="" and part) or (cur.."/"..part)
+        local ok,err=fs.createDirectory(cur)
+        if ok==false then return false,err end
+      end
+      return true
+    end
     function cache:info(path) return fs.getInfo(safeCachePath(path)) end
     function cache:read(path) return fs.read(safeCachePath(path)) end
     function cache:write(path,data)
       assert(type(data)=="string","cache writes require string bytes")
-      return fs.write(safeCachePath(path),data)
+      if #data>64*1024*1024 then return false,"cache write exceeds the API-2 64 MiB per-key limit" end
+      local full=safeCachePath(path)
+      local ok,err=ensureParent(full);if ok==false then return false,err end
+      return fs.write(full,data)
     end
     function cache:delete(path)
       local full=safeCachePath(path);if not fs.getInfo(full) then return true end

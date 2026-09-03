@@ -78,6 +78,8 @@ end
 
 local function zero(p)
   return {command=0,brace=0,shift=0,settle=0,look=0,arm=0,lean=0,turn=0,forward=0,bob=0,sway=0,
+    gesture1=0,gesture2=0,gesture3=0,gesture4=0,gesture5=0,
+    reaction1=0,reaction2=0,reaction3=0,reaction4=0,reaction5=0,
     idleArm=0,armLead=p.lead or 1,headEnergy=p.head or 1,weightEnergy=p.weight or 1}
 end
 local function scaleMotion(m,s)
@@ -98,31 +100,48 @@ local GESTURE_KIND={opening=true,throw=true,sendout=true,recall=true,command=tru
 local REACTION_KIND={brace=true,concern=true,frustration=true,defeat=true}
 local function sourceTimeline(id,kind,t,strength)
   local p=cloneProfile(id)
-  local out={command=0,arm=0,settle=0,brace=0,shift=0}
+  local out={
+    command=0,arm=0,settle=0,brace=0,shift=0,
+    gesture1=0,gesture2=0,gesture3=0,gesture4=0,gesture5=0,
+    reaction1=0,reaction2=0,reaction3=0,reaction4=0,reaction5=0,
+  }
   if not kind then return out end
   local d=A.duration(id,kind)
   local u=clamp((tonumber(t) or 0)/math.max(.001,d),0,1)
   local raw=clamp(tonumber(strength) or 1,0,1.20)
+  local function adjacentWeights(amp)
+    local marks={.20,.36,.52,.68,.84}
+    local w={0,0,0,0,0}
+    if u<marks[1] then
+      w[1]=smooth(u/marks[1])*amp
+    elseif u>=marks[#marks] then
+      w[#marks]=(1-smooth((u-marks[#marks])/(1-marks[#marks])))*amp
+    else
+      for i=1,#marks-1 do
+        if u>=marks[i] and u<marks[i+1] then
+          local q=smooth((u-marks[i])/(marks[i+1]-marks[i]))
+          w[i]=(1-q)*amp;w[i+1]=q*amp
+          break
+        end
+      end
+    end
+    return w
+  end
   if GESTURE_KIND[kind] then
     local amp=clamp(raw*(tonumber(p.gesture) or 1),0,1)
-    if u<.18 then
-      out.command=smooth(u/.18)*amp
-    elseif u<.48 then
-      local q=smooth((u-.18)/.30);out.command=(1-q)*amp;out.arm=q*amp
-    elseif u<.78 then
-      local q=smooth((u-.48)/.30);out.arm=(1-q)*amp;out.settle=q*amp
-    else
-      out.settle=(1-smooth((u-.78)/.22))*amp
-    end
+    local w=adjacentWeights(amp)
+    for i=1,5 do out["gesture"..i]=w[i] or 0 end
+    -- Retain the old semantic channels for root/hand compatibility only. The
+    -- visible mesh is now driven by the dense gesture1..5 source samples.
+    out.command=(w[1] or 0)+(w[2] or 0)*.55
+    out.arm=(w[2] or 0)*.45+(w[3] or 0)+(w[4] or 0)*.55
+    out.settle=(w[4] or 0)*.45+(w[5] or 0)
   elseif REACTION_KIND[kind] then
     local amp=clamp(raw*(tonumber(p.reaction) or 1),0,1)
-    if u<.16 then
-      out.brace=smooth(u/.16)*amp
-    elseif u<.60 then
-      local q=smooth((u-.16)/.44);out.brace=(1-q)*amp;out.shift=q*amp
-    else
-      out.shift=(1-smooth((u-.60)/.40))*amp
-    end
+    local w=adjacentWeights(amp)
+    for i=1,5 do out["reaction"..i]=w[i] or 0 end
+    out.brace=(w[1] or 0)+(w[2] or 0)+(w[3] or 0)*.40
+    out.shift=(w[3] or 0)*.60+(w[4] or 0)+(w[5] or 0)
   end
   return out
 end
@@ -225,6 +244,8 @@ function A.idle(id,age,kind,actionAge,strength,side)
   local out={breath=breath,look=look*damp+(perf.look or 0),arm=perf.arm or 0,shift=perf.shift or 0,settle=settle*damp+(perf.settle or 0),
     lean=lean*damp+(perf.lean or 0),turn=turn*damp+(perf.turn or 0),bob=bob*damp+(perf.bob or 0),sway=sway*damp+(perf.sway or 0),
     command=perf.command or 0,brace=perf.brace or 0,forward=windForward*damp+(perf.forward or 0),idleArm=idleArm*damp,
+    gesture1=0,gesture2=0,gesture3=0,gesture4=0,gesture5=0,
+    reaction1=0,reaction2=0,reaction3=0,reaction4=0,reaction5=0,
     armLead=perf.armLead or p.lead or 1,headEnergy=p.head or 1,weightEnergy=p.weight or 1}
   if id=="miror_b" then
     local groove=math.sin(age*.82+.40)*live
@@ -242,11 +263,15 @@ function A.idle(id,age,kind,actionAge,strength,side)
     local src=sourceTimeline(id,kind,actionAge,strength)
     out.command=src.command;out.arm=src.arm;out.settle=src.settle
     out.brace=src.brace;out.shift=src.shift
+    for i=1,5 do
+      out["gesture"..i]=src["gesture"..i] or 0
+      out["reaction"..i]=src["reaction"..i] or 0
+    end
   end
   -- 1.5.54: source B1 poses own the visible trainer performance. Whole-body
   -- sway/bob/lean remains only as a small continuity layer so authored feet,
   -- shoulders and torso silhouettes are not puppeteered by procedural motion.
-  local residual=1-out.sourceAuthority*.97
+  local residual=kind and (1-out.sourceAuthority*.995) or (1-out.sourceAuthority*.97)
   out.lean=(out.lean or 0)*residual;out.turn=(out.turn or 0)*residual
   out.bob=(out.bob or 0)*residual;out.sway=(out.sway or 0)*residual
   out.forward=(out.forward or 0)*residual
@@ -261,6 +286,8 @@ end
 local DYNAMIC_KEYS={
   "breath","look","arm","shift","settle","lean","turn","bob","sway",
   "command","brace","forward","idleArm","hairSway","hairBounce","hairTwist",
+  "gesture1","gesture2","gesture3","gesture4","gesture5",
+  "reaction1","reaction2","reaction3","reaction4","reaction5",
 }
 local RESPONSE={
   breath={9.0,8.0},look={8.0,7.0},arm={16.0,8.8},shift={11.5,7.8},settle={8.0,6.3},
@@ -284,15 +311,21 @@ function A.step(state,id,age,kind,actionAge,strength,side,dt)
   -- authored B1 silhouette, replay that silhouette consistently; only the
   -- deterministic continuity filter below remains on top of the source pose.
   local p=cloneProfile(id);local continuity=tonumber(p.continuity) or 1
-  local sourceKeys={breath=true,look=true,arm=true,shift=true,settle=true,command=true,brace=true}
+  local sourceKeys={breath=true,look=true,arm=true,shift=true,settle=true,command=true,brace=true,
+    gesture1=true,gesture2=true,gesture3=true,gesture4=true,gesture5=true,
+    reaction1=true,reaction2=true,reaction3=true,reaction4=true,reaction5=true}
   for _,k in ipairs(DYNAMIC_KEYS) do
     local x=tonumber(state.current[k]);local goal=tonumber(target[k]) or 0;if x==nil then x=goal end
-    if sourceKeys[k] then
-      -- The target itself is now a continuous source-clip timeline. Apply only
-      -- a gentle low-pass for event-boundary continuity; do not independently
-      -- spring each source pose or it re-introduces robotic phase lag/snapping.
-      local attack=kind and 9.2 or 6.8;local release=kind and 7.4 or 5.8
-      local rate=(math.abs(goal)>math.abs(x) and attack or release)/continuity
+    if sourceKeys[k] and kind then
+      -- Decisive trainer actions are already a continuous interpolation of
+      -- adjacent frames from one real B1 source clip.  Do not spring-filter
+      -- those source weights again: that second filter was visibly delaying
+      -- shoulders/hands relative to the authored body motion.
+      x=goal;state.velocity[k]=0
+    elseif sourceKeys[k] then
+      -- Idle breath/look remain gently filtered so battle-entry and event seams
+      -- do not pop while no decisive source performance owns the body.
+      local rate=(math.abs(goal)>math.abs(x) and 6.8 or 5.8)/continuity
       local q=1-math.exp(-rate*dt);x=x+(goal-x)*q;state.velocity[k]=0
     else
       local vel=tonumber(state.velocity[k]) or 0
@@ -322,5 +355,5 @@ function A.root(id,motion)
     compression=(motion.brace or 0)*.020*residual,
   }
 end
-function A.status() return {version=10,vocabulary={"opening","sendout","recall","command","brace","concern","frustration","victory","defeat"},profiles=PROFILES,clock="game-time-from-fixed-step",sharedPlayerEnemy=true,statefulContinuity=true,sourceAuthority=true,sourcePoseBank="native-b1-coherent-clipfamilies",sourcePlayback="continuous-adjacent-b1-timeline",proceduralRoot="one-percent-continuity-only",randomVariation=false} end
+function A.status() return {version=12,vocabulary={"opening","sendout","recall","command","brace","concern","frustration","victory","defeat"},profiles=PROFILES,clock="game-time-from-fixed-step",sharedPlayerEnemy=true,statefulContinuity=true,sourceAuthority=true,sourcePoseBank="native-b1-dense-five-sample-clipfamilies",sourcePlayback="adjacent-authored-frame-interpolation",proceduralRoot="one-percent-continuity-only",randomVariation=false} end
 return A

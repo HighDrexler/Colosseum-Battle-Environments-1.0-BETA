@@ -286,6 +286,22 @@ function H.findArchives(blob)
   return out
 end
 
+-- Deep archive discovery for bounded one-time extraction jobs such as retail
+-- capture .fdat members. Normal trainer/arena paths intentionally keep the
+-- fast 64 KiB search in findArchives(); this variant may scan the full member.
+function H.findArchivesDeep(blob,maxBytes)
+  if type(blob)~="string" then return {} end
+  local out,seen={},{}
+  local limit=math.min(tonumber(maxBytes) or #blob,#blob)-0x20
+  if limit<0 then return out end
+  for base=0,limit,4 do
+    local a=archiveAt(blob,base)
+    if a and not seen[base] then seen[base]=true;out[#out+1]=a end
+  end
+  table.sort(out,function(a,b)return a.base<b.base end)
+  return out
+end
+
 function H.findArchive(blob)
   local archives=H.findArchives(blob)
   for _,a in ipairs(archives) do if a:publicSymbol("scene_data") then return a end end
@@ -1096,6 +1112,43 @@ function H.extractNativePose(model,clipIndex,frame,opts)
   for k,v in pairs(opts) do o[k]=v end
   o.nativePose={clip=tonumber(clipIndex) or 0,frame=tonumber(frame) or 0}
   return extractRoot(model.archive,model.root,o)
+end
+
+-- Enumerate every renderable HSD JOBJ model root in a source blob.
+-- Capture extraction uses this because the retail snatch_*.fdat member can
+-- contain several HSD roots: the physical ball is not guaranteed to be the
+-- largest root and is not guaranteed to live inside a Waza type-2 payload.
+function H.extractModels(blob,opts)
+  opts=opts or {}
+  if type(blob)~="string" then return nil,"HSD source is not bytes" end
+  local archives=H.findArchives(blob)
+  if #archives==0 and type(H.findArchivesDeep)=="function" then archives=H.findArchivesDeep(blob,#blob) end
+  if #archives==0 then return nil,"HSD archive not found" end
+  local out={};local rootCount=0;local lastBudget=nil
+  for _,a in ipairs(archives) do
+    local roots=opts.semanticRootsOnly
+      and semanticModelRoots(a,opts.maxRoots or 192)
+      or candidateRoots(a,opts.maxRoots or 192)
+    for ri,root in ipairs(roots) do
+      rootCount=rootCount+1
+      if type(opts.progress)=="function" and (ri==1 or ri%8==0) then pcall(opts.progress,ri,#roots) end
+      local model,why,stats=extractRoot(a,root,opts)
+      if why then lastBudget=why end
+      if model then
+        model.archive=a;model.root=root;model.stats=stats
+        model.semanticRootsOnly=opts.semanticRootsOnly==true
+        model.semanticRootCount=#roots
+        out[#out+1]=model
+      end
+    end
+  end
+  if #out==0 then
+    local suffix=lastBudget and ("; last guard="..tostring(lastBudget)) or ""
+    return nil,("no renderable HSD JOBJ models found (%d archive%s, %d candidate root%s%s)"):format(
+      #archives,#archives==1 and "" or "s",rootCount,rootCount==1 and "" or "s",suffix)
+  end
+  table.sort(out,function(a,b)return (tonumber(a.vertexCount) or 0)>(tonumber(b.vertexCount) or 0) end)
+  return out
 end
 
 function H.extractModel(blob,opts)

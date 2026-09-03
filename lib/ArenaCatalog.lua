@@ -13,6 +13,9 @@ local runtimeSelected=nil
 local pendingSelected=nil
 local boundBattle=nil
 local boundSelected=nil
+local boundResolved=nil
+local lastRandomResolved=nil
+local primedRandom=nil
 
 local DEFINITIONS={
   water={
@@ -21,7 +24,7 @@ local DEFINITIONS={
     pokemon={player={0,14.5},enemy={0,-14.5}},figureScale=0.40,
     trainers={player={13.2,25.8},enemy={-13.2,-25.8}},
     trainerScale={player=0.425,enemy=0.205},
-    camera={side=54,back=13,height=22,lookX=0,lookY=5.8,frameH=47},
+    camera={side=54,back=13,height=22,lookX=0,lookY=5.8,frameH=47,safe={minRadius=26,maxRadius=72,minY=6.5,maxY=31,maxPitch=24,minPitch=-10,minFov=31,maxFov=52}},
     backdrop={top={0.025,0.075,0.145},bottom={0.13,0.25,0.34}},
     profile="water",crowd="stadium",
   },
@@ -31,7 +34,7 @@ local DEFINITIONS={
     pokemon={player={-4.4,16.8},enemy={4.4,-16.8}},figureScale=0.335,
     trainers={player={10.8,24.8},enemy={-10.8,-24.8}},
     trainerScale={player=0.405,enemy=0.198},
-    camera={side=56,back=17,height=18.5,lookX=0,lookY=7.0,frameH=50},
+    camera={side=56,back=17,height=18.5,lookX=0,lookY=7.0,frameH=50,safe={minRadius=28,maxRadius=76,minY=7.0,maxY=30,maxPitch=23,minPitch=-9,minFov=31,maxFov=52}},
     backdrop={top={0.10,0.31,0.63},bottom={0.72,0.84,0.93}},
     profile="orre",crowd="source-hsd-exact",
   },
@@ -41,7 +44,7 @@ local DEFINITIONS={
     pokemon={player={-4.5,18.0},enemy={4.5,-18.0}},figureScale=0.365,
     trainers={player={14.0,29.5},enemy={-14.0,-29.5}},
     trainerScale={player=0.425,enemy=0.205},
-    camera={side=59,back=18,height=22,lookX=0,lookY=5.3,frameH=51},
+    camera={side=59,back=18,height=22,lookX=0,lookY=5.3,frameH=51,safe={minRadius=29,maxRadius=82,minY=7.0,maxY=34,maxPitch=25,minPitch=-10,minFov=31,maxFov=53}},
     backdrop={top={0.08,0.31,0.65},bottom={0.68,0.84,0.76}},
     profile="outdoor",crowd="none",
   },
@@ -51,7 +54,7 @@ local DEFINITIONS={
     pokemon={player={-4.8,17.5},enemy={4.8,-17.5}},figureScale=0.35,
     trainers={player={12.5,27.0},enemy={-12.5,-27.0}},
     trainerScale={player=0.405,enemy=0.198},
-    camera={side=58,back=17,height=20.5,lookX=0,lookY=6.3,frameH=51},
+    camera={side=58,back=17,height=20.5,lookX=0,lookY=6.3,frameH=51,safe={minRadius=29,maxRadius=78,minY=7.0,maxY=30,maxPitch=22,minPitch=-8,minFov=31,maxFov=52}},
     backdrop={top={0.43,0.64,0.82},bottom={0.72,0.84,0.93}},
     profile="realgam",crowd="source-hsd-exact",
   },
@@ -66,15 +69,35 @@ local DEFINITIONS={
     -- Slightly tighter and lower than the old survey-like framing so the deck,
     -- landmark pylons and first crater wall carry the shot while the skyline
     -- still clears both battlers.
-    camera={side=61,back=19,height=23.8,lookX=0,lookY=6.1,frameH=53.5},
+    camera={side=61,back=19,height=23.8,lookX=0,lookY=6.1,frameH=53.5,safe={minRadius=31,maxRadius=86,minY=7.5,maxY=35,maxPitch=25,minPitch=-10,minFov=31,maxFov=53}},
     -- Neutral fallback only; the extracted D2 HSD scene owns the real backdrop.
     backdrop={top={0.30,0.38,0.49},bottom={0.72,0.72,0.69}},
     profile="summit",crowd="none",
   },
 }
 
-local ORDER={"auto","water","orre_colosseum","realgam_colosseum","outdoor_wild","mt_battle_summit"}
-local VALID={auto=true,water=true,orre_colosseum=true,realgam_colosseum=true,outdoor_wild=true,mt_battle_summit=true}
+local ORDER={"auto","random","water","orre_colosseum","realgam_colosseum","outdoor_wild","mt_battle_summit"}
+local VALID={auto=true,random=true,water=true,orre_colosseum=true,realgam_colosseum=true,outdoor_wild=true,mt_battle_summit=true}
+
+local function randomDefinition()
+  local pool={}
+  for _,id in ipairs(ORDER) do
+    if id~="auto" and id~="random" then
+      local def=DEFINITIONS[id]
+      if def and def.ready then pool[#pool+1]=def end
+    end
+  end
+  if #pool==0 then return DEFINITIONS.water end
+  if #pool==1 then return pool[1] end
+  local candidates={}
+  for _,def in ipairs(pool) do
+    if def.id~=lastRandomResolved then candidates[#candidates+1]=def end
+  end
+  if #candidates==0 then candidates=pool end
+  local chosen=candidates[math.random(1,#candidates)]
+  lastRandomResolved=chosen.id
+  return chosen
+end
 
 local function saved(game)
   local save=game and game.save
@@ -89,6 +112,16 @@ local function ensurePrefs(game)
   local p=game.save.colosseumBattle
   if type(p)~="table" then p={};game.save.colosseumBattle=p end
   return p
+end
+
+-- Resolve the NEXT random arena before a battle object exists so Android can
+-- prewarm that exact scene off the battle-entry seam. The choice is consumed
+-- once when the next battle binds; it never changes during that battle.
+function C.primeRandom(game)
+  local selected=pendingSelected or (game and saved(game)) or runtimeSelected or "auto"
+  if selected~="random" or boundBattle then return nil end
+  if not primedRandom then primedRandom=randomDefinition() end
+  return primedRandom
 end
 
 
@@ -111,6 +144,7 @@ function C.order() return ORDER end
 function C.options()
   return {
     {id="auto",label="AUTO"},
+    {id="random",label="RANDOM"},
     {id="water",label="WATER COLOSSEUM"},
     {id="orre_colosseum",label="ORRE COLOSSEUM"},
     {id="realgam_colosseum",label="REALGAM COLOSSEUM"},
@@ -123,8 +157,10 @@ function C.setSelected(game,id)
   if not VALID[id] then id="auto" end
   runtimeSelected=id
   pendingSelected=id
+  if id~="random" then primedRandom=nil end
   local p=ensurePrefs(game)
   if p then p.arena=id end
+  if id=="random" then C.primeRandom(game) end
   -- Arena providers are acquired once at battle start. Never mutate a battle
   -- already in progress; stage the explicit choice so the NEXT acquire cannot
   -- be overwritten by an older battle.game.save snapshot.
@@ -162,10 +198,27 @@ function C.resolve(game,battle)
       boundSelected=pendingSelected or C.selected(game)
       runtimeSelected=boundSelected
       pendingSelected=nil
+      if boundSelected=="random" then
+        boundResolved=primedRandom or randomDefinition()
+        primedRandom=nil
+      else
+        boundResolved=nil
+      end
     end
     selected=boundSelected or "auto"
   else
     selected=C.selected(game)
+  end
+  if selected=="random" then
+    -- Random is chosen ONLY at the authoritative battle acquisition above.
+    -- Status/menu/prewarm calls without a battle must never consume RNG or alter
+    -- the no-repeat history, otherwise merely opening settings can change the
+    -- arena the next battle receives.
+    local def
+    if battle then def=boundResolved
+    else def=primedRandom or (lastRandomResolved and DEFINITIONS[lastRandomResolved]) or DEFINITIONS.water end
+    if not def or not def.ready then def=DEFINITIONS.water end
+    return def,selected
   end
   local wanted=selected
   if selected=="auto" then
@@ -180,12 +233,13 @@ function C.releaseBattle(battle)
   if not battle or boundBattle==battle then
     boundBattle=nil
     boundSelected=nil
+    boundResolved=nil
   end
 end
 
 function C.status(game,battle)
   local def,selected=C.resolve(game,battle)
-  return {enabled=C.enabled(game),selected=selected,resolved=def.id,cache=def.cache,runtimeSelected=runtimeSelected,pendingSelected=pendingSelected,boundSelected=boundSelected,boundBattle=boundBattle~=nil,definitions=DEFINITIONS}
+  return {enabled=C.enabled(game),selected=selected,resolved=def.id,cache=def.cache,runtimeSelected=runtimeSelected,pendingSelected=pendingSelected,boundSelected=boundSelected,boundResolved=boundResolved and boundResolved.id or nil,lastRandomResolved=lastRandomResolved,primedRandom=primedRandom and primedRandom.id or nil,boundBattle=boundBattle~=nil,definitions=DEFINITIONS}
 end
 
 return C

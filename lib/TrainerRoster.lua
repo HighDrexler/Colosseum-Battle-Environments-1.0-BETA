@@ -201,6 +201,39 @@ function R.modelFor(ctx)
   if generic then return generic,"generic:"..key end
   return nil,"generic-cache-missing:"..key
 end
+-- Return a tiny, ordered trainer working set that can be prepared before a
+-- battle exists. Rival choice is first because rival battles otherwise have to
+-- parse/upload the entire trainer cache on battle.started. AUTO enemy mode gets
+-- only the generic default archetype; class-specific models remain lazy so this
+-- does not turn mobile startup into an all-trainer VRAM preload.
+function R.prewarmPlan(game)
+  local ctx={game=game}
+  local p=prefs(ctx)
+  local out,seen={},{}
+  local function add(cfg,reason)
+    if not cfg then return end
+    local key=tostring(cfg.id or cfg.cache or cfg.label or "trainer")
+    if seen[key] then return end
+    seen[key]=true
+    out[#out+1]={config=cfg,reason=reason or "prewarm"}
+  end
+
+  local rivalChoice=R.normalizeChoice(p.rivalModel or "leaf","rival")
+  if rivalChoice~="off" then
+    add(indexEntry("rivals",rivalChoice) or catalogEntry(rivalChoice),"rival:"..rivalChoice)
+  end
+
+  local enemyChoice=R.normalizeChoice(p.enemyTrainerModel or (p.enemyTrainerModels==false and "off" or "auto"),"enemy")
+  if enemyChoice~="off" then
+    if enemyChoice~="auto" then
+      add(catalogEntry(enemyChoice),"enemy-forced:"..enemyChoice)
+    else
+      add(indexEntry("archetypes","default_m"),"generic:default_m")
+    end
+  end
+  return out
+end
+
 function R.available(id) return catalogEntry(id)~=nil end
 function R.coverage()
   local idx=loadIndex(); local archetypes,rivals,players,models=0,0,0,0

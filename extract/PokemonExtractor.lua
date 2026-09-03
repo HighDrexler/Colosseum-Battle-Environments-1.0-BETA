@@ -787,21 +787,62 @@ end
 -- One packed string per render group keeps the generated chunk tiny while
 -- preserving exactly the same 44-float vertex rows. PokemonActors expands the
 -- strings only after the cache chunk has loaded.
-local function packedVerticesLua(vertices)
-  local rows={}
-  for _,v in ipairs(vertices or {}) do
-    local row={v[1],v[2],v[3],v[4] or 0,v[5] or 0,v[6] or 0,v[7] or 1,v[8] or 0}
-    for slot=1,MORPH_SLOTS do
-      local at=6+slot*3
-      row[#row+1]=v[at+1] or v[1]
-      row[#row+1]=v[at+2] or v[2]
-      row[#row+1]=v[at+3] or v[3]
-    end
-    local parts={}
-    for i=1,STRIDE do parts[i]=num(row[i]) end
-    rows[#rows+1]=table.concat(parts,",")
+local function normalizedVertexRow(v)
+  local row={v[1],v[2],v[3],v[4] or 0,v[5] or 0,v[6] or 0,v[7] or 1,v[8] or 0}
+  for slot=1,MORPH_SLOTS do
+    local at=6+slot*3
+    row[#row+1]=v[at+1] or v[1]
+    row[#row+1]=v[at+2] or v[2]
+    row[#row+1]=v[at+3] or v[3]
   end
-  return q(table.concat(rows,"\n"))
+  return row
+end
+-- Emits the same "a,b,c\n..." blob as before, but writes each component
+-- straight into one buffer instead of building a per-vertex parts table and
+-- running table.concat once per vertex. A single Pokemon body is thousands of
+-- vertices and this runs for every species and every action page.
+local function packedVerticesLua(vertices)
+  local out,n={},0
+  local first=true
+  for _,v in ipairs(vertices or {}) do
+    local row=normalizedVertexRow(v)
+    if first then first=false else n=n+1;out[n]="\n" end
+    for i=1,STRIDE do
+      if i>1 then n=n+1;out[n]="," end
+      n=n+1;out[n]=num(row[i])
+    end
+  end
+  return q(table.concat(out,"",1,n))
+end
+local unpackArgs=table.unpack or unpack
+-- Batched exactly like RuntimeMeshCache.packRows: one love.data.pack call and
+-- one intermediate string per 64 vertices instead of per vertex. Identical
+-- output bytes.
+local RUNTIME_PACK_BATCH=64
+local function runtimeVerticesBytes(vertices)
+  if not (love and love.data and type(love.data.pack)=="function") then return nil end
+  vertices=vertices or {}
+  local count=#vertices
+  if count==0 then return nil end
+  local rowFmt=string.rep("f",STRIDE)
+  local batchFmt=string.rep(rowFmt,RUNTIME_PACK_BATCH)
+  local buf={}
+  local chunks,chunkCount={},0
+  local i=1
+  while i<=count do
+    local take=count-i+1;if take>RUNTIME_PACK_BATCH then take=RUNTIME_PACK_BATCH end
+    local k=0
+    for r=i,i+take-1 do
+      local row=normalizedVertexRow(vertices[r])
+      for j=1,STRIDE do k=k+1;buf[k]=row[j] end
+    end
+    local ok,bytes=pcall(love.data.pack,"string",
+      take==RUNTIME_PACK_BATCH and batchFmt or string.rep(rowFmt,take),unpackArgs(buf,1,k))
+    if not ok or type(bytes)~="string" then return nil end
+    chunkCount=chunkCount+1;chunks[chunkCount]=bytes
+    i=i+take
+  end
+  return table.concat(chunks,"",1,chunkCount)
 end
 
 local function appendPackedActionGroups(out,model)
@@ -842,7 +883,24 @@ local function actionPayloadLua(a)
   return table.concat(out)
 end
 
-local function cacheLua(stem,dex,model,texturePaths,clip,clipCount,frameSpacing,attached,sourceName,decodeMode,actionRefs)
+local function metadataCacheLua(metadata)
+  if type(metadata)~="table" then return nil end
+  local out={"-- Compact PKX runtime metadata generated from the user's GC6E01 disc.\nreturn {revision=1,bodyMap={"}
+  local keys={"origin","mouth","chest","tail","eye_left","eye_right","hand_left","hand_right","additional_1","additional_2","additional_3","additional_4","foot_left","foot_right","center","additional_5"}
+  for _,key in ipairs(keys) do out[#out+1]="["..q(key).."]="..tostring(tonumber(metadata.bodyMap and metadata.bodyMap[key]) or -1).."," end
+  out[#out+1]="},slots={"
+  local slotKeys={"idle","statusA","physicalA","physicalB","physicalC","physicalD","statusB","physicalE","damage","damageHeavy","faint","idleB","specialC","idleC","idleD","idleE","takeFlight"}
+  for _,key in ipairs(slotKeys) do
+    local slot=metadata.slots and metadata.slots[key]
+    if type(slot)=="table" then
+      out[#out+1]="["..q(key).."]={animationIndex="..tostring(tonumber(slot.animationIndex) or -1)..",duration="..num(slot.duration or 0).."},"
+    end
+  end
+  out[#out+1]="}}\n"
+  return table.concat(out)
+end
+
+local function cacheLua(stem,dex,model,texturePaths,clip,clipCount,frameSpacing,attached,sourceName,decodeMode,actionRefs,runtimeBins,runtimeStamp)
   local b=model.bounds
   local out={
     "-- Generated locally from the user's own Pokemon Colosseum GC6E01 disc.\n",
@@ -887,6 +945,9 @@ local function cacheLua(stem,dex,model,texturePaths,clip,clipCount,frameSpacing,
     "jointPositions=",jointLua(model.jointPositions),",jointFrames=",jointFramesLua(model.jointFrames),",\n",
     "groups={\n",
   }
+  if runtimeBins then
+    table.insert(out,3,"runtimeMeshVersion=1,stamp="..q(runtimeStamp or "")..",\n")
+  end
   for gi,g in ipairs(model.groups) do
     out[#out+1]="{material="..q("pkx_group_"..gi)
     local tp=texturePaths[gi]
@@ -903,7 +964,11 @@ local function cacheLua(stem,dex,model,texturePaths,clip,clipCount,frameSpacing,
     out[#out+1]=",renderFlags="..tostring(g.renderFlags or 0)
     out[#out+1]=",shadow="..tostring(g.shadow==true)..",effect="..tostring(g.effect==true)
     out[#out+1]=",textureSlot="..tostring(g.textureSlot or -1)
-    out[#out+1]=",vertexStride="..tostring(STRIDE)..",verticesPacked="..packedVerticesLua(g.vertices).."},\n"
+    if runtimeBins and runtimeBins[gi] then
+      out[#out+1]=",vertexStride="..tostring(STRIDE)..",runtimeBin="..q(runtimeBins[gi]).."},\n"
+    else
+      out[#out+1]=",vertexStride="..tostring(STRIDE)..",verticesPacked="..packedVerticesLua(g.vertices).."},\n"
+    end
   end
   out[#out+1]="},\nactions={\n"
   for _,key in ipairs(ACTION_ORDER) do
@@ -1284,16 +1349,49 @@ function P.extractSpecies(mod,disc,dex,opts)
     end
   end
 
+  local metadataPath=("cache/pokemon/%d/metadata_v1.lua"):format(dex)
+  local metadataLua=metadataCacheLua(metadata)
+  if metadataLua then write(mod,metadataPath,metadataLua,generated) end
   write(mod,cachePath,cacheLua(stem,dex,base,texturePaths,clip,clipCount or 0,spacing,attached,sourceName,decodeMode,actionRefs),generated)
+
+  -- Runtime-ready float32 sidecars are emitted while the freshly decoded HSD
+  -- vertex tables are already in memory. On Android this avoids serializing the
+  -- exact same geometry to CSV and immediately reparsing thousands of tonumber
+  -- calls before the first visible send-out. The textual cache remains the
+  -- canonical/fail-open source on hosts without love.data.pack.
+  local runtimePaths={}
+  local runtimeBins={}
+  local runtimeOK=love and love.data and type(love.data.pack)=="function"
+  if runtimeOK then
+    for gi,g in ipairs(base.groups or {}) do
+      local bytes=runtimeVerticesBytes(g.vertices)
+      local path=("cache/pokemon/%d/runtime_mesh_v1/base_%02d.f32"):format(dex,gi)
+      if not bytes then runtimeOK=false;break end
+      local okWrite=write(mod,path,bytes,generated)
+      if okWrite==false then runtimeOK=false;break end
+      runtimeBins[gi]=path;runtimePaths[#runtimePaths+1]=path
+    end
+  end
+  local stamp=P.stamp({skinFix=currentSkinFix,renderPassFilter=currentRenderPassFilter,decodeMode=decodeMode})
+  if runtimeOK and #runtimeBins==#(base.groups or {}) and #runtimeBins>0 then
+    local runtimeMeta=("cache/pokemon/%d/runtime_mesh_v1/base.lua"):format(dex)
+    write(mod,runtimeMeta,cacheLua(stem,dex,base,texturePaths,clip,clipCount or 0,spacing,attached,sourceName,decodeMode,actionRefs,runtimeBins,stamp),generated)
+    runtimePaths[#runtimePaths+1]=runtimeMeta
+    trail[#trail+1]="runtime mesh sidecar: READY (direct float32 upload)"
+  else
+    trail[#trail+1]="runtime mesh sidecar: deferred to first runtime materialization"
+  end
   write(mod,diagPath,table.concat(trail,"\n").."\n",generated)
 
   -- Written LAST, after every other artifact for this species has landed. A
   -- crash mid-extract therefore leaves an unstamped cache, which isCached
   -- rejects -- so a half-written species rebuilds instead of rendering broken.
   local revPath=P.revPath(dex)
-  write(mod,revPath,P.stamp({skinFix=currentSkinFix,renderPassFilter=currentRenderPassFilter,decodeMode=decodeMode}),generated)
+  write(mod,revPath,stamp,generated)
 
   local written={cachePath,diagPath,revPath}
+  for _,path in ipairs(runtimePaths) do written[#written+1]=path end
+  if metadataLua then written[#written+1]=metadataPath end
   for _,path in ipairs(actionPaths) do written[#written+1]=path end
   local seenTex={}
   for _,tp in pairs(texturePaths) do

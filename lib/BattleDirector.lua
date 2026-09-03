@@ -130,14 +130,15 @@ function D:event(ctx,name,payload)
   end
   local b=battleOf(ctx)
   local gen2=b and b.__cbeGeneration==2
-  local queueSync=gen2 and b.__cbePresentationQueueSync==true
+  local queueSync=b and b.__cbePresentationQueueSync==true
   -- 1.5.32: presentation is battle-flow authoritative, never text/input
   -- authoritative. Gold's presentation_* rows are emitted later when the UI
   -- queue is consumed, and A/B can advance that queue. Treat those rows as
   -- visual-suppression bookkeeping only and drive the director from the
   -- resolved battle semantics immediately. This makes camera/actors/trainers
   -- deterministic regardless of how quickly the player pages text.
-  if queueSync and (name=="battle.move_used" or name=="battle.damage_dealt" or name=="battle.fainted") then return end
+  if queueSync and ((gen2 and (name=="battle.move_used" or name=="battle.damage_dealt" or name=="battle.fainted"))
+      or ((not gen2) and name=="battle.fainted")) then return end
   local semantic=name
   if name=="battle.presentation_damage" then semantic="battle.damage_dealt"
   elseif name=="battle.presentation_faint" then semantic="battle.fainted" end
@@ -241,7 +242,7 @@ function D:bindAttack(ctx,side,moveId,move,duration,fxSpec,wazaTimingPoints,pres
         local okStart,inst=pcall(WazaSequence.start,WazaSequence,ctx,side,fxSpec,{
           role="attack",target=seq.target,moveId=seq.moveId,move=seq.move,startedAt=seq.startedAt,
           globalTimingPoints=seq.wazaTimingPoints,presentationFrames=seq.presentationFrames,
-          animationSlot=seq.animationSlot,animationName=seq.animationName})
+          animationSlot=seq.animationSlot,animationName=seq.animationName,presentationSerial=seq.serial})
         if okStart and type(inst)=="table" then seq.wazaAttackSerial=inst.serial end
       end
     end
@@ -259,12 +260,16 @@ function D:bindDamage(ctx,attacker,target,fxSpec,moveId,move,wazaTimingPoints,pr
   end
   local okHas,has=pcall(WazaSequence.hasTimeline,WazaSequence,fxSpec,"damage")
   if not okHas or not has then return nil,"no damage Waza timeline" end
-  -- Missing PKX timing points are an explicit Waza timing fallback, not a
-  -- reason to split the presentation into an unrelated direct GPT1 path.
+  -- Damage is the impact chapter of the SAME move presentation session. Keep
+  -- the BattleDirector serial on both Waza instances so camera/effect handlers
+  -- can cross the attack -> impact seam without behaving like unrelated moves.
+  local seq=state.moves[attacker]
   local okStart,inst,why=pcall(WazaSequence.start,WazaSequence,ctx,attacker,fxSpec,{
     role="damage",target=target,moveId=moveId,move=move,globalTimingPoints=wazaTimingPoints,
-    presentationFrames=tonumber(presentationFrames) or 0})
+    presentationFrames=tonumber(presentationFrames) or 0,
+    presentationSerial=seq and seq.serial or nil,parentAttackSerial=seq and seq.wazaAttackSerial or nil})
   if not okStart or type(inst)~="table" then return nil,tostring(okStart and why or inst) end
+  if seq then seq.wazaDamageSerial=inst.serial end
   return inst
 end
 
@@ -313,7 +318,7 @@ function D:status()
   local function brief(seq)
     if not seq then return nil end
     return {serial=seq.serial,moveId=seq.moveId,phase=phaseFor(seq),duration=seq.attackDuration,
-      fxStyle=seq.fxStyle,fxStarted=seq.fxStarted,wazaAttackSerial=seq.wazaAttackSerial,impactAt=seq.impactAt and (seq.impactAt-state.time) or nil}
+      fxStyle=seq.fxStyle,fxStarted=seq.fxStarted,wazaAttackSerial=seq.wazaAttackSerial,wazaDamageSerial=seq.wazaDamageSerial,impactAt=seq.impactAt and (seq.impactAt-state.time) or nil}
   end
   return {version=2,clock="game-time",time=state.time,lastEvent=state.lastEvent,
     player=brief(state.moves.player),enemy=brief(state.moves.enemy),prefetch=state.prefetch}

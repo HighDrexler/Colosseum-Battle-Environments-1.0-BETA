@@ -1,6 +1,6 @@
 local V=...
 local HSD,FSYS=V and V.HSD,V and V.FSYS
-local A={arenaRevision=8}
+local A={arenaRevision=9}
 local floor,abs,sin,cos=math.floor,math.abs,math.sin,math.cos
 local SPECS={
   ["cache/stages/d2_crater/textures/tex_0f4120_128x128_f14.rgba"]={128,128,"metal"},
@@ -133,8 +133,21 @@ local function vec(v)
   if type(v)~="table" then return nil end
   local o={"{"};for i=1,#v do if i>1 then o[#o+1]="," end;o[#o+1]=num(v[i]) end;o[#o+1]="}";return table.concat(o)
 end
+-- Append a vector straight into the output buffer. vec() built a throwaway
+-- table and ran table.concat for EVERY vertex of an arena; at hundreds of
+-- thousands of vertices per venue that dominated the write stage's garbage.
+-- Produces exactly the same characters as vec().
+local function vecInto(out,n,v)
+  n=n+1;out[n]="{"
+  for i=1,#v do
+    if i>1 then n=n+1;out[n]="," end
+    n=n+1;out[n]=num(v[i])
+  end
+  n=n+1;out[n]="}"
+  return n
+end
 local function serializeSourceArena(model,source,crowdOriginal)
-  local out={"-- Generated from the user-supplied Pokemon Colosseum GC6E01 disc.\nreturn {version=31,source=",string.format("%q",source),",prototype=false,"}
+  local out={"-- Generated from the user-supplied Pokemon Colosseum GC6E01 disc.\nreturn {version=32,source=",string.format("%q",source),",prototype=false,"}
   local b=model.bounds or {};out[#out+1]="bounds={min="..(vec(b.min) or "{0,0,0}")..",max="..(vec(b.max) or "{0,0,0}").."},"
   out[#out+1]="groupCount="..tostring(#(model.groups or {}))..",vertexCount="..tostring(tonumber(model.vertexCount) or 0)..","
   out[#out+1]="crowdOriginal="..tostring(crowdOriginal or 0)..",crowdPolicy="..string.format("%q",model.crowdPolicy or "source-hsd-crowd")..",groups={\n"
@@ -152,8 +165,9 @@ local function serializeSourceArena(model,source,crowdOriginal)
     if g.specular then out[#out+1]="specular="..vec(g.specular).."," end
     if g.shininess then out[#out+1]="shininess="..num(g.shininess).."," end
     out[#out+1]="vertices={"
-    for _,v in ipairs(g.vertices or {}) do out[#out+1]=vec(v).."," end
-    out[#out+1]="}},\n"
+    local n=#out
+    for _,v in ipairs(g.vertices or {}) do n=vecInto(out,n,v);n=n+1;out[n]="," end
+    n=n+1;out[n]="}},\n"
   end
   out[#out+1]="}}\n";return table.concat(out)
 end
@@ -240,23 +254,44 @@ local function buildSourceArenaFromDisc(mod,disc,progress,generated,spec)
   return {groups=#model.groups,vertices=model.vertexCount,source=source,textures=textureCount,crowdOriginal=crowdOriginal}
 end
 function A.repair(mod,disc,progress,generated)
-  -- 1.5.55 arena migration: rebuild only the venues whose extraction contract
-  -- changed. Water, Wildlands and the already full-distance Mt. Battle cache are
-  -- preserved. Orre T1 + Realgam D4 are regenerated from the complete HSD scene
-  -- so their distant architecture is no longer thrown away by a compact radius.
+  -- 1.7.17 parity migration: refresh every disc-backed venue through the
+  -- current HSD/material serializer, then materialize the current authored
+  -- Wildlands recipe. Earlier incremental migrations preserved older Water,
+  -- Mt. Battle and Wildlands caches, so presentation fixes could fail to reach
+  -- an otherwise healthy existing install.
+  local sourceIndexes={1,2,3,5}
+  local total=#sourceIndexes+1
   local report={"return {revision="..tostring(A.arenaRevision)..","}
-  progress("PRESERVING WATER / WILDLANDS / MT. BATTLE",0,3)
-  for step,index in ipairs({2,3}) do
+  progress("ARENA PARITY REFRESH",0,total)
+  for step,index in ipairs(sourceIndexes) do
     local arena=ARENAS[index]
-    progress((arena.label or arena.id).." / FULL SOURCE HSD",step,3)
+    progress((arena.label or arena.id).." / FULL SOURCE HSD",step-1,total)
     local value=buildSourceArenaFromDisc(mod,disc,progress,generated,arena)
     report[#report+1]=string.format("%s={cache=%q,groups=%d,vertices=%d,source=%q,textures=%d},",
       arena.id,arena.cache,tonumber(value.groups) or 0,tonumber(value.vertices) or 0,
       tostring(value.source or "GC6E01 source"),tonumber(value.textures) or 0)
   end
-  report[#report+1]="preserved={water=true,outdoor_wild=true,mt_battle_summit=true},}\n"
+  local wild=ARENAS[4]
+  progress("ORRE WILDLANDS / AUTHORED PARITY",#sourceIndexes,total)
+  local keys={}
+  for path in pairs(SPECS) do
+    if path:find("cache/stages/wildlands/",1,true) then keys[#keys+1]=path end
+  end
+  table.sort(keys)
+  for _,path in ipairs(keys) do
+    local sp=SPECS[path]
+    write(mod,path,textureBytes(mod,path,sp),generated)
+  end
+  local src=assert(mod:read(wild.recipe),"missing arena recipe: "..wild.recipe)
+  local chunk,err=load(src,"@"..wild.recipe);assert(chunk,err)
+  local ok,recipe=pcall(chunk);assert(ok,recipe)
+  assert(type(recipe)=="table" and type(recipe.groups)=="table" and #recipe.groups>0,"invalid arena recipe: "..wild.id)
+  write(mod,wild.cache,src,generated)
+  report[#report+1]=string.format("%s={cache=%q,groups=%d,vertices=%d,source=%q,textures=%d},",
+    wild.id,wild.cache,#recipe.groups,tonumber(recipe.vertexCount) or 0,tostring(recipe.source or "recipe"),#keys)
+  report[#report+1]="}\n"
   write(mod,"build/arena_repair.lua",table.concat(report),generated)
-  progress("ORRE / REALGAM FULL-DISTANCE SOURCE REBUILD READY",3,3)
+  progress("ARENA PARITY REFRESH READY",total,total)
   return true
 end
 function A.run(mod,disc,progress,generated)

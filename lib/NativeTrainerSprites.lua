@@ -32,17 +32,34 @@ local function suppress(battle)
   return battle.kind=="trainer" or battle.kind=="wild"
 end
 
-local function providerVisible(provider,battle)
+local function providerVisible(provider,battle,side)
   if not (provider and type(provider.shouldRender)=="function") then return false end
   local ok,value=pcall(provider.shouldRender,provider,{battle=battle,game=battle and battle.game})
-  return ok and value==true
+  if not (ok and value==true) then return false end
+  -- shouldRender is a capability prediction; native art must only disappear
+  -- after the actual 3D actor has loaded and entered this battle. Also consult
+  -- Arena's last trainer draw fault: a shader/backend error can occur AFTER the
+  -- scene reports ready. In that case the next native frame must fail open
+  -- instead of keeping an empty trainer slot forever.
+  local arena=V and V.Arena
+  if arena and type(arena.status)=="function" then
+    local aok,ast=pcall(arena.status,arena)
+    local errors=aok and type(ast)=="table" and ast.renderErrors or nil
+    local key=side=="player" and "playerTrainer" or "enemyTrainer"
+    if type(errors)=="table" and errors[key] then return false end
+  end
+  if type(provider.status)=="function" then
+    local sok,st=pcall(provider.status,provider)
+    if sok and type(st)=="table" then return st.active==true and st.ready==true end
+  end
+  return false
 end
 
 local function trainerMask(battle)
   battle=presentation(battle)
   if not suppress(battle) then return false,false end
-  local hidePlayer=battle.showPlayerBack and providerVisible(PlayerTrainer,battle) or false
-  local hideEnemy=battle.showEnemyTrainer and providerVisible(Trainer,battle) or false
+  local hidePlayer=battle.showPlayerBack and providerVisible(PlayerTrainer,battle,"player") or false
+  local hideEnemy=battle.showEnemyTrainer and providerVisible(Trainer,battle,"enemy") or false
   return hidePlayer,hideEnemy
 end
 
@@ -130,7 +147,7 @@ function N.status()
     active=N.activeBattle~=nil,
     error=N.error,
     installs=N.installs,
-    scope="capability-driven-native-trainer-picture-only; stock-hud-fails-open",
+    scope="ready-and-active-3d-trainer-only; runtime-cache-failure-keeps-native-trainer-art",
   }
 end
 return N

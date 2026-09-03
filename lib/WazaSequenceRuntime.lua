@@ -1,8 +1,8 @@
 local V=...
 local MoveFXVM=V and V.MoveFXVM
 local W={
-  version=4,
-  source="GC6E01 WazaSequence dependency-timed 60 Hz entry lifecycle scheduler",
+  version=6,
+  source="GC6E01 exact-node-offset dependency-timed 60 Hz Waza lifecycle scheduler",
   handlers={},active={},serial=0,trace={},errors={},last=nil,
 }
 
@@ -28,20 +28,33 @@ end
 
 local function phaseEntries(spec,role)
   local out={}
+  local runtimePhase=0
   for _,phase in ipairs(type(spec)=="table" and (spec.wazaPhases or {}) or {}) do
     if roleForPhase(phase.name)==role then
+      runtimePhase=runtimePhase+1
+      local namespace=runtimePhase*100000
       for _,entry in ipairs(phase.entries or {}) do
         local copy={}
         for k,v in pairs(entry) do copy[k]=v end
         copy.phase=copy.phase or phase.name
         copy.rawPath=copy.rawPath or phase.rawPath
+        -- WZX entry identifiers are local to each source phase. Curated moves
+        -- can legitimately layer attack + sp1 (Ember is one), so timing anchors
+        -- must be namespaced for the scheduler while the original identifier is
+        -- preserved for GPT1/model handler matching and diagnostics.
+        local sourceId=tonumber(copy.identifier) or tonumber(copy.index) or (#out+1)
+        local sourceAnchor=math.floor(tonumber(copy.anchorEntry) or 0)
+        copy.runtimeIdentifier=namespace+sourceId
+        copy.runtimeAnchorEntry=sourceAnchor>0 and (namespace+sourceAnchor) or 0
+        copy.runtimePhaseOrder=runtimePhase
         out[#out+1]=copy
       end
     end
   end
-  -- Source identifiers are the dependency graph. Do not sort by old CBE timing
-  -- aliases: +0x10/+0x14/+0x18 are anchor-entry/point selectors, not frames.
   table.sort(out,function(a,b)
+    local ap=tonumber(a.runtimePhaseOrder) or 0
+    local bp=tonumber(b.runtimePhaseOrder) or 0
+    if ap~=bp then return ap<bp end
     local ai=tonumber(a.identifier) or tonumber(a.index) or 0
     local bi=tonumber(b.identifier) or tonumber(b.index) or 0
     if ai~=bi then return ai<bi end
@@ -86,8 +99,8 @@ end
 local function resolveEntryStarts(entries,globalTimingPoints)
   local byId={}; local rows={}; local unresolved=0; local minStart=math.huge; local maxStart=0
   for _,entry in ipairs(entries or {}) do
-    local id=tonumber(entry.identifier) or tonumber(entry.index) or (#rows+1)
-    local anchor=math.floor(tonumber(entry.anchorEntry) or 0)
+    local id=tonumber(entry.runtimeIdentifier) or tonumber(entry.identifier) or tonumber(entry.index) or (#rows+1)
+    local anchor=math.floor(tonumber(entry.runtimeAnchorEntry) or tonumber(entry.anchorEntry) or 0)
     local localIdx=pointIndex(entry.localPoint)
     local anchorIdx=pointIndex(entry.anchorPoint)
     local localValue=entryPoint(entry,localIdx) or 0
@@ -297,6 +310,7 @@ function W:start(ctx,side,spec,opts)
     serial=self.serial,ctx=ctx,side=side,target=opts.target or (side=="player" and "enemy" or "player"),
     role=role,spec=spec,moveId=opts.moveId,move=opts.move,age=0,frame=0,accumulator=0,
     entries={},done=false,cancelled=false,startedAt=opts.startedAt,
+    presentationSerial=opts.presentationSerial,parentAttackSerial=opts.parentAttackSerial,
     globalTimingPoints=opts.globalTimingPoints,timing=timing,
   }
   for _,row in ipairs(resolved) do
@@ -358,7 +372,7 @@ function W:status()
   local active={}
   for _,inst in ipairs(self.active) do
     active[#active+1]={serial=inst.serial,side=inst.side,target=inst.target,role=inst.role,frame=inst.frame,
-      entries=#inst.entries,sourceEndFrame=inst.sourceEndFrame,moveId=inst.moveId,
+      entries=#inst.entries,sourceEndFrame=inst.sourceEndFrame,moveId=inst.moveId,presentationSerial=inst.presentationSerial,parentAttackSerial=inst.parentAttackSerial,
       timingShift=inst.timing and inst.timing.shift or 0,unresolvedTiming=inst.timing and inst.timing.unresolved or 0}
   end
   return {version=self.version,source=self.source,active=active,handlerKinds=(function()

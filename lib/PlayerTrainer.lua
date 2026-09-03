@@ -5,70 +5,23 @@ local mod, Mat4, TrainerRig = V.mod, V.Mat4, V.TrainerRig
 local TrainerPerformance=V.TrainerPerformance
 local BattleSides=V.BattleSides
 local TrainerRoster=V.TrainerRoster
+local TrainerMorph=V.TrainerMorph
 local P = {}
 
-local FORMAT = {
-  {"VertexPosition","float",3},
-  {"VertexTexCoord","float",2},
-  {"VertexNormal","float",3},
-  {"BreathPosition","float",3},
-  {"LookPosition","float",3},
-  {"ArmPosition","float",3},
-  {"ShiftPosition","float",3},
-  {"SettlePosition","float",3},
-  {"CommandPosition","float",3},
-  {"BracePosition","float",3},
-  {"ArmWeight","float",1},
-}
-local VERTEX=[[
-uniform mat4 vp; uniform mat4 model;
-uniform float breathMix; uniform float lookMix; uniform float armMix;
-uniform float shiftMix; uniform float settleMix;
-uniform float commandMix; uniform float braceMix;
-uniform float sourcePoseGain;
-attribute vec3 VertexNormal;
-attribute vec3 BreathPosition;
-attribute vec3 LookPosition;
-attribute vec3 ArmPosition;
-attribute vec3 ShiftPosition;
-attribute vec3 SettlePosition;
-attribute vec3 CommandPosition;
-attribute vec3 BracePosition;
-varying vec3 worldPos; varying vec3 worldNormal;
+local function platformOS()
+  if love and love.system and type(love.system.getOS)=="function" then
+    local ok,v=pcall(love.system.getOS);if ok and v then return tostring(v) end
+  end
+  return "Unknown"
+end
+local WINDOWS_RUNTIME=platformOS()=="Windows"
 
-
-vec4 position(mat4 transform_projection, vec4 vertex_position) {
-  vec3 base = vertex_position.xyz;
-  vec3 p = base;
-  // Source-performance compositor: large body poses are mutually normalized.
-  // This prevents anticipation/release/recovery targets from stacking into an
-  // anatomically impossible action-figure silhouette.
-  /* The source morphs are intentionally treated as pose guides rather than
-     100% rigid limb targets.  Colosseum's animation reads from whole-body
-     silhouette/weight transfer; overdriving these hard-skinned targets is what
-     made elbows and shoulders look like an action figure. */
-  // Keep Red's source-weighted morphs readable without letting arm targets
-  // overpower the hips/shoulders and turn him back into a hinged action figure.
-  float wa=max(armMix,0.0)*1.00*sourcePoseGain, ws=max(shiftMix,0.0)*0.96*sourcePoseGain, wt=max(settleMix,0.0)*0.90*sourcePoseGain;
-  float wc=max(commandMix,0.0)*1.00*sourcePoseGain, wb=max(braceMix,0.0)*0.96*sourcePoseGain;
-  float sum=wa+ws+wt+wc+wb;
-  // Native B1 source poses now own decisive gestures. Keep a small ceiling so
-  // interpolation/recovery remains smooth, but do not reduce them to pose hints.
-  float action=clamp(sum,0.0,0.84);
-  if (sum>0.0001) {
-    vec3 target=(ArmPosition*wa+ShiftPosition*ws+SettlePosition*wt+
-                 CommandPosition*wc+BracePosition*wb)/sum;
-    p=mix(base,target,action);
-  }
-  // Breath and look are tiny secondary motion and fade almost completely
-  // during decisive source-style battle gestures.
-  float secondary=1.0-action*0.92;
-  p+=(BreathPosition-base)*breathMix*secondary;
-  p+=(LookPosition-base)*lookMix*secondary;
-  vec3 n = VertexNormal;
-  vec4 world=model*vec4(p,1.0); worldPos=world.xyz;
-  worldNormal=normalize((model*vec4(normalize(n),0.0)).xyz); return vp*world;
-}]]
+-- Shared with Trainer.lua via TrainerMorph so the player and enemy actors
+-- cannot drift apart. DENSE is the unchanged 44-float cache layout.
+local FORMAT=TrainerMorph.DENSE_FORMAT
+local FORMAT_COMPACT=TrainerMorph.COMPACT_FORMAT
+local DENSE_MESH=TrainerMorph.dense()
+local VERTEX=TrainerMorph.VERTEX
 local PIXEL=[[
 uniform vec3 cameraEye; uniform vec4 tintColor; uniform vec4 materialColor; uniform float useTexture; uniform float unlit; uniform float opacity;
 varying vec3 worldPos; varying vec3 worldNormal;
@@ -125,7 +78,7 @@ local CAPTURE_TARGET_X,CAPTURE_TARGET_Z=0,-14.5
 -- Reference-timed Colosseum capture sequence (real presentation seconds).
 -- Gameplay/catch odds remain 100% engine-owned; only the visible choreography
 -- runs on this wall clock so Gen1Recomp fast-forward cannot delete the shakes.
-local CAPTURE_T={charge=.76,throw=1.72,impact=.52,absorb=1.72,fall=1.12,settle=.42,shake=.88,outcome=1.02}
+local CAPTURE_T={charge=.62,throw=1.30,impact=.34,absorb=1.28,fall=.82,settle=.36,shake=.90,outcome=1.08}
 local function captureMilestones(shakes)
   local a=CAPTURE_T.charge
   local b=a+CAPTURE_T.throw
@@ -191,13 +144,17 @@ local function sourceBallAsset(phase)
   local idx=loadCaptureAssetIndex();if not idx then return nil end
   local id=captureBallId(capture and capture.ball)
   local row=idx.balls and idx.balls[id];local phases=row and row.phases
-  if not phases then return nil end
+  -- A cache row is source-backed only when extraction explicitly proved and
+  -- locked the retail model. Never interpret an unresolved/fallback row as a
+  -- Colosseum source asset on Android.
+  if not (row and row.sourceReady==true and row.fallback~=true and row.staticSource==true and phases) then return nil end
   local key=(phase=="shake" and "shake")
     or ((phase=="fall" or phase=="settle" or phase=="caught") and "land")
     or (phase=="breakout" and "miss") or "throw"
   return phases[key] or phases.shake, id, key
 end
 local function sourceAssetFrame(asset,phase,u,bp)
+  if asset and asset.staticSource==true then return 0 end
   local a=asset and asset.animation or nil
   local finish=math.max(0,tonumber(a and a.endFrame) or 0)
   if finish<=0 then return 0 end
@@ -247,10 +204,13 @@ local function imageFromRaw(spec)
   return img
 end
 local function shadowVertex(x,y,z,u,v)
+  if not DENSE_MESH then return TrainerMorph.staticCompactVertex(x,y,z,u,v,0,1,0) end
   -- Same base position is supplied for every morph stream. Shadows never
-  -- morph, but the mesh must still satisfy the GPU-safe 10-attribute format.
+  -- morph, but the mesh must still satisfy the mobile-safer dense source format.
   return {x,y,z,u,v,0,1,0,
-    x,y,z, x,y,z, x,y,z, x,y,z, x,y,z, x,y,z, x,y,z, 0}
+    x,y,z, x,y,z,
+    x,y,z, x,y,z, x,y,z, x,y,z, x,y,z,
+    x,y,z, x,y,z, x,y,z, x,y,z, x,y,z}
 end
 local function ensureShadow()
   if shadowImage and shadowMesh then return true end
@@ -261,12 +221,15 @@ local function ensureShadow()
   end end
   shadowImage=love.graphics.newImage(data);shadowImage:setFilter("linear","linear")
   local verts={shadowVertex(-2.2,.035,-1.05,0,0),shadowVertex(2.2,.035,-1.05,1,0),shadowVertex(2.2,.035,1.05,1,1),shadowVertex(-2.2,.035,-1.05,0,0),shadowVertex(2.2,.035,1.05,1,1),shadowVertex(-2.2,.035,1.05,0,1)}
-  shadowMesh=love.graphics.newMesh(FORMAT,verts,"triangles","static");shadowMesh:setTexture(shadowImage);return true
+  shadowMesh=love.graphics.newMesh(DENSE_MESH and FORMAT or FORMAT_COMPACT,verts,"triangles","static");shadowMesh:setTexture(shadowImage);return true
 end
 
 local function ballVertex(x,y,z,u,v)
+  if not DENSE_MESH then return TrainerMorph.staticCompactVertex(x,y,z,u,v,0,1,0) end
   return {x,y,z,u,v,0,1,0,
-    x,y,z, x,y,z, x,y,z, x,y,z, x,y,z, x,y,z, x,y,z, 0}
+    x,y,z, x,y,z,
+    x,y,z, x,y,z, x,y,z, x,y,z, x,y,z,
+    x,y,z, x,y,z, x,y,z, x,y,z, x,y,z}
 end
 local function sphereBand(y0,y1,r,segments)
   local out={}
@@ -305,7 +268,7 @@ local function ensureBall()
     end
     local eq=sphereBand(-.105,.105,1.025,18);for _,v in ipairs(eq) do black[#black+1]=v end
     local function make(vs)
-      local m=love.graphics.newMesh(FORMAT,vs,"triangles","static")
+      local m=love.graphics.newMesh(DENSE_MESH and FORMAT or FORMAT_COMPACT,vs,"triangles","static")
       m:setTexture(ballTexture)
       return m
     end
@@ -348,7 +311,7 @@ local function redStrapRelief(v)
   local dz=.060+.120*crown+.025*shoulder
   -- Apply the same offset to base + every morph position so the strap keeps its
   -- original authored animation relationship instead of swimming on the body.
-  for _,base in ipairs({1,9,12,15,18,21,24,27}) do
+  for _,base in ipairs({1,9,12,15,18,21,24,27,30,33,36,39,42}) do
     if row[base]~=nil then row[base]=row[base]+dx end
     if row[base+2]~=nil then row[base+2]=row[base+2]+dz end
   end
@@ -363,11 +326,14 @@ local function redStrapRelief(v)
 end
 
 local function preparePlayerVertices(vertices,isRed)
-  if not isRed then return vertices or {} end
+  if not isRed then
+    local rows=vertices or {};for _,row in ipairs(rows) do if type(row)=="table" then row[45]=nil end end
+    return rows
+  end
   local out={}
   for i,v in ipairs(vertices or {}) do
     local row=redStrapRelief(v)
-    row[30]=tonumber(row[30]) or 0
+    row[45]=nil
     out[i]=row
   end
   return out
@@ -395,6 +361,10 @@ local function loadScene(ctx)
   if errorText then return nil,errorText end
   if not (love and love.graphics and love.image and love.graphics.newMesh and love.graphics.newShader) then errorText="LÖVE mesh/shader API unavailable";return nil,errorText end
   local cache,err=readLua(cfg.cache);if not cache then errorText=tostring(err);return nil,errorText end
+  if tonumber(cache.formatVersion)~=26 then
+    errorText=(cfg.label or wanted).." trainer cache format "..tostring(cache.formatVersion or "?").." is stale; rebuild required for dense source animation"
+    return nil,errorText
+  end
   local textures,groups={},{}
   for i,g in ipairs(cache.groups or {}) do
     local path=g.texture and g.texture.path;local img=path and textures[path] or nil
@@ -403,14 +373,21 @@ local function loadScene(ctx)
     -- retained per HSD DOBJ group instead of flattening the trainer to one
     -- opaque texture-only material.
     local weighted=preparePlayerVertices(g.vertices or {},currentModel==DEFAULT_PLAYER_MODEL and not cfg.directSource)
-    local ok,mesh=pcall(love.graphics.newMesh,FORMAT,weighted,"triangles","static")
+    local denseWeighted=weighted
+    if not DENSE_MESH then
+      local compact={}
+      for ri,row in ipairs(denseWeighted) do compact[ri]=TrainerMorph.compactVertex(row,nil,nil) end
+      weighted=compact
+    end
+    local ok,mesh=pcall(love.graphics.newMesh,DENSE_MESH and FORMAT or FORMAT_COMPACT,weighted,"triangles",DENSE_MESH and "static" or "dynamic")
     if not ok then errorText=(cfg.label or wanted).." mesh "..i..": "..tostring(mesh);return nil,errorText end
     if img then mesh:setTexture(img) end
     local d=g.diffuse or {1,1,1}
     groups[#groups+1]={mesh=mesh,material=g.material,image=img,textured=img~=nil,
       diffuse={tonumber(d[1]) or 1,tonumber(d[2]) or 1,tonumber(d[3]) or 1},
       alpha=tonumber(g.alpha) or 1,xlu=g.xlu==true,noz=g.noz==true,
-      renderFlags=tonumber(g.renderFlags) or 0,shadow=g.shadow==true,effect=g.effect==true}
+      renderFlags=tonumber(g.renderFlags) or 0,shadow=g.shadow==true,effect=g.effect==true,
+      poseSourceRows=(not DENSE_MESH) and denseWeighted or nil,posePair=nil}
   end
   local ok,sh=pcall(love.graphics.newShader,VERTEX,PIXEL);if not ok or not sh then errorText=(cfg.label or wanted).." shader: "..tostring(sh or "unavailable");return nil,errorText end
   shader=sh;local sok,serr=ensureShadow();if not sok then errorText=(cfg.label or wanted).." shadow: "..tostring(serr);return nil,errorText end
@@ -564,8 +541,9 @@ function P:event(ctx,name,payload)
   payload=type(payload)=="table" and payload or {}
   local b0=battleOf(ctx)
   local gen2=b0 and b0.__cbeGeneration==2
-  local queueSync=gen2 and b0.__cbePresentationQueueSync==true
-  if queueSync and (name=="battle.move_used" or name=="battle.damage_dealt" or name=="battle.fainted") then return end
+  local queueSync=b0 and b0.__cbePresentationQueueSync==true
+  if queueSync and ((gen2 and (name=="battle.move_used" or name=="battle.damage_dealt" or name=="battle.fainted"))
+      or ((not gen2) and name=="battle.fainted")) then return end
   local semantic=name
   if name=="battle.presentation_damage" then semantic="battle.damage_dealt"
   elseif name=="battle.presentation_faint" then semantic="battle.fainted" end
@@ -695,9 +673,7 @@ local function setShader(vp,model,pose,unlit,tint,opacity,motion)
   motion=motion or {}
   if not shader then local loaded=loadScene(nil); if not (loaded and shader) then return false end end
   love.graphics.setShader(shader);shader:send("vp","row",vp);shader:send("model","row",model);shader:send("cameraEye",pose and pose.eye or {54,24,13});shader:send("unlit",unlit or 0);shader:send("tintColor",tint or {1,1,1,1});shader:send("opacity",opacity or 1)
-  shader:send("breathMix",motion.breath or 0);shader:send("lookMix",motion.look or 0);shader:send("armMix",motion.arm or 0)
-  shader:send("shiftMix",motion.shift or 0);shader:send("settleMix",motion.settle or 0)
-  shader:send("commandMix",motion.command or 0);shader:send("braceMix",motion.brace or 0);shader:send("sourcePoseGain",1)
+  TrainerMorph.sendMixes(shader,motion)
 end
 function P:drawShadow(ctx,vp,pose)
   if not activeNow then return end;local s=loadScene(ctx);if not s then return end;local p=entryPose();if p.progress<.05 then return end
@@ -707,6 +683,7 @@ end
 function P:draw(ctx,vp,pose)
   if not activeNow then return end;drawFrames=drawFrames+1;local s=loadScene(ctx);if not s then return end;local p=entryPose();if p.progress<.03 then return end
   local motion=idleMotion();local model=animatedModel(p,motion)
+  TrainerMorph.bindPair(s.groups,motion)
   love.graphics.setDepthMode("lequal",true);love.graphics.setBlendMode("alpha","alphamultiply");if love.graphics.setMeshCullMode then love.graphics.setMeshCullMode("none") end;love.graphics.setColor(1,1,1,1)
   setShader(vp,model,pose,0,{1,1,1,1},smooth(p.progress/.38),motion)
   for _,grp in ipairs(s.groups) do
@@ -728,28 +705,54 @@ end
 local function mixJointPoint(base,poses,index,motion)
   local p=base and base[index];if type(p)~="table" then return nil end
   motion=motion or {}
-  local wa=math.max(tonumber(motion.arm) or 0,0)*1.00
-  local ws=math.max(tonumber(motion.shift) or 0,0)*.96
-  local wt=math.max(tonumber(motion.settle) or 0,0)*.90
-  local wc=math.max(tonumber(motion.command) or 0,0)*1.00
-  local wb=math.max(tonumber(motion.brace) or 0,0)*.96
-  local sum=wa+ws+wt+wc+wb;local action=clamp(sum,0,.84)
   local x,y,z=tonumber(p[1]) or 0,tonumber(p[2]) or 0,tonumber(p[3]) or 0
+  local weights={}
+  local sum=0
+  for i=1,5 do
+    local gw=math.max(tonumber(motion["gesture"..i]) or 0,0)
+    local rw=math.max(tonumber(motion["reaction"..i]) or 0,0)
+    weights[#weights+1]={"gesture"..i,gw};sum=sum+gw
+    weights[#weights+1]={"reaction"..i,rw};sum=sum+rw
+  end
+  local action=clamp(sum,0,1)
   if sum>.0001 then
     local tx,ty,tz,tw=0,0,0,0
-    local function add(name,w)
+    for _,row in ipairs(weights) do
+      local name,w=row[1],row[2]
       local q=poses and poses[name] and poses[name][index]
+      if q and w>0 then
+        tx=tx+(tonumber(q[1]) or x)*w
+        ty=ty+(tonumber(q[2]) or y)*w
+        tz=tz+(tonumber(q[3]) or z)*w
+        tw=tw+w
+      end
+    end
+    if tw>.0001 then
+      x=x+(tx/tw-x)*action;y=y+(ty/tw-y)*action;z=z+(tz/tw-z)*action
+    end
+  else
+    -- Old-cache compatibility during a failed/partial rebuild.
+    local legacy={{"arm",motion.arm},{"shift",motion.shift},{"settle",motion.settle},{"command",motion.command},{"brace",motion.brace}}
+    local tx,ty,tz,tw=0,0,0,0
+    for _,row in ipairs(legacy) do
+      local q=poses and poses[row[1]] and poses[row[1]][index];local w=math.max(tonumber(row[2]) or 0,0)
       if q and w>0 then tx=tx+(tonumber(q[1]) or x)*w;ty=ty+(tonumber(q[2]) or y)*w;tz=tz+(tonumber(q[3]) or z)*w;tw=tw+w end
     end
-    add("arm",wa);add("shift",ws);add("settle",wt);add("command",wc);add("brace",wb)
-    if tw>.0001 then x=x+(tx/tw-x)*action;y=y+(ty/tw-y)*action;z=z+(tz/tw-z)*action end
+    if tw>.0001 then
+      action=clamp(tw,0,1);x=x+(tx/tw-x)*action;y=y+(ty/tw-y)*action;z=z+(tz/tw-z)*action
+    end
   end
-  local secondary=1-action*.92
+  local secondary=1-action
   local function secondaryPose(name,w)
     local q=poses and poses[name] and poses[name][index]
-    if q and w~=0 then x=x+((tonumber(q[1]) or x)-(tonumber(p[1]) or x))*w*secondary;y=y+((tonumber(q[2]) or y)-(tonumber(p[2]) or y))*w*secondary;z=z+((tonumber(q[3]) or z)-(tonumber(p[3]) or z))*w*secondary end
+    if q and w~=0 then
+      x=x+((tonumber(q[1]) or x)-(tonumber(p[1]) or x))*w*secondary
+      y=y+((tonumber(q[2]) or y)-(tonumber(p[2]) or y))*w*secondary
+      z=z+((tonumber(q[3]) or z)-(tonumber(p[3]) or z))*w*secondary
+    end
   end
-  secondaryPose("breath",tonumber(motion.breath) or 0);secondaryPose("look",tonumber(motion.look) or 0)
+  secondaryPose("breath",tonumber(motion.breath) or 0)
+  secondaryPose("look",tonumber(motion.look) or 0)
   return {x,y,z}
 end
 local function runtimeReleaseJoint()
@@ -758,7 +761,7 @@ local function runtimeReleaseJoint()
 
   local base=scene.jointPositions
   local poses=scene.poseJointPositions or {}
-  local action=poses.arm or poses.command or poses.settle or base
+  local action=poses.gesture3 or poses.gesture4 or poses.gesture2 or poses.arm or poses.command or base
   local parents=scene.jointParents or {}
   local b=scene.bounds or {};local mn=b.min or {0,0,0};local mx=b.max or {0,16,0};local center=b.center or {0,8,0}
   local h=math.max(.001,(tonumber(mx[2]) or 16)-(tonumber(mn[2]) or 0))
@@ -905,25 +908,40 @@ local function captureBallPose()
     if handAttached then
       return {start[1],start[2],start[3],0,kind=phase,phaseU=u,spin=0,trail=0,opacity=1,handAttached=true}
     end
-    local q=smooth(clamp((u-releaseU)/math.max(.001,1-releaseU),0,1))
+    -- Once the source hand releases, use a real projectile path: horizontal
+    -- travel is nearly constant while gravity supplies the arc. The previous
+    -- smoothstep path visibly slowed the ball at both ends and made the throw
+    -- read like a floating camera prop rather than something Red actually threw.
+    local q=clamp((u-releaseU)/math.max(.001,1-releaseU),0,1)
+    local arc=4.0*q*(1-q)*4.35
     return {start[1]+(target[1]-start[1])*q,
-      start[2]+(target[2]-start[2])*q+math.sin(q*math.pi)*5.15,
+      start[2]+(target[2]-start[2])*q+arc,
       start[3]+(target[3]-start[3])*q,0,kind=phase,phaseU=u,
-      spin=q*math.pi*2.35,trail=math.sin(q*math.pi),opacity=1}
+      spin=q*math.pi*6.0,trail=math.sin(q*math.pi)*.72,opacity=1}
   elseif phase=="impact" then
     local q=clamp(u,0,1)
-    return {target[1],target[2]+.12*math.sin(q*math.pi),target[3],0,kind=phase,phaseU=u,spin=0,flare=1-q*.50,opacity=1}
+    -- Keep impact compact and readable. Source WZX/HSD animation owns the
+    -- opening; world motion only adds a tiny physical recoil instead of the
+    -- old half-second hovering bob.
+    local recoil=math.sin(q*math.pi)*.10*(1-q*.35)
+    return {target[1],target[2]+recoil,target[3],0,kind=phase,phaseU=u,spin=math.pi*6.0,flare=1-q*.62,opacity=1}
   elseif phase=="absorb" then
     local q=clamp(u,0,1)
-    return {target[1],target[2]+math.sin(q*math.pi)*.46,target[3],0,kind=phase,phaseU=u,spin=0,flare=(1-q)*.42+.08,opacity=1}
+    local recoil=math.sin(q*math.pi)*.12*(1-q)
+    return {target[1],target[2]+recoil,target[3],0,kind=phase,phaseU=u,spin=0,flare=(1-q)*.34+.05,opacity=1}
   elseif phase=="fall" then
-    local q=smooth(u)
-    return {target[1],target[2]+(ground[2]-target[2])*q+math.sin(q*math.pi)*.18,target[3],0,kind=phase,phaseU=u,
-      spin=(1-q)*math.pi*.48,trail=(1-q)*.24,opacity=1}
+    -- Gravity-driven drop. q^2 gives the expected acceleration into the turf
+    -- and avoids the floaty ease-in/ease-out used by the old capture path.
+    local q=clamp(u,0,1)
+    local fall=q*q
+    return {target[1],target[2]+(ground[2]-target[2])*fall,target[3],0,kind=phase,phaseU=u,
+      spin=(1-q)*math.pi*.74,trail=(1-q)*.16,opacity=1}
   elseif phase=="settle" then
     local q=clamp(u,0,1)
-    local bounce=math.abs(math.sin(q*math.pi*2))*math.max(0,1-q)*.17
-    return {ground[1],ground[2]+bounce,ground[3],2.58,kind=phase,phaseU=u,rock=math.sin(q*math.pi*2)*.055,flare=math.max(0,1-q*2)*.20,opacity=1}
+    -- One small damped landing bounce followed by a planted hold before shakes.
+    local bounce=math.sin(q*math.pi)*math.max(0,1-q)*.13
+    local rock=math.sin(q*math.pi)*math.max(0,1-q)*.045
+    return {ground[1],ground[2]+bounce,ground[3],2.58,kind=phase,phaseU=u,rock=rock,flare=math.max(0,1-q*2.5)*.14,opacity=1}
   elseif phase=="shake" then
     local _,_,_,_,_,f=captureMilestones(c.shakes)
     local elapsed=math.max(0,(c.age or 0)-f)
@@ -991,7 +1009,13 @@ function P:captureBallPosition(ctx)
 end
 
 function P:captureEnemyScale(ctx)
-  if not capture or capture.done then return 1 end
+  if not capture then return 1 end
+  -- A successful capture is terminal for the wild battler. Keep that actor
+  -- suppressed after the cinematic has finished and through Pokédex/nickname
+  -- dialogue; the old `capture.done -> 1` branch resurrected the caught Pokémon
+  -- beside the closed ball as soon as UI flow resumed.
+  if capture.caught and capture.done then return 0 end
+  if capture.done then return 1 end
   local phase,u=capturePhase(capture)
   if phase=="charge" or phase=="throw" or phase=="impact" then return 1 end
   if phase=="absorb" then return math.max(0,1-smooth(clamp((u-.10)/.72,0,1))) end
@@ -1108,5 +1132,5 @@ function P:resetRuntime()
   captureAssetIndex=nil;captureAssetError=nil;captureSourceDrawFrames=0
   return true
 end
-function P:status() return {active=activeNow,ready=scene~=nil,error=errorText,model=(currentConfig and currentConfig.label) or tostring(currentModel):upper(),modelSource=currentConfig and currentConfig.source or nil,modelReason=currentReason,pose="NativeHSD-source-hand-anchored-throw-player",action=actionKind,modelScale=MODEL_SCALE,final={FINAL_X,0,FINAL_Z},ballTarget={SENDOUT_TARGET_X,0,SENDOUT_TARGET_Z},captureTarget={CAPTURE_TARGET_X,0,CAPTURE_TARGET_Z},drawFrames=drawFrames,ballReady=(captureAssetIndex and true) or ballMeshRed~=nil,ballError=ballError,captureAssetError=captureAssetError,captureSourceDrawFrames=captureSourceDrawFrames,ballDrawFrames=ballDrawFrames,releaseJoint=scene and scene.releaseJoint or nil,releaseJointScore=scene and scene.releaseJointScore or nil,capture=P:captureStatus()} end
+function P:status() return {active=activeNow,ready=scene~=nil,error=errorText,model=(currentConfig and currentConfig.label) or tostring(currentModel):upper(),modelSource=currentConfig and currentConfig.source or nil,modelReason=currentReason,pose="NativeHSD-source-hand-anchored-throw-player",action=actionKind,modelScale=MODEL_SCALE,final={FINAL_X,0,FINAL_Z},ballTarget={SENDOUT_TARGET_X,0,SENDOUT_TARGET_Z},captureTarget={CAPTURE_TARGET_X,0,CAPTURE_TARGET_Z},drawFrames=drawFrames,ballReady=(captureAssetIndex and true) or ballMeshRed~=nil,ballError=ballError,captureAssetError=captureAssetError,captureSourceDrawFrames=captureSourceDrawFrames,ballDrawFrames=ballDrawFrames,releaseJoint=scene and scene.releaseJoint or nil,releaseJointScore=scene and scene.releaseJointScore or nil,capture=P:captureStatus(),morph=TrainerMorph.status(),windowsCompat=WINDOWS_RUNTIME} end
 return P

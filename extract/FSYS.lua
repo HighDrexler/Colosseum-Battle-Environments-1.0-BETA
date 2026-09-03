@@ -10,8 +10,18 @@ local MODEL_TYPES={
   [0x20]={ext="wzx",model=false},
 }
 
+-- Pre-interned single-byte strings. Every decompressed byte used to allocate
+-- through string.char(); an array index costs neither a C call nor a hash.
+local CHR={};for i=0,255 do CHR[i]=string.char(i) end
+
 -- Pokemon Colosseum/XD FSYS members use the SysDolphin 0x1000-byte LZSS ring.
 -- The u32 at +0x08 is the total compressed member size including the 0x10 header.
+--
+-- PERFORMANCE: this decoder runs over every arena, trainer, Pokemon, Waza and
+-- audio member on the disc, so it is the single hottest function in the whole
+-- cache build. The emit()/heartbeat() closures, the 2^bit flag test, the two
+-- modulo wraps and the per-byte string.char() were all on the per-output-byte
+-- path. They are inlined here; output is byte-identical.
 function F.decompressLZSS(blob,expected,opts)
   assert(type(blob)=="string" and blob:sub(1,4)=="LZSS","missing LZSS header")
   opts=opts or {}
@@ -20,6 +30,9 @@ function F.decompressLZSS(blob,expected,opts)
   local maxOutput=tonumber(opts.maxOutput) or (64*1024*1024)
   assert(expected and expected>=0 and expected<=maxOutput,("LZSS output outside safety limit: %s / %s"):format(tostring(expected),tostring(maxOutput)))
   assert(packedSize and packedSize>=16 and packedSize<=#blob,"bad LZSS header")
+
+  local byte,concat,chr=string.byte,table.concat,CHR
+  local progress=type(opts.progress)=="function" and opts.progress or nil
   local src=17;local srcEnd=packedSize
   local ring={};for i=0,4095 do ring[i]=0 end
   local rp=0xFEE
@@ -27,48 +40,56 @@ function F.decompressLZSS(blob,expected,opts)
   -- members can be several MiB and the old byte-table implementation could
   -- spend minutes/GBs of transient memory before table.concat. Flush modest
   -- string chunks instead.
-  local chunks,chunk,chunkN={}, {},0
-  local outN=0;local nextHeartbeat=256*1024
-  local function flush()
-    if chunkN==0 then return end
-    chunks[#chunks+1]=table.concat(chunk);chunk={};chunkN=0
-  end
-  local function heartbeat(force)
-    if type(opts.progress)~="function" then return end
-    if force or outN>=nextHeartbeat then
-      nextHeartbeat=outN+256*1024
-      pcall(opts.progress,outN,expected or 0)
-    end
-  end
-  local function emit(b)
-    outN=outN+1
-    assert(outN<=maxOutput,"LZSS output exceeded safety limit")
-    chunkN=chunkN+1;chunk[chunkN]=string.char(b)
-    if chunkN>=8192 then flush() end
-    ring[rp]=b;rp=(rp+1)%4096
-    heartbeat(false)
-  end
-  while src<=srcEnd and (not expected or expected==0 or outN<expected) do
-    local flags=blob:byte(src);src=src+1;if not flags then break end
-    for bit=0,7 do
-      if src>srcEnd or (expected and expected>0 and outN>=expected) then break end
-      local literal=(math.floor(flags/(2^bit))%2)==1
-      if literal then
-        local b=blob:byte(src);src=src+1;if not b then break end
-        emit(b)
+  local chunks,chunkCount={},0
+  local chunk,chunkN={},0
+  local outN=0;local nextHeartbeat=262144
+  local bounded=(expected and expected>0)
+  local limit=bounded and expected or maxOutput
+
+  while src<=srcEnd and outN<limit do
+    local flags=byte(blob,src);src=src+1
+    if not flags then break end
+    for _=1,8 do
+      if src>srcEnd or outN>=limit then break end
+      -- Consume the flag word one bit at a time by halving it, which is the
+      -- same test as floor(flags/2^bit)%2 without the per-bit exponentiation.
+      local literal=flags%2
+      flags=(flags-literal)*0.5
+      if literal==1 then
+        local b=byte(blob,src);src=src+1
+        if not b then break end
+        outN=outN+1
+        chunkN=chunkN+1;chunk[chunkN]=chr[b]
+        ring[rp]=b;rp=rp+1;if rp>=4096 then rp=0 end
       else
-        local b0,b1=blob:byte(src,src+1);src=src+2;if not b1 then break end
-        local mp=b0+(math.floor(b1/16)%16)*256;local n=(b1%16)+3
+        local b0,b1=byte(blob,src,src+1);src=src+2
+        if not b1 then break end
+        local hi=b1-b1%16
+        local mp=b0+hi*16
+        local n=b1-hi+3
+        if outN+n>limit then n=limit-outN end
         for _=1,n do
-          if expected and expected>0 and outN>=expected then break end
-          local b=ring[mp] or 0;mp=(mp+1)%4096;emit(b)
+          local b=ring[mp];mp=mp+1;if mp>=4096 then mp=0 end
+          chunkN=chunkN+1;chunk[chunkN]=chr[b]
+          ring[rp]=b;rp=rp+1;if rp>=4096 then rp=0 end
         end
+        outN=outN+n
+      end
+      if chunkN>=8192 then
+        chunkCount=chunkCount+1;chunks[chunkCount]=concat(chunk,"",1,chunkN);chunkN=0
       end
     end
+    -- One heartbeat per flag group rather than per output byte.
+    if progress and outN>=nextHeartbeat then
+      nextHeartbeat=outN+262144
+      pcall(progress,outN,expected or 0)
+    end
   end
-  flush();heartbeat(true)
-  if expected and expected>0 then assert(outN==expected,("LZSS short output: %d/%d"):format(outN,expected)) end
-  return table.concat(chunks)
+  if chunkN>0 then chunkCount=chunkCount+1;chunks[chunkCount]=concat(chunk,"",1,chunkN) end
+  if progress then pcall(progress,outN,expected or 0) end
+  if bounded then assert(outN==expected,("LZSS short output: %d/%d"):format(outN,expected))
+  else assert(outN<maxOutput,"LZSS output exceeded safety limit") end
+  return concat(chunks,"",1,chunkCount)
 end
 local function readName(disc,file,offset)
   if not offset or offset<=0 or offset>=file.size then return nil end

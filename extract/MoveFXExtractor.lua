@@ -1,7 +1,7 @@
 local V=...
 local FSYS,GX,HSD=V.FSYS,V.GXTexture,V.HSD
 local Waza=V.WazaSequenceExtractor
-local M={revision=14,mod=nil,openDisc=nil,memory={},negative={},pending={},pendingKeys={},prefetchStats={queued=0,completed=0,failed=0}}
+local M={revision=18,mod=nil,openDisc=nil,memory={},negative={},pending={},pendingKeys={},prefetchStats={queued=0,completed=0,failed=0}}
 
 local MOVE={
   [33]={stem="taiatari",phases={"attack","damage"},style="impact",tint={1.00,0.96,0.82}}, -- Tackle
@@ -413,6 +413,47 @@ local function beFloat(s,p)
   if exp==0 then return sign*(mant/8388608)*(2^-126) end
   return sign*(1+mant/8388608)*(2^(exp-127))
 end
+-- Pre-materialize Waza model float32 sidecars during the one-time source cache
+-- build whenever LÖVE's portable pack API is available. Runtime still validates
+-- sourceSize and falls back to the canonical packed Lua payload, so these files
+-- are an optimization rather than a new correctness dependency.
+local function runtimeRoot(path) return tostring(path or "cache/movefx/model.lua"):gsub("%.lua$","").."_runtime_v1" end
+local function runtimeBinPath(path,i) return runtimeRoot(path)..("/base_%02d.f32"):format(tonumber(i) or 0) end
+local function runtimeMetaPath(path) return runtimeRoot(path).."/base.lua" end
+local function cacheSize(path)
+  local mod=M.mod;if not (mod and mod.cache and type(mod.cache.info)=="function") then return nil end
+  local ok,info=pcall(mod.cache.info,mod.cache,path);return ok and type(info)=="table" and tonumber(info.size) or nil
+end
+local function packPackedRows(group,stride)
+  if not (love and love.data and type(love.data.pack)=="function") then return nil,"love.data.pack unavailable" end
+  local packed=type(group)=="table" and group.verticesPacked or nil
+  if type(packed)~="string" then return nil,"packed vertices unavailable" end
+  local fmt=string.rep("f",stride);local chunks={};local n=0
+  for line in packed:gmatch("[^\r\n]+") do
+    local vals={};for token in line:gmatch("[^,]+") do vals[#vals+1]=tonumber(token) or 0 end
+    if #vals~=stride then return nil,("packed stride mismatch %d/%d"):format(#vals,stride) end
+    local ok,bytes=pcall(love.data.pack,"string",fmt,(table.unpack or unpack)(vals,1,stride))
+    if not ok or type(bytes)~="string" then return nil,tostring(bytes or "float32 pack failed") end
+    n=n+1;chunks[n]=bytes
+  end
+  if n==0 then return nil,"no packed vertex rows" end
+  return table.concat(chunks)
+end
+local function prebuildRuntimeMesh(path,cache,stride)
+  local size=cacheSize(path);if not size or size<=0 then return false end
+  if not (love and love.data and type(love.data.pack)=="function") then return false end
+  local compact={runtimeMeshVersion=1,sourceSize=size}
+  for k,v in pairs(cache or {}) do if k~="groups" then compact[k]=v end end
+  compact.groups={}
+  for i,g in ipairs(cache.groups or {}) do
+    local bytes=select(1,packPackedRows(g,stride));if type(bytes)~="string" then return false end
+    local bin=runtimeBinPath(path,i);local ok=write(bin,bytes);if not ok then return false end
+    local row={};for k,v in pairs(g) do if k~="vertices" and k~="verticesPacked" then row[k]=v end end
+    row.runtimeBin=bin;compact.groups[i]=row
+  end
+  return write(runtimeMetaPath(path),"return "..serialize(compact).."\n")
+end
+
 local function hex(bytes)
   local out={}
   for i=1,#bytes do out[#out+1]=string.format("%02X",bytes:byte(i)) end
@@ -430,8 +471,8 @@ end
 local function write(path,data)
   local mod=M.mod; if not (mod and mod.cache and type(mod.cache.write)=="function") then return false,"cache unavailable" end
   local ok,a,b=pcall(mod.cache.write,mod.cache,path,data)
-  if not ok then return false,tostring(a) end
-  if a==false or a==nil then return false,tostring(b or "cache write failed") end
+  if not ok then return false,("cache write failed [%s]: %s"):format(tostring(path),tostring(a)) end
+  if a==false or a==nil then return false,("cache write failed [%s]: %s"):format(tostring(path),tostring(b or "cache write failed")) end
   if type(M.buildGenerated)=="table" then
     local seen=M.buildGeneratedSeen or {};M.buildGeneratedSeen=seen
     if not seen[path] then seen[path]=true;M.buildGenerated[#M.buildGenerated+1]=path end
@@ -486,14 +527,33 @@ local function intensityAlpha(rgba)
   return table.concat(out)
 end
 
+-- Correlate embedded GPT1 resources with the exact type-3 Waza row that owns
+-- them. 1.7.14 called this helper without ever defining it, aborting fresh
+-- extraction before particle programs could be cached. The authoritative map
+-- now comes from the typed WazaSequence parser rather than bytes guessed around
+-- the GPT1 magic itself.
+local function scanSequenceGPT1(blob)
+  local map={}
+  if not (Waza and type(Waza.parse)=="function") then return map end
+  local ok,timeline=pcall(Waza.parse,blob,{phase="gpt1-index"})
+  if not ok or type(timeline)~="table" then return map end
+  for _,entry in ipairs(timeline.entries or {}) do
+    if type(entry)=="table" and entry.kind=="particle" and entry.gptOffset~=nil then
+      map[tonumber(entry.gptOffset) or entry.gptOffset]=entry
+    end
+  end
+  return map
+end
 
 local function parseGPT1(blob,gptOff,bank,out,maxTextures,sequence)
   local n=#blob
-  -- WZX places the top-level GPT1 generator REF directly 0x10 bytes before
-  -- the embedded GPT1 payload. This is the source root that the sequence
-  -- actually starts; the PTL table itself is a template bank, not a list of
-  -- generators that should all be emitted at once.
-  local rootRef=(gptOff>=0x10) and be32(blob,gptOff-0x10) or nil
+  -- The owning type-3 Waza row supplies the exact generator selector passed by
+  -- retail to fn_801190DC(resource, selector, animationMode & 1). Use that
+  -- selector as the entry point. Only retain the old preceding-word probe as a
+  -- diagnostic fallback for malformed/legacy banks that cannot be correlated.
+  local rootSelector=type(sequence)=="table" and tonumber(sequence.selector) or nil
+  local legacyRootRef=(gptOff>=0x10) and be32(blob,gptOff-0x10) or nil
+  if rootSelector==nil then rootSelector=legacyRootRef end
   local ptlRel,txgRel,refRel=be32(blob,gptOff+4),be32(blob,gptOff+8),be32(blob,gptOff+0x10)
   if not (ptlRel and txgRel) then return end
   local ptl=gptOff+ptlRel;local txg=gptOff+txgRel
@@ -521,9 +581,9 @@ local function parseGPT1(blob,gptOff,bank,out,maxTextures,sequence)
         out.programs[#out.programs+1]={
           bank=bank,bankIndex=i,genType=be16(blob,ga) or 0,unknown02=be16(blob,ga+2) or 0,
           lifetime=life,maxParticles=maxParticles,flags=be32(blob,ga+8) or 0,
-          params=params,commandHex=hex(commands),refId=refId,rootRef=rootRef,gptOffset=gptOff,
-          root=(rootRef~=nil and refId~=nil and tonumber(refId)==tonumber(rootRef)) or false,
-          sequence=sequence,
+          params=params,commandHex=hex(commands),refId=refId,selector=rootSelector,rootRef=rootSelector,gptOffset=gptOff,
+          root=(rootSelector~=nil and refId~=nil and tonumber(refId)==tonumber(rootSelector)) or false,
+          sequence=sequence,legacyRootRef=legacyRootRef,
         }
       end
     end
@@ -688,7 +748,7 @@ end
 -- HSD curves are evaluated at each authored 60 Hz frame during extraction and
 -- packed into overlapping 12-target GPU pages, so runtime playback is source
 -- motion rather than an authored CBE approximation.
-local function compileWazaModel(blob,entry,stem,phase)
+local function compileWazaModel(blob,entry,stem,phase,opts)
   if not (HSD and type(HSD.extractModel)=="function" and type(blob)=="string"
       and type(entry)=="table" and tonumber(entry.dataOffset) and tonumber(entry.dataSize)) then
     return nil,"Waza model extractor unavailable"
@@ -717,6 +777,7 @@ local function compileWazaModel(blob,entry,stem,phase)
   local animInfo=nil
   if type(HSD.nativeAnimationInfo)=="function" then animInfo=select(1,HSD.nativeAnimationInfo(model,0)) end
   local endFrame=animInfo and math.max(0,math.floor(tonumber(animInfo.endFrame) or 0)) or 0
+  if opts and opts.staticOnly then endFrame=0 end
   if endFrame>600 then return nil,("Waza model source animation exceeds safety bound: %d frames"):format(endFrame) end
   local animated=false;local poses={[0]=model};local maxMotion=0
   if endFrame>0 and type(HSD.extractNativePose)=="function" then
@@ -752,6 +813,7 @@ local function compileWazaModel(blob,entry,stem,phase)
       local path=("cache/movefx/%s/models/%s_%03d_anim_%03d.lua"):format(stem,phase,ident,#pages+1)
       local okWrite,why=write(path,"return "..serialize(page).."\n")
       if not okWrite then return nil,why end
+      pcall(prebuildRuntimeMesh,path,page,44)
       pages[#pages+1]={cache=path,startFrame=start,endFrame=stop,morphFrames=stop-start}
       start=stop
     end
@@ -770,8 +832,41 @@ local function compileWazaModel(blob,entry,stem,phase)
     animation={clip=0,endFrame=endFrame,frameCount=endFrame+1,animated=animated,maxMotion=maxMotion,pages=pages}}
   local okWrite,why=write(cachePath,"return "..serialize(cache).."\n")
   if not okWrite then return nil,why end
+  pcall(prebuildRuntimeMesh,cachePath,cache,8)
   return {cache=cachePath,groups=#groups,vertices=tonumber(model.vertexCount) or 0,textures=textureCount,bounds=model.bounds,
     animation={clip=0,endFrame=endFrame,frameCount=endFrame+1,animated=animated,maxMotion=maxMotion,pages=pages}}
+end
+
+-- Serialize a model that was decoded from the complete retail snatch member.
+-- Capture choreography owns all ball motion, so this deliberately stores only
+-- exact source geometry/materials/textures and no HSD animation pages.
+local function compileDecodedCaptureModel(model,stem,phase,tag)
+  if type(model)~="table" then return nil,"decoded capture model unavailable" end
+  local safe=tostring(tag or "root"):gsub("[^%w_%-]","_")
+  local textureSpecs={};local textureCount=0
+  for gi,g in ipairs(model.groups or {}) do
+    local texSpec=nil;local t=g.texture
+    if t and type(t.rgba)=="string" and tonumber(t.w) and tonumber(t.h) then
+      local path=("cache/movefx/%s/models/%s_member_%s_tex_%03d.rgba"):format(stem,phase,safe,gi)
+      local okWrite,why=write(path,t.rgba);if not okWrite then return nil,why end
+      texSpec={path=path,w=t.w,h=t.h,wrapS=t.wrapS,wrapT=t.wrapT,format=t.format,dataOffset=t.dataOffset}
+      textureCount=textureCount+1
+    end
+    textureSpecs[gi]=texSpec
+  end
+  local groups={}
+  for gi,g in ipairs(model.groups or {}) do
+    groups[#groups+1]=wazaModelGroupShell(g,textureSpecs[gi]);groups[#groups].vertices=g.vertices
+  end
+  if #groups==0 then return nil,"capture member HSD root has no drawable groups" end
+  local cachePath=("cache/movefx/%s/models/%s_member_%s.lua"):format(stem,phase,safe)
+  local cache={revision=4,source="GC6E01 snatch member HSD static root",phase=phase,identifier=safe,
+    bounds=model.bounds,vertexCount=model.vertexCount,groups=packWazaGroups(groups,8),
+    animation={clip=0,endFrame=0,frameCount=1,animated=false,maxMotion=0,pages={}}}
+  local okWrite,why=write(cachePath,"return "..serialize(cache).."\n");if not okWrite then return nil,why end
+  pcall(prebuildRuntimeMesh,cachePath,cache,8)
+  return {cache=cachePath,groups=#groups,vertices=tonumber(model.vertexCount) or 0,textures=textureCount,bounds=model.bounds,
+    animation={clip=0,endFrame=0,frameCount=1,animated=false,maxMotion=0,pages={}},staticSource=true,memberRoot=true}
 end
 
 local function extractWZX(disc,stem,phase)
@@ -799,11 +894,25 @@ local function cachedRoleReady(spec,role)
   if type(spec)~="table" then return false end
   local banks={}
   for _,t in ipairs(spec.textures or {}) do banks[tonumber(t.bank) or 1]=true end
-  for _,g in ipairs(spec.generatorPrograms or {}) do
-    local phase=tostring(g.phase or "all"):lower()
-    local gRole=(phase=="damage" or phase=="status") and "damage" or "attack"
-    if gRole==role and g.root==true and type(g.commandHex)=="string" and #g.commandHex>=2
-        and banks[tonumber(g.bank) or 1] then return true end
+  local programs=spec.generatorPrograms or {}
+  for _,phase in ipairs(spec.wazaPhases or {}) do
+    local pn=tostring(phase.name or "all"):lower()
+    local pRole=(pn=="damage" or pn=="status") and "damage" or "attack"
+    if pRole==role then
+      for _,entry in ipairs(phase.entries or {}) do
+        if entry.kind=="particle" and entry.bank and banks[tonumber(entry.bank) or 1] then
+          local wanted=tonumber(entry.selector~=nil and entry.selector or entry.rootRef)
+          for _,g in ipairs(programs) do
+            if tonumber(g.bank)==tonumber(entry.bank) and type(g.commandHex)=="string" and #g.commandHex>=2
+                and (wanted==nil or tonumber(g.refId)==wanted) then return true end
+          end
+        elseif entry.kind=="model" and type(entry.modelAsset)=="table" and entry.modelAsset.cache then
+          return true
+        elseif entry.kind=="type4" and entry.effectType~=nil then
+          return true
+        end
+      end
+    end
   end
   return false
 end
@@ -811,7 +920,7 @@ end
 local ATTACK_PHASES={"attack","special","sp1","all"}
 local DAMAGE_PHASES={"damage","status"}
 local CANONICAL={attack=true,special=true,sp1=true,all=true,damage=true,status=true}
-local function phasesFor(disc,stem,preferred)
+local function phasesFor(disc,stem,preferred,layerPreferred)
   local found,variants={},{}
   local function exists(phase)
     phase=tostring(phase or ""):lower()
@@ -832,22 +941,46 @@ local function phasesFor(disc,stem,preferred)
       end
     end
   end
-  -- One source attack program and one source damage program are selected.
-  -- sp1/special and species-named files are alternates, not simultaneous layers.
-  local out={}
-  for _,phase in ipairs(ATTACK_PHASES) do if exists(phase) then out[#out+1]=phase;break end end
-  for _,phase in ipairs(DAMAGE_PHASES) do if exists(phase) then out[#out+1]=phase;break end end
+
+  local out,seen={},{}
+  local function add(phase)
+    phase=tostring(phase or ""):lower()
+    if phase~="" and exists(phase) and not seen[phase] then
+      seen[phase]=true;out[#out+1]=phase
+    end
+  end
+
+  if layerPreferred then
+    -- Curated move definitions list authored layers, not substitutes. In
+    -- particular Ember's visible projectile is carried by hinoko_sp1 while its
+    -- attack bank handles setup/timing. 1.7 accidentally selected only the first
+    -- attack-like bank, so the move resolved damage with no embers on screen.
+    for _,phase in ipairs(preferred or {}) do add(phase) end
+    local hasAttack,hasDamage=false,false
+    for _,phase in ipairs(out) do
+      if phase=="damage" or phase=="status" then hasDamage=true else hasAttack=true end
+    end
+    if not hasAttack then for _,phase in ipairs(ATTACK_PHASES) do if exists(phase) then add(phase);break end end end
+    if not hasDamage then for _,phase in ipairs(DAMAGE_PHASES) do if exists(phase) then add(phase);break end end end
+  else
+    -- Discovery-only aliases remain conservative: one attack bank and one
+    -- damage bank, avoiding speculative stacking for moves we have not audited.
+    for _,phase in ipairs(ATTACK_PHASES) do if exists(phase) then add(phase);break end end
+    for _,phase in ipairs(DAMAGE_PHASES) do if exists(phase) then add(phase);break end end
+  end
   table.sort(variants)
   return out,variants
 end
 
-M._internal={scanSequenceGPT1=scanSequenceGPT1,scanGPT1=scanGPT1,compileWazaModel=compileWazaModel}
+M._internal={scanSequenceGPT1=scanSequenceGPT1,scanGPT1=scanGPT1,compileWazaModel=compileWazaModel,phasesFor=phasesFor}
 
 -- Build the exact Colosseum capture-ball prop bank from the user's GC6E01 disc.
--- Every supported ball has its own WZX family; the ~7 KB type-2 HSD object in
--- those sequences is the source ball model (including its source texture and,
--- where authored, the native HSD clip used by shake/land/miss). No procedural
--- sphere or hand-authored recolor is used when this cache is available.
+-- Every supported ball has its own WZX family. Retail identification is based
+-- on a decoded HSD visual fingerprint recurring across the authored snatch
+-- phases, not on byte size. Capture choreography already owns world motion, so
+-- the selected ISO geometry/materials are deliberately compiled STATIC for the
+-- runtime. This avoids Android/GLES morph-page failures ever masquerading as a
+-- missing source ball while preserving the exact Colosseum model and texture.
 local CAPTURE_BALLS={
   poke={suffix="monster",aliases={"POKE_BALL","POKEBALL","MONSTER_BALL","BALL"}},
   great={suffix="super",aliases={"GREAT_BALL","GREATBALL","SUPER_BALL"}},
@@ -873,72 +1006,442 @@ local function captureArchiveName(base,suffix)
 end
 local function captureSource(disc,archiveName)
   local file=disc and disc:file(archiveName);if not file then return nil,"source archive missing: "..archiveName end
-  local okArc,arc=pcall(FSYS.open,disc,file);if not okArc or not arc then return nil,tostring(arc) end
+  local okArc,arc=pcall(FSYS.open,disc,file);if not okArc or not arc then return nil,("FSYS open failed [%s]: %s"):format(tostring(archiveName),tostring(arc)) end
   local list=arc:list() or {};local entry
+  -- Retail snatch FSYS groups carry their authored asset as a .fdat member.
+  -- Prefer that exact member explicitly; older code searched for .wzx first and
+  -- then blindly used list[1], which could parse the sequence while missing the
+  -- actual HSD model container we need for the visible ball.
   for _,candidate in ipairs(list) do
-    if tostring(candidate.name or ""):lower():find("%.wzx$",1,false) then entry=candidate;break end
+    if tostring(candidate.name or ""):lower():find("%.fdat$",1,false) then entry=candidate;break end
+  end
+  if not entry then
+    for _,candidate in ipairs(list) do
+      if tostring(candidate.name or ""):lower():find("%.wzx$",1,false) then entry=candidate;break end
+    end
   end
   entry=entry or list[1];if not entry then return nil,"empty source archive: "..archiveName end
   local okBlob,blob=pcall(arc.extract,arc,entry,{maxOutput=64*1024*1024})
-  if not okBlob or type(blob)~="string" then return nil,tostring(blob or "capture WZX extraction failed") end
+  if not okBlob or type(blob)~="string" then return nil,("capture WZX extraction failed [%s/%s]: %s"):format(tostring(archiveName),tostring(entry.name),tostring(blob or "unknown error")) end
   local okTimeline,timeline,why=pcall(Waza.parse,blob,{phase="capture",member=entry.name})
-  if not okTimeline or type(timeline)~="table" then return nil,tostring(okTimeline and why or timeline) end
+  if not okTimeline or type(timeline)~="table" then return nil,("capture WZX parse failed [%s/%s]: %s"):format(tostring(archiveName),tostring(entry.name),tostring(okTimeline and why or timeline)) end
   return {blob=blob,timeline=timeline,member=entry.name,archive=archiveName}
 end
-local function captureBallEntry(timeline)
-  local best,bestSize=nil,-1
-  for _,entry in ipairs((timeline and timeline.entries) or {}) do
-    if entry.kind=="model" then
-      local size=tonumber(entry.dataSize or entry.embeddedSize) or 0
-      -- The ball prop is consistently the compact ~7 KB type-2 object. Large
-      -- entries are trainer/snag-machine/effect assemblies; tiny entries are
-      -- helper planes. Keep a broad source-safe window for regional variants.
-      if size>=3000 and size<=24000 and size>bestSize then best,bestSize=entry,size end
+local CAPTURE_BALL_EXPECTED_BYTES=7168
+local CAPTURE_PHASE_ORDER={"shake","throw","land","miss"}
+
+-- Pure-Lua deterministic fingerprint. Keeping the accumulator below 2^31 makes
+-- the multiply exact in Lua's double number type on Windows and Android alike.
+local function captureHash(bytes)
+  if type(bytes)~="string" then return "0:00000000" end
+  local h=5381
+  for i=1,#bytes do h=(h*33+bytes:byte(i))%2147483647 end
+  return ("%d:%08X"):format(#bytes,h)
+end
+local function captureQuant(v)
+  v=tonumber(v) or 0
+  return math.floor(v*10000+(v>=0 and .5 or -.5))
+end
+local function captureVisualFingerprint(model)
+  if type(model)~="table" then return nil end
+  local b=model.bounds or {};local mn=b.min or {};local mx=b.max or {}
+  local parts={tostring(tonumber(model.vertexCount) or 0)}
+  for k=1,3 do parts[#parts+1]=tostring(captureQuant((tonumber(mx[k]) or 0)-(tonumber(mn[k]) or 0))) end
+  for _,g in ipairs(model.groups or {}) do
+    local t=g.texture
+    if t and type(t.rgba)=="string" then
+      parts[#parts+1]=table.concat({"T",tostring(t.w or 0),tostring(t.h or 0),tostring(t.format or 0),captureHash(t.rgba)},":")
+    else
+      parts[#parts+1]="U:"..tostring(#(g.vertices or {}))
     end
   end
-  return best,bestSize
+  return table.concat(parts,"|")
 end
+local function captureEmbeddedFingerprint(blob,entry)
+  local off=tonumber(entry and entry.dataOffset);local size=tonumber(entry and (entry.dataSize or entry.embeddedSize))
+  if not off or not size or off<0 or size<=0 or type(blob)~="string" or off+size>#blob then return nil end
+  return captureHash(blob:sub(off+1,off+size))
+end
+
+local CAPTURE_DECODE_OPTS={textures=true,maxRoots=96,maxVertices=90000,maxDisplayOps=300000,maxJobjs=4096,maxDobjs=12000,maxPobjs=20000}
+
+local function capturePreviewFromModel(model,size,embeddedFingerprint,sizeHint)
+  if type(model)~="table" then return nil,"decoded HSD model unavailable" end
+  local b=model.bounds or {};local mn=b.min or {};local mx=b.max or {}
+  local sx=math.abs((tonumber(mx[1]) or 0)-(tonumber(mn[1]) or 0))
+  local sy=math.abs((tonumber(mx[2]) or 0)-(tonumber(mn[2]) or 0))
+  local sz=math.abs((tonumber(mx[3]) or 0)-(tonumber(mn[3]) or 0))
+  local largest=math.max(sx,sy,sz);local smallest=math.min(sx,sy,sz)
+  local aspect=(smallest>1e-6) and (largest/smallest) or math.huge
+  local textures=0
+  for _,g in ipairs(model.groups or {}) do
+    local t=g.texture;if t and type(t.rgba)=="string" and tonumber(t.w) and tonumber(t.h) then textures=textures+1 end
+  end
+  local vertices=tonumber(model.vertexCount) or 0
+  local score=0
+  if aspect<=1.35 then score=score+90
+  elseif aspect<=1.70 then score=score+65
+  elseif aspect<=2.20 then score=score+35
+  elseif aspect<=3.00 then score=score+10
+  else score=score-math.min(50,(aspect-3)*8) end
+  if vertices>=24 and vertices<=12000 then score=score+20 elseif vertices>50000 then score=score-30 end
+  score=score+math.min(4,textures)*8
+  -- The old ~7 KiB observation is useful only for embedded type-2 payloads.
+  -- A complete snatch_*.fdat member is much larger and must never be punished
+  -- just because the physical ball lives as one HSD root inside that container.
+  if sizeHint and tonumber(size) and tonumber(size)>0 then
+    local ratio=math.max(size,1)/CAPTURE_BALL_EXPECTED_BYTES
+    score=score+12/(1+math.abs(math.log(ratio)))
+  end
+  return {model=model,size=tonumber(size) or 0,vertices=vertices,textures=textures,spans={sx,sy,sz},aspect=aspect,
+    score=score,visualFingerprint=captureVisualFingerprint(model),embeddedFingerprint=embeddedFingerprint}
+end
+
+local function captureModelPreview(blob,entry)
+  if not (HSD and type(HSD.extractModel)=="function" and type(blob)=="string" and type(entry)=="table") then
+    return nil,"HSD preview unavailable"
+  end
+  local off=tonumber(entry.dataOffset);local size=tonumber(entry.dataSize or entry.embeddedSize)
+  if not off or not size or off<0 or size<=0 or off+size>#blob then return nil,"model source range invalid" end
+  local source=blob:sub(off+1,off+size)
+  local model,err=HSD.extractModel(source,CAPTURE_DECODE_OPTS)
+  if not model then return nil,err or "HSD decode failed" end
+  return capturePreviewFromModel(model,size,captureEmbeddedFingerprint(blob,entry),true)
+end
+
+-- Retail snatch FSYS members are .fdat asset containers. The physical ball can
+-- be an HSD root in the member itself rather than an embedded Waza type-2 row.
+-- Enumerate every renderable root so the compact ball cannot be hidden by a
+-- larger effect/controller root. This is the primary 1.8.4 source path.
+local function captureMemberCandidates(src)
+  local out={}
+  if not (src and type(src.blob)=="string" and HSD) then return out end
+  local models,why
+  if type(HSD.extractModels)=="function" then
+    models,why=HSD.extractModels(src.blob,CAPTURE_DECODE_OPTS)
+  elseif type(HSD.extractModel)=="function" then
+    local one,err=HSD.extractModel(src.blob,CAPTURE_DECODE_OPTS);why=err
+    if one then models={one} end
+  end
+  if type(models)~="table" then return out,why end
+  for ri,model in ipairs(models) do
+    local preview=capturePreviewFromModel(model,#src.blob,nil,false)
+    if preview then
+      out[#out+1]={memberRoot=true,rootIndex=ri,size=#src.blob,preview=preview,score=preview.score,
+        entry={identifier=9000+ri,entryType="member-hsd",kind="member-model"}}
+    end
+  end
+  table.sort(out,function(a,b)
+    if a.score~=b.score then return a.score>b.score end
+    return (a.preview.vertices or math.huge)<(b.preview.vertices or math.huge)
+  end)
+  return out,why
+end
+
+local function captureBallCandidates(src)
+  local out={}
+  for _,entry in ipairs((src and src.timeline and src.timeline.entries) or {}) do
+    if tonumber(entry.entryType)==2 or entry.kind=="model" then
+      local size=tonumber(entry.dataSize or entry.embeddedSize) or 0
+      if size>0 then
+        local preview,why=captureModelPreview(src.blob,entry)
+        out[#out+1]={entry=entry,size=size,preview=preview,error=why,score=preview and preview.score or -math.huge}
+      end
+    end
+  end
+  table.sort(out,function(a,b)
+    if (a.preview~=nil)~=(b.preview~=nil) then return a.preview~=nil end
+    if a.score~=b.score then return a.score>b.score end
+    return a.size<b.size
+  end)
+  return out
+end
+
+local function captureTimelineDump(src,id,phase)
+  local t=src and src.timeline or {}
+  local out={
+    ("[%s/%s] archive=%s member=%s parsed=%s complete=%s parse_error=%s"):format(
+      tostring(id),tostring(phase),tostring(src and src.archive),tostring(src and src.member),
+      tostring(t and t.parsedCount),tostring(t and t.complete),tostring(t and t.parseError))
+  }
+  for i,e in ipairs((t and t.entries) or {}) do
+    out[#out+1]=("  #%d id=%s type=%s kind=%s dataSize=%s embeddedSize=%s dataOffset=%s magic=%s state=%s attachment=%s part=%s position=%s"):format(
+      i,tostring(e.identifier),tostring(e.entryType),tostring(e.kind),tostring(e.dataSize),
+      tostring(e.embeddedSize),tostring(e.dataOffset),tostring(e.dataMagic and hex(e.dataMagic) or nil),tostring(e.state),
+      tostring(e.attachment),tostring(e.partIndex),tostring(e.positionType))
+  end
+  return table.concat(out,"\n")
+end
+
+local function shallowCopy(t)
+  local o={};for k,v in pairs(t or {}) do o[k]=v end;return o
+end
+
 function M.extractCaptureAssets(mod,disc,progress,generated)
   if not (mod and disc and Waza and type(Waza.parse)=="function") then return nil,"capture source extractor unavailable" end
   local previousMod,previousGenerated=M.mod,M.buildGenerated
+  local previousSeen=M.buildGeneratedSeen
   M.mod=mod;M.buildGenerated=generated;M.buildGeneratedSeen={}
-  local index={revision=2,source="GC6E01 native snatch WZX type-2 ball models",balls={},aliases={}}
+  local index={revision=6,source="GC6E01 native snatch FSYS member HSD roots + Waza type-2 fallback / static runtime",balls={},aliases={},sourceReady=0,fallbackBalls=0,sourceComplete=false}
   local ids={"poke","great","ultra","master","safari","net","nest","repeatball","timer","dive","premier","luxury"}
-  local failures={}
+  local failures={};local timelineDiagnostics={};local candidateDiagnostics={}
+  local function recordFailure(id,phase,why)
+    local msg=tostring(id).."/"..tostring(phase)..": "..tostring(why);failures[#failures+1]=msg;return msg
+  end
+  local function flushCaptureDiagnostics()
+    local timelineText=table.concat(timelineDiagnostics,"\n\n");if timelineText~="" then timelineText=timelineText.."\n" end
+    local okT,whyT=write("build/capture_timeline_entries.txt",timelineText);if not okT then error(tostring(whyT),0) end
+    local candidateText=table.concat(candidateDiagnostics,"\n");if candidateText~="" then candidateText=candidateText.."\n" end
+    return candidateText
+  end
+
   local okRun,runErr=pcall(function()
     for bi,id in ipairs(ids) do
       if type(progress)=="function" then pcall(progress,"CAPTURE BALLS / "..id:upper(),bi-1,#ids) end
-      local def=CAPTURE_BALLS[id];local row={id=id,suffix=def.suffix,phases={}}
-      for phase,base in pairs(CAPTURE_PHASES) do
-        local archive=captureArchiveName(base,def.suffix)
+      local def=CAPTURE_BALLS[id];local row={id=id,suffix=def.suffix,phases={},sourceReady=false,fallback=false}
+      local sources={};local all={};local identifierPhases={};local visualPhases={};local embeddedPhases={}
+
+      -- Parse every authored capture phase first. This makes selection stable
+      -- across archives and lets a valid retail prop from one phase repair a
+      -- phase whose archive does not redundantly embed the model.
+      for _,phase in ipairs(CAPTURE_PHASE_ORDER) do
+        local base=CAPTURE_PHASES[phase];local archive=captureArchiveName(base,def.suffix)
         local src,why=captureSource(disc,archive)
         if src then
-          local entry,size=captureBallEntry(src.timeline)
-          if entry then
-            local stem="capture/"..id
-            local asset,aerr=compileWazaModel(src.blob,entry,stem,phase)
-            if asset then
-              asset.sourceArchive=archive;asset.sourceMember=src.member;asset.sourceEntry=entry.identifier;asset.sourceBytes=size
-              row.phases[phase]=asset
-              local rawPath=("cache/capture/source/%s_%s.wzx"):format(id,phase)
-              write(rawPath,src.blob);row.phases[phase].rawPath=rawPath
-            else failures[#failures+1]=id.."/"..phase..": "..tostring(aerr) end
-          else failures[#failures+1]=id.."/"..phase..": source ball type-2 model not found" end
-        else failures[#failures+1]=id.."/"..phase..": "..tostring(why) end
+          sources[phase]=src;timelineDiagnostics[#timelineDiagnostics+1]=captureTimelineDump(src,id,phase)
+          -- First inspect every HSD model root in the complete retail .fdat
+          -- member. Public Colosseum tooling treats these snatch FSYS payloads as
+          -- .fdat assets; the physical ball is therefore allowed to live at the
+          -- member level instead of inside a Waza type-2 entry.
+          local memberCandidates,memberWhy=captureMemberCandidates(src)
+          src.memberCandidates=memberCandidates
+          for ci,c in ipairs(memberCandidates or {}) do
+            local pv=c.preview
+            candidateDiagnostics[#candidateDiagnostics+1]=("%s/%s MEMBER_HSD root=%s vertices=%s textures=%s score=%.3f aspect=%s spans=%s"):format(
+              tostring(id),tostring(phase),tostring(c.rootIndex),tostring(pv and pv.vertices),tostring(pv and pv.textures),
+              tonumber(c.score) or -9999,tostring(pv and pv.aspect or nil),
+              pv and table.concat({("%.4g"):format(pv.spans[1]),("%.4g"):format(pv.spans[2]),("%.4g"):format(pv.spans[3])},",") or "nil")
+            if pv then
+              local ident="member:"..tostring(c.rootIndex)
+              identifierPhases[ident]=identifierPhases[ident] or {};identifierPhases[ident][phase]=true
+              if pv.visualFingerprint then visualPhases[pv.visualFingerprint]=visualPhases[pv.visualFingerprint] or {};visualPhases[pv.visualFingerprint][phase]=true end
+              all[#all+1]={phase=phase,src=src,candidate=c,memberRoot=true}
+            end
+          end
+          if #(memberCandidates or {})==0 then
+            candidateDiagnostics[#candidateDiagnostics+1]=(tostring(id).."/"..tostring(phase).." MEMBER_HSD none: "..tostring(memberWhy or "no roots"))
+          end
+
+          -- Keep decoded Waza type-2 payloads as a secondary path for archives
+          -- that really do embed the prop there.
+          local candidates=captureBallCandidates(src);src.captureCandidates=candidates
+          for ci,c in ipairs(candidates) do
+            local pv=c.preview
+            candidateDiagnostics[#candidateDiagnostics+1]=("%s/%s preview=%d id=%s type=%s size=%s decode=%s score=%.3f aspect=%s spans=%s vertices=%s textures=%s err=%s"):format(
+              tostring(id),tostring(phase),ci,tostring(c.entry.identifier),tostring(c.entry.entryType),tostring(c.size),
+              tostring(pv~=nil),tonumber(c.score) or -9999,tostring(pv and pv.aspect or nil),
+              pv and table.concat({("%.4g"):format(pv.spans[1]),("%.4g"):format(pv.spans[2]),("%.4g"):format(pv.spans[3])},",") or "nil",
+              tostring(pv and pv.vertices or nil),tostring(pv and pv.textures or nil),tostring(c.error))
+            if pv then
+              local ident=tostring(c.entry.identifier or "nil")
+              identifierPhases[ident]=identifierPhases[ident] or {};identifierPhases[ident][phase]=true
+              if pv.visualFingerprint then visualPhases[pv.visualFingerprint]=visualPhases[pv.visualFingerprint] or {};visualPhases[pv.visualFingerprint][phase]=true end
+              if pv.embeddedFingerprint then embeddedPhases[pv.embeddedFingerprint]=embeddedPhases[pv.embeddedFingerprint] or {};embeddedPhases[pv.embeddedFingerprint][phase]=true end
+              all[#all+1]={phase=phase,src=src,candidate=c,memberRoot=false}
+            end
+          end
+        else
+          recordFailure(id,phase,why)
+        end
       end
-      -- Shake is the most compact/consistent source family and is mandatory;
-      -- other phases may fail open to that exact same source prop.
-      if not row.phases.shake then error("native capture ball missing for "..id) end
+
+      -- 1.8.3: retail WZX archives do NOT guarantee that the same model blob or
+      -- decoded visual fingerprint is duplicated across snatch phases. 1.8.2 made
+      -- recurrence mandatory and therefore rejected every real retail ball (0/12)
+      -- even though the archives, WZX parser and HSD decoder were all healthy.
+      --
+      -- Select from actual decoded Type-2 HSD source instead. snatch_shake is the
+      -- strongest semantic bank because the ball itself must be present while it
+      -- rocks on the floor; land/throw/miss remain ordered fallbacks. Cross-phase
+      -- identity is retained as bonus evidence, never as a hard requirement.
+      local function phaseCount(set)local n=0;for _ in pairs(set or {}) do n=n+1 end;return n end
+      local phaseBonus={shake=260,land=120,throw=90,miss=35}
+      local ranked={}
+      for _,x in ipairs(all) do
+        local pv=x.candidate.preview or {}
+        local ident=tostring(x.candidate.entry.identifier or "nil")
+        local exactN=phaseCount(embeddedPhases[pv.embeddedFingerprint])
+        local visualN=phaseCount(visualPhases[pv.visualFingerprint])
+        local identN=phaseCount(identifierPhases[ident])
+        local textures=tonumber(pv.textures) or 0
+        local vertices=tonumber(pv.vertices) or 0
+        local aspect=tonumber(pv.aspect) or math.huge
+        local textureEvidence=(textures>0) and (120+math.min(textures,4)*12) or -80
+        local shapeEvidence=(aspect<=1.8 and 90) or (aspect<=2.4 and 45) or (aspect<=3.0 and 5) or -120
+        local vertexEvidence=(vertices>=24 and vertices<=20000) and 30 or ((vertices>0 and vertices<=50000) and 5 or -60)
+        local recurrenceEvidence=exactN*80+visualN*120+identN*18
+        -- A drawable model root discovered in the complete authored .fdat is
+        -- stronger capture-source evidence than assuming one Waza row owns it.
+        local memberEvidence=x.memberRoot and 420 or 0
+        local score=(tonumber(x.candidate.score) or 0)+(phaseBonus[x.phase] or 0)+textureEvidence+shapeEvidence+vertexEvidence+recurrenceEvidence+memberEvidence
+        x.exactPhaseCount=exactN;x.visualPhaseCount=visualN;x.identifierPhaseCount=identN;x.lockScore=score
+        -- Prefer genuinely textured, compact HSD props. If a retail ball happens
+        -- to use material colour without a texture, the decoded fallback list
+        -- below still gives it a chance rather than inventing a byte-size window.
+        x.strongBallCandidate=(textures>0 and vertices>=24 and vertices<=50000 and aspect<=3.0)
+        ranked[#ranked+1]=x
+      end
+      table.sort(ranked,function(a,b)
+        if a.strongBallCandidate~=b.strongBallCandidate then return a.strongBallCandidate==true end
+        if a.lockScore~=b.lockScore then return a.lockScore>b.lockScore end
+        if a.phase~=b.phase then return (phaseBonus[a.phase] or 0)>(phaseBonus[b.phase] or 0) end
+        return (a.candidate.size or math.huge)<(b.candidate.size or math.huge)
+      end)
+
+      -- Compile candidates in ranked order and accept the first one that really
+      -- becomes a drawable static HSD asset. This is a stronger source contract
+      -- than fingerprint recurrence: the bytes came from this ball's retail WZX
+      -- family, parsed as Type-2, decoded as HSD, survived material/texture export
+      -- and produced drawable source geometry. No procedural model can satisfy it.
+      local compiledAny,canonical,chosenAsset,lastErr=nil,nil,nil,nil
+      for ai,x in ipairs(ranked) do
+        local stem="capture/"..id
+        local trial,why
+        if x.memberRoot then
+          trial,why=compileDecodedCaptureModel(x.candidate.preview and x.candidate.preview.model,stem,x.phase,"root"..tostring(x.candidate.rootIndex or ai))
+        else
+          trial,why=compileWazaModel(x.src.blob,x.candidate.entry,stem,x.phase,{staticOnly=true})
+        end
+        local pv=x.candidate.preview or {}
+        candidateDiagnostics[#candidateDiagnostics+1]=("%s/source-lock compile=%d sourcePhase=%s id=%s size=%s score=%.3f strong=%s exact=%s visual=%s ident=%s textures=%s aspect=%s result=%s"):format(
+          tostring(id),ai,tostring(x.phase),tostring(x.candidate.entry.identifier),tostring(x.candidate.size),
+          tonumber(x.lockScore) or 0,tostring(x.strongBallCandidate==true),tostring(x.exactPhaseCount or 0),
+          tostring(x.visualPhaseCount or 0),tostring(x.identifierPhaseCount or 0),tostring(pv.textures),tostring(pv.aspect),
+          trial and (x.memberRoot and "PASS_MEMBER_HSD_STATIC" or "PASS_TYPE2_STATIC") or ("FAIL "..tostring(why)))
+        if trial then canonical=x;chosenAsset=trial;break else lastErr=why end
+      end
+
+      if canonical and chosenAsset then
+        local pv=canonical.candidate.preview or {}
+        row.canonicalIdentifier=canonical.candidate.entry.identifier
+        row.canonicalSourcePhase=canonical.phase
+        row.canonicalScore=canonical.lockScore
+        row.canonicalExactPhases=canonical.exactPhaseCount
+        row.canonicalVisualPhases=canonical.visualPhaseCount
+        row.canonicalIdentifierPhases=canonical.identifierPhaseCount
+        row.selection=canonical.memberRoot and "snatch-member-hsd-root-v1" or "waza-type2-decoded-hsd-v3"
+        row.staticSource=true
+        chosenAsset.sourceArchive=canonical.src.archive
+        chosenAsset.sourceMember=canonical.src.member
+        chosenAsset.sourceEntry=canonical.memberRoot and ("member-root:"..tostring(canonical.candidate.rootIndex)) or canonical.candidate.entry.identifier
+        chosenAsset.sourceBytes=canonical.memberRoot and #canonical.src.blob or canonical.candidate.size
+        chosenAsset.sourceLocked=true
+        chosenAsset.staticSource=true
+        chosenAsset.sourceSelection=row.selection
+        local rawPath=("cache/capture/source/%s_%s.wzx"):format(id,canonical.phase)
+        local wrote,werr=write(rawPath,canonical.src.blob);if not wrote then error(tostring(werr),0) end
+        chosenAsset.rawPath=rawPath
+
+        -- One retail ball model is intentionally shared across throw/land/shake/
+        -- miss. Those phases describe choreography around the SAME physical prop;
+        -- PlayerTrainer owns that world motion. Requiring four separately matching
+        -- model blobs was the architectural mistake that caused the 0/12 lockout.
+        for _,phase in ipairs(CAPTURE_PHASE_ORDER) do
+          local asset=shallowCopy(chosenAsset)
+          asset.capturePhase=phase
+          asset.sourcePhase=canonical.phase
+          asset.sharedRetailProp=true
+          row.phases[phase]=asset
+        end
+        compiledAny=chosenAsset
+        row.sourceReady=true;index.sourceReady=index.sourceReady+1
+      else
+        recordFailure(id,"all","no drawable retail HSD ball root found in snatch member or type-2 payload: "..tostring(lastErr or "no candidate"))
+        row.fallback=true
+        row.fallbackReason="native source model unavailable; runtime procedural capture prop enabled"
+        index.fallbackBalls=index.fallbackBalls+1
+      end
       index.balls[id]=row
       for _,alias in ipairs(def.aliases or {}) do index.aliases[tostring(alias):upper()]=id end
+      local candidateText=flushCaptureDiagnostics()
+      local failText=table.concat(failures,"\n");if failText~="" then failText=failText.."\n" end
+      local okD,whyD=write("build/capture_source.txt",failText..candidateText);if not okD then error(tostring(whyD),0) end
     end
-    write("cache/capture/index.lua","return "..serialize(index).."\n")
-    write("build/capture_source.txt",table.concat(failures,"\n")..(#failures>0 and "\n" or ""))
-    if type(progress)=="function" then pcall(progress,"CAPTURE BALLS READY",#ids,#ids) end
+
+    index.sourceComplete=(index.sourceReady==#ids and index.fallbackBalls==0)
+    -- Capture-source uncertainty must never brick arenas/trainers/MoveFX again.
+    -- `ready` means the capture bank is structurally usable; `sourceComplete`
+    -- separately states whether all 12 visible props are genuine retail HSD.
+    index.ready=true
+    local okIndex,indexErr=write("cache/capture/index.lua","return "..serialize(index).."\n");if not okIndex then error(tostring(indexErr),0) end
+    local candidateText=flushCaptureDiagnostics();local failText=table.concat(failures,"\n");if failText~="" then failText=failText.."\n" end
+    local okDiag,diagErr=write("build/capture_source.txt",failText..candidateText);if not okDiag then error(tostring(diagErr),0) end
+    if type(progress)=="function" then pcall(progress,("CAPTURE BALLS READY / %d SOURCE / %d FALLBACK"):format(index.sourceReady,index.fallbackBalls),#ids,#ids) end
   end)
-  M.mod=previousMod;M.buildGenerated=previousGenerated;M.buildGeneratedSeen=nil
+
+  if not okRun then
+    pcall(function()
+      local detail=table.concat(failures,"\n");if detail~="" then detail=detail.."\n" end
+      local candidateText=table.concat(candidateDiagnostics,"\n");if candidateText~="" then candidateText=candidateText.."\n" end
+      write("build/capture_source.txt",detail..candidateText.."fatal="..tostring(runErr).."\n")
+    end)
+  end
+  M.mod=previousMod;M.buildGenerated=previousGenerated;M.buildGeneratedSeen=previousSeen
   if not okRun then return nil,tostring(runErr) end
-  return {ready=true,count=#ids,failures=failures,index="cache/capture/index.lua"}
+  return {ready=index.ready==true,sourceComplete=index.sourceComplete==true,count=#ids,sourceReady=index.sourceReady,
+    fallbackBalls=index.fallbackBalls,failures=failures,index="cache/capture/index.lua",
+    message=index.sourceComplete and nil or ("capture bank ready with "..tostring(index.sourceReady).."/"..tostring(#ids).." retail HSD balls; unresolved rows use explicit procedural fallback")}
+end
+
+-- Build the complete retail move-bank cache up front.  Runtime prefetch remains
+-- as a repair/fail-open path, but a healthy generated cache should never need
+-- to reopen the GameCube image just because a previously unseen Pokemon used a
+-- different move.  The alias table intentionally covers all 251 Gen I/II move
+-- ids, so this scan also becomes a concrete coverage report rather than a
+-- hand-maintained "supported moves" list.
+function M.extractAllMoves(mod,disc,progress,generated)
+  assert(mod and mod.cache,"MoveFX full build: cache unavailable")
+  assert(disc,"MoveFX full build: disc unavailable")
+  local previousMod,previousOpen,previousGenerated=M.mod,M.openDisc,M.buildGenerated
+  local previousSeen=M.buildGeneratedSeen
+  M.mod=mod;M.openDisc=function() return disc end;M.buildGenerated=generated;M.buildGeneratedSeen={}
+  M.memory={};M.negative={};M.pending={};M.pendingKeys={};M.prefetchStats={queued=0,completed=0,failed=0}
+  local index={revision=M.revision,wazaRevision=Waza and Waza.revision or nil,source="GC6E01 retail WZX",moves={},soundIds={}}
+  local soundSeen={};local ready,missing=0,0;local report={}
+  local okRun,runErr=pcall(function()
+    for id=1,251 do
+      if type(progress)=="function" then pcall(progress,("MOVEFX %03d/251"):format(id),id-1,251) end
+      local spec,err=M.acquire(id,nil)
+      if type(spec)=="table" then
+        ready=ready+1
+        local row={id=id,stem=spec.stem,style=spec.style,wazaReady=spec.wazaReady==true,
+          attackReady=spec.attackReady==true,damageReady=spec.damageReady==true,soundIds={}}
+        local localSeen={}
+        for _,se in ipairs(spec.sounds or {}) do
+          local sid=(type(se)=="table" and tonumber(se.sourceType)==5) and tonumber(se.soundId) or nil
+          if sid and sid>=0 and sid<65536 and not localSeen[sid] then
+            sid=math.floor(sid);localSeen[sid]=true;row.soundIds[#row.soundIds+1]=sid
+            if not soundSeen[sid] then soundSeen[sid]=true;index.soundIds[#index.soundIds+1]=sid end
+          end
+        end
+        table.sort(row.soundIds);index.moves[id]=row
+        report[#report+1]=("%03d READY stem=%s waza=%s attack=%s damage=%s sounds=%d"):format(id,tostring(spec.stem),tostring(row.wazaReady),tostring(row.attackReady),tostring(row.damageReady),#row.soundIds)
+      else
+        missing=missing+1
+        index.moves[id]={id=id,missing=true,error=tostring(err or "source WZX unavailable")}
+        report[#report+1]=("%03d MISSING %s"):format(id,tostring(err or "source WZX unavailable"))
+      end
+      if id%8==0 and type(collectgarbage)=="function" then pcall(collectgarbage,"step",220) end
+    end
+    table.sort(index.soundIds)
+    index.ready=ready;index.missing=missing;index.total=251;index.uniqueSounds=#index.soundIds
+    write("cache/movefx/index.lua","return "..serialize(index).."\n")
+    write("build/movefx_coverage.txt",table.concat(report,"\n").."\n")
+    if type(progress)=="function" then pcall(progress,("MOVEFX READY %d/251 / %d source SFX ids"):format(ready,#index.soundIds),251,251) end
+  end)
+  M.mod=previousMod;M.openDisc=previousOpen;M.buildGenerated=previousGenerated;M.buildGeneratedSeen=previousSeen
+  if not okRun then return nil,tostring(runErr) end
+  return {ready=(ready==251 and missing==0),total=251,sourceReady=ready,missing=missing,soundIds=index.soundIds,index=index}
 end
 
 function M.install(mod,openDisc)
@@ -968,7 +1471,7 @@ function M.acquire(moveId,move)
   local key,phases,variants
   local attempted={}
   for _,candidate in ipairs(candidates) do
-    local found,var=phasesFor(disc,candidate,p.phases)
+    local found,var=phasesFor(disc,candidate,p.phases,(id and MOVE[id]~=nil and p.candidate~=true) and true or false)
     attempted[#attempted+1]=candidate
     if #found>0 then key=candidate;phases=found;variants=var;break end
     M.memory[candidate]=false
@@ -1024,21 +1527,34 @@ function M.acquire(moveId,move)
         local copy={};for k,v in pairs(entry) do copy[k]=v end
         copy.rawPath=rawWazaPath
         local localBank=entry.gptOffset and bankFx.gptBanks and bankFx.gptBanks[entry.gptOffset] or nil
-        -- A real type-3 SequenceEntry does not necessarily embed a new GPT1.
-        -- Flamethrower/Blizzard/Thunderbolt commonly load one bank in the first
-        -- row and have later rows select another generator from it by REF id.
-        -- Resolve those rows against the extracted generator table so the Waza
-        -- scheduler can dispatch each authored particle beat independently.
-        if not localBank and entry.kind=="particle" and entry.rootRef~=nil then
+        -- Retail type-3 resource reuse is keyed by the common `state` field: a
+        -- non-zero state points at an earlier Waza entry and reuses that entry's
+        -- loaded particle bank. Resolve that dependency first. Selector/REF
+        -- matching is only a compatibility fallback for old or damaged caches.
+        if not localBank and entry.kind=="particle" and (tonumber(entry.state) or 0)~=0 then
+          local wantedState=tonumber(entry.state)
+          for i=#timeline.entries,1,-1 do
+            local prior=timeline.entries[i]
+            if prior and tonumber(prior.identifier)==wantedState and prior.kind=="particle" then
+              localBank=tonumber(prior.sourceBank) or nil
+              copy.resolvedGPTOffset=prior.gptOffset or prior.resolvedGPTOffset
+              copy.sharedParticleBank=localBank~=nil
+              copy.sharedFromIdentifier=wantedState
+              break
+            end
+          end
+        end
+        if not localBank and entry.kind=="particle" and (entry.selector~=nil or entry.rootRef~=nil) then
+          local wanted=tonumber(entry.selector~=nil and entry.selector or entry.rootRef)
           local matchedOffset
           for _,program in ipairs(bankFx.programs or {}) do
-            if program.refId~=nil and tonumber(program.refId)==tonumber(entry.rootRef) then
+            if program.refId~=nil and tonumber(program.refId)==wanted then
               localBank=tonumber(program.bank) or nil
               matchedOffset=program.gptOffset
               break
             end
           end
-          if localBank then copy.resolvedGPTOffset=matchedOffset;copy.sharedParticleBank=true end
+          if localBank then copy.resolvedGPTOffset=matchedOffset;copy.selectorResolvedFallback=true end
         end
         if localBank then
           copy.sourceBank=localBank
@@ -1242,6 +1758,12 @@ end
 M.prefetchBattler=M.queueBattler
 M.prefetchBattle=M.queueBattle
 
+local function androidRuntime()
+  if love and love.system and type(love.system.getOS)=="function" then
+    local ok,v=pcall(love.system.getOS);return ok and tostring(v or "")=="Android"
+  end
+  return false
+end
 function M.pumpPrefetch(maxItems)
   maxItems=math.max(0,math.floor(tonumber(maxItems) or 1))
   local out={processed=0,ready=0,failed=0,pending=#M.pending}
@@ -1254,6 +1776,7 @@ function M.pumpPrefetch(maxItems)
     else
       out.failed=out.failed+1;M.prefetchStats.failed=M.prefetchStats.failed+1
     end
+    if androidRuntime() and type(collectgarbage)=="function" then pcall(collectgarbage,"collect") end
   end
   out.pending=#M.pending
   return out
@@ -1263,5 +1786,5 @@ function M.clear()
   M.memory={};M.negative={};M.pending={};M.pendingKeys={};M.prefetchStats={queued=0,completed=0,failed=0};return true
 end
 function M.status() return {revision=M.revision,wazaRevision=Waza and Waza.revision or nil,cached=M.memory,negative=M.negative,sourceAliases=251,prefetch=true,peek=true,pending=#M.pending,prefetchStats=M.prefetchStats,
-  prefetchPolicy="lead-party WZX warmed at game.ready; current battle banks completed before CBE world presentation begins; no source extraction on visible move/damage frames"} end
+  prefetchPolicy=androidRuntime() and "Android: global game.ready WZX warm disabled; active battle banks resolve on demand/pre-entry and metadata/GPU caches trim after battle" or "lead-party WZX warmed at game.ready; current battle banks completed before CBE world presentation begins; no source extraction on visible move/damage frames"} end
 return M

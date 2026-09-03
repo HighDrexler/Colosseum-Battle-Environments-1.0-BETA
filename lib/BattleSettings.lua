@@ -47,7 +47,7 @@ local function prefs(game)
   local validMusic={random=true,normal=true,first=true,cipher_peon=true,miror_b=true,cipher_admin=true,mirakle_b=true,semifinal=true,final=true,link1=true,link2=true,link3=true,original=true}
   if p.music=="colosseum" or p.music=="wild" or p.music=="trainer" or p.music=="gym" then p.music="normal" end
   if not validMusic[p.music] then p.music="normal" end
-  local validArena={auto=true,water=true,orre_colosseum=true,realgam_colosseum=true,outdoor_wild=true,mt_battle_summit=true}
+  local validArena={auto=true,random=true,water=true,orre_colosseum=true,realgam_colosseum=true,outdoor_wild=true,mt_battle_summit=true}
   if not validArena[p.arena] then p.arena="auto" end
   return p
 end
@@ -187,7 +187,7 @@ local function openBattleMenu(game,returnId,returnParent)
     end
     local rows={
       {label="ROM SOURCE   "..tostring(cs.sourceStatus or "UNKNOWN"),keepOpen=true},
-      {label="RUNTIME     "..(cs.runtimeReady and "FULL RUNTIME READY" or (cs.visualReady and "VISUAL READY / AUDIO PENDING" or tostring(cs.sourceStatus or "BUILD PENDING"))),keepOpen=true},
+      {label="RUNTIME     "..(cs.fullRuntimeReady and "FULL RUNTIME READY" or (cs.visualReady and "VISUAL READY / AUDIO PENDING" or tostring(cs.sourceStatus or "BUILD PENDING"))),keepOpen=true},
       {label="SOURCE      "..tostring(cs.source or "UNKNOWN"),keepOpen=true},
       {label="DISC        "..tostring(cs.discId or "GC6E01").." / "..tostring(cs.discRegion or "USA"),keepOpen=true},
       {label="EXTRACT V"..tostring(cs.extractionCacheVersion or 1).." / REV "..tostring(cs.extractorRevision or 1),keepOpen=true},

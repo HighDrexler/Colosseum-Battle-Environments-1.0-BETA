@@ -46,10 +46,29 @@ local function endFrame(g)
   g.present()
 end
 
+-- A full-screen clear + present + event pump costs an entire display frame on
+-- a phone. The old throttle was bypassed whenever the LABEL changed, and the
+-- extractors change their label per move / per species / per member -- so a
+-- 251-move pass paid hundreds of full presents purely to redraw a progress
+-- bar. The throttle is now on time alone (still ~22 updates/second, which is
+-- more than a human reads), and `force` still bypasses it for stage
+-- transitions and the final frame.
+--
+-- Event pumping is deliberately NOT throttled with the redraw: Android needs
+-- the message queue drained during a long synchronous build or the OS reports
+-- the app as unresponsive. Pumping without redrawing is nearly free.
+local function pumpOnly()
+  if love and love.event and love.event.pump then pcall(love.event.pump) end
+end
+
 local function draw(label,current,total,force,finalText)
   if not graphicsReady() then return end
   local now=(love.timer and love.timer.getTime and love.timer.getTime()) or os.clock()
-  if not force and U.lastLabel==label and now-U.lastDraw<0.045 then return end
+  if not force and now-U.lastDraw<0.045 then
+    U.lastLabel=label
+    pumpOnly()
+    return
+  end
   U.lastDraw=now;U.lastLabel=label;U.active=true
   local ok=pcall(function()
     local g,panelW,_,x,y=beginFrame()
@@ -70,7 +89,7 @@ local function draw(label,current,total,force,finalText)
     g.setColor(0.78,0.80,0.74,1);g.print(("OVERALL CACHE  %d%%"):format(math.floor(overall*100+0.5)),bx,by+34)
 
     g.setColor(0.58,0.62,0.57,1)
-    g.print("First launch after importing the disc or updating the extractor can take ~30-90 seconds.",x+28,y+275)
+    g.print("Visual cache work is normally short; first portable soundtrack synthesis on mobile can take several minutes once.",x+28,y+275)
     g.print("The current source/member is shown above; progress heartbeats confirm the build is still active.",x+28,y+301)
     if finalText then g.setColor(0.90,0.86,0.65,1);printWrapped(g,finalText,x+28,y+330,panelW-56) end
     endFrame(g)
@@ -84,6 +103,23 @@ local function short(v,n)
   n=n or 150
   if #v>n then return v:sub(1,n-3).."..." end
   return v
+end
+
+local function failureButtons()
+  if not (love and love.graphics and type(love.graphics.getDimensions)=="function") then return nil end
+  local w,h=love.graphics.getDimensions();local panelW=math.min(w-48,760);local panelH=math.min(h-48,470)
+  local x=(w-panelW)/2;local y=(h-panelH)/2;local bx=x+28;local bw=panelW-56;local bh=34
+  return {
+    retry={x=bx,y=y+348,w=bw,h=bh},
+    continue={x=bx,y=y+386,w=bw,h=bh},
+    exit={x=bx,y=y+424,w=bw,h=bh},
+  }
+end
+local function actionAt(x,y)
+  x,y=tonumber(x),tonumber(y);if not x or not y then return nil end
+  local rows=failureButtons();if not rows then return nil end
+  for action,r in pairs(rows) do if x>=r.x and x<=r.x+r.w and y>=r.y and y<=r.y+r.h then return action end end
+  return nil
 end
 
 local function failureFrame(state,message,trainerFirst,trainerSource)
@@ -103,9 +139,14 @@ local function failureFrame(state,message,trainerFirst,trainerSource)
       g.setColor(0.68,0.71,0.66,1);printWrapped(g,short(trainerSource,210),x+166,y+236,panelW-194)
     end
     g.setColor(0.58,0.62,0.57,1);g.print("CBE will not initialize an incomplete generated runtime.",x+28,y+314)
-    g.setColor(0.84,0.84,0.75,1);g.print("R  RETRY CACHE BUILD",x+28,y+356)
-    g.print("ENTER  CONTINUE WITHOUT CBE",x+28,y+384)
-    g.print("ESC  EXIT GAME",x+28,y+412)
+    local rows=failureButtons()
+    local function button(r,label)
+      g.setColor(0.13,0.15,0.13,1);g.rectangle("fill",r.x,r.y,r.w,r.h,5,5)
+      g.setColor(0.84,0.84,0.75,1);g.print(label,r.x+12,r.y+9)
+    end
+    button(rows.retry,"RETRY CACHE BUILD   [R]")
+    button(rows.continue,"CONTINUE WITHOUT CBE   [ENTER]")
+    button(rows.exit,"EXIT GAME   [ESC]")
     endFrame(g)
   end)
   if not ok then U.disabled=true return false end
@@ -135,20 +176,38 @@ function U.failureGate(state,message,trainerFirst,trainerSource)
   local prevR,prevEnter,prevEsc=true,true,true
   local armedAt=((love.timer and love.timer.getTime and love.timer.getTime()) or os.clock())+0.20
   while true do
+    local now=(love.timer and love.timer.getTime and love.timer.getTime()) or os.clock()
     if love.event and love.event.pump then pcall(love.event.pump) end
     if love.event and type(love.event.poll)=="function" then
       local ok,iter=pcall(love.event.poll)
       if ok and iter then
-        for name in iter do
+        for name,a,b,c in iter do
           if name=="quit" then return "exit" end
+          if now==nil then now=(love.timer and love.timer.getTime and love.timer.getTime()) or os.clock() end
+          if name=="mousepressed" and tonumber(c or 1)==1 then
+            local action=actionAt(a,b);if action and now>=armedAt then return action end
+          elseif name=="touchpressed" then
+            local action=actionAt(b,c);if action and now>=armedAt then return action end
+          end
         end
       end
     end
-    local now=(love.timer and love.timer.getTime and love.timer.getTime()) or os.clock()
     local r=isDown("r")
     local ent=isDown("return") or isDown("kpenter")
     local esc=isDown("escape")
+    local pointerAction=nil
+    if now>=armedAt and love.touch and type(love.touch.getTouches)=="function" and type(love.touch.getPosition)=="function" then
+      local ok,ids=pcall(love.touch.getTouches)
+      if ok and type(ids)=="table" then
+        for _,id in ipairs(ids) do local okp,x,y=pcall(love.touch.getPosition,id);if okp then pointerAction=actionAt(x,y);if pointerAction then break end end end
+      end
+    end
+    if not pointerAction and now>=armedAt and love.mouse and type(love.mouse.isDown)=="function" and type(love.mouse.getPosition)=="function" then
+      local okd,down=pcall(love.mouse.isDown,1)
+      if okd and down then local okp,x,y=pcall(love.mouse.getPosition);if okp then pointerAction=actionAt(x,y) end end
+    end
     if now>=armedAt then
+      if pointerAction then return pointerAction end
       if r and not prevR then return "retry" end
       if ent and not prevEnter then return "continue" end
       if esc and not prevEsc then

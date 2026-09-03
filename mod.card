@@ -1,268 +1,69 @@
-## 1.6.1 — presentation stability / reaction cleanup
+## 1.8.4-capture-member-hsd.1 — retail member HSD capture resolution
+- Fixes the repeated 0/12 lockout by removing the assumption that the retail ball must live inside a Waza Type-2 payload.
+- Enumerates every renderable HSD root from each complete snatch_*.fdat FSYS member, including archives located beyond the normal 64 KiB fast-scan window.
+- Ranks complete-member HSD roots first using phase semantics, isotropic ball geometry, texture/material evidence and successful static source compilation; Type-2 payloads remain a secondary compatibility path.
+- Stores the selected retail geometry/materials/textures as a static capture asset so Android never depends on HSD morph-page playback for the ball.
+- Capture index revision 6 separates sourceComplete (12/12 genuine retail props) from ready (usable capture bank). Missing optional capture source is explicit fallback metadata and can no longer block arenas, trainers, MoveFX or audio.
 
-- Active 3D Pokémon are now hard-persistent through damage: dense `damage/pageN` / `faint/pageN` source banks receive the same root-travel stabilization as single-page banks, malformed reaction poses fall back to the resident base body, and an action-mesh draw fault can no longer intentionally become a blank damage frame.
-- Arena-floor collision now solves the complete final transform, including negative fallback/faint lift and whole-actor pitch/roll. The lowest animated vertex is clamped above the battle deck instead of only clamping the unshifted local pose.
-- Trainer motion is source-led but substantially more restrained: lower morph ceiling, ~1% residual whole-body procedural motion, reduced idle sway/bob/groove, reaction debounce, chip-damage filtering, and trainer KO frustration moved behind the Pokémon faint beat.
-- MoveFX now has one phase owner. A retail WazaSequence and a direct whole-role GPT1 fallback cannot run in parallel; damage no longer starts the same Waza twice, duplicate SequenceEntry wrappers are deduped, and missing PKX timing uses the Waza scheduler's explicit timing fallback instead of splitting presentation paths.
+## 1.8.3-capture-source-resolve.1 — retail capture source resolution
+- Fixes the 1.8.2 `0/12 retail balls source-locked` regression seen on real hardware.
+- Cross-phase fingerprint recurrence is now confidence evidence instead of a hard requirement.
+- Each ball is selected only from its own retail `snatch_*` WZX family, with `snatch_shake` prioritized because the physical ball must be present there.
+- Source readiness requires Type-2 parse + HSD decode + drawable static source compilation; byte-size heuristics stay removed.
+- The one proven retail prop is shared across throw/land/shake/miss world choreography.
+- Capture index revision 5 triggers a capture-only rebuild and preserves arenas/trainers/MoveFX/audio.
 
-## 1.6.0 — release / compatibility hardening
+## 1.8.1-capture-presentation.1 — catch choreography parity
+- Successful and failed captures now use the same capture camera path until the actual final outcome reveal; early BattleState.result / battle.ended knowledge can no longer telegraph success from the instant the ball is thrown.
+- Capture camera ownership now queues all non-capture/exit cuts until the wall-clock throw, impact, absorb, fall, settle, and shake sequence completes.
+- Reworks the throw into a source-hand release followed by constant-horizontal ballistic travel, a compact impact/recoil, gravity-driven drop, and a single damped landing settle instead of smoothstep floating/bobbing.
+- The throw camera is now a stable sideline tracking dolly rather than being attached directly to the moving projectile.
+- Successful catches retain a terminal enemy-suppression latch after the cinematic completes, preventing both CBE actors and native fallback sprites from reappearing during Pokédex/nickname dialogue.
+- Runtime/presentation-only patch; generated extractor/cache revision remains 15 and existing 1.8.0 source caches are reusable.
 
-- Final release cleanup removes only code proven unreachable or superseded; cache migrations, legacy host adapters and platform fallbacks remain intact.
-- Colosseum source handling is content-first rather than extension-first. CBE normalizes structurally valid GC6E01 raw ISO/GCM, safe trimmed/scrubbed raw media and GameCube CISO into one logical disc view and validates the FST + core FSYS source archives before extraction.
-- Manifest adds representation-aware GameCube import metadata (`gcn_ciso`, `allow_scrubbed`, `disc_id`, `disc_revision`) while preserving the canonical ISO + tested CISO hashes for older launcher builds.
-- Optional audio can never invalidate the visual runtime. Audio failures are warnings, individual themes register independently, missing themes fall back to original game music, and random mode only selects complete generated themes.
-- Retains 1.5.66's battle-entry Pokemon/action prewarm, whole-model arena-floor constraint, exhaustive 251-move retail WZX routing, and Gen-I/Gen-II capture queue/UI ownership fixes.
-- Historical test-only documentation is removed from the distributable; the release package keeps only current release/compatibility/audit documentation.
+## 1.8.0-capture-source-fix.1 — capture extraction resolution
+- Removes the 3-24 KiB capture model gate completely; source byte size is never a validity requirement.
+- Decodes every retail type-2 HSD candidate and ranks actual ball-like geometry plus recurrence across shake/throw/land/miss banks.
+- Uses the same decoded retail prop to repair phase banks that do not redundantly embed their own model.
+- Falls back to the exact static retail HSD prop if a source animation clip cannot be compiled.
+- Capture props are no longer allowed to block the entire generated CBE runtime; the existing deterministic 3D ball fallback is used only if no retail model can be decoded at all.
+- Retains detailed source/candidate diagnostics and bumps generated-runtime extractor revision to 15.
 
-## 1.5.66 — runtime blocker / final test correction
+## 1.8.0-capture-entry-probe.1 — retail capture type-2 probe
+- Confirms Android storage/import diagnostics from the previous test build.
+- Removes the hard 3-24 KiB gate from capture-ball selection.
+- Dumps every parsed WZX timeline row to `build/capture_timeline_entries.txt`.
+- Soft-ranks type-2 candidates around the historical ~7 KiB observation, then requires real HSD decode.
+- Writes per-candidate decode results to `build/capture_source.txt`.
+- Bumps extractor revision to 14 so this changed capture extraction path is rebuilt cleanly.
 
-- Large Pokémon no longer wait until their first visible draw to decode/upload their scene. CBE now prewarms both active battlers before opening the arena, warms the exact native action categories their current moves need, and materializes already-cached bench species at battle entry. Replacements that were not cached are synchronously prepared at the authoritative switch boundary before presentation providers can draw them.
-- Arena floor is now a true presentation collision plane for every Colosseum Pokémon actor. The loader records the minimum Y of base and native action/morph frames; runtime computes the current weighted source-pose minimum and translates the complete actor upward only when authored geometry would penetrate the arena. This fixes Pidgey/flying/damage-pose floor clipping without species hacks or deforming source animation.
-- MoveFX source routing advances to revision 14. All 251 Gen-I/II move IDs now have at least one exact retail GC6E01 WZX archive candidate proven against the user Colosseum disc FST. Incorrect broad aliases that could cross-wire Swords Dance/Rest were removed. Psychic -> `psycho`, Psybeam -> `psyche`, Wing Attack -> `tsubasa`; Wing Attack correctly waits for its source damage bank because the retail attack bank is timing/audio-only.
-- Source audit finds typed Type-2/Type-3 visual payloads for 249/251 move families; the two controller-only exceptions are Mirror Move and Conversion. Opaque Type-4 data remains preserved but is not falsely treated as decoded.
-- CBE now owns capture queue pacing, not just capture drawing. Gen I's stock 20-frame delay + ball animation chain are stripped after authoritative `battle.ball_thrown`, while outcome/state rows remain untouched. Gold's semantic queue is held at the same boundary. Both queues release only after CBE's wall-clock Colosseum capture sequence completes, so battle-speed multipliers cannot make result dialogue outrun the ball.
-- During the owned capture window, native bottom text, status HUD, Gen-II panel compositing, and stock ball/picture animation visuals are suppressed. The original "used BALL" / caught dialogue and Game Boy/GBC sprites cannot leak through the 3D sequence; authoritative caught/broke-free/nickname/storage logic resumes immediately afterward.
-- 1.5.65's clean Colosseum `me_snatch` success audio replacement remains intact; native `Caught_Mon` stays suppressed only when the ISO-derived source cue is available.
+## 1.8.0-android-storage-diagnostics.1 — Android / AYN Thor source-cache diagnostics
+- Preserves the 1.8.0 gameplay/presentation/cache contracts; this is a diagnostics-only test pass.
+- Verifies a nested `mod.cache` write/read/info/delete cycle before extraction and surfaces the exact failing cache path/error.
+- Verifies bounded `mod.imports` source reads and records native-vs-legacy launcher bridge/container metadata.
+- Capture extraction now preserves its second-return error, checks raw/index/diagnostic writes, and identifies the exact WZX archive/member/cache path that failed.
+- Writes `build/android_storage_diagnostic.txt` whenever the cache is writable; capture-specific detail remains in `build/capture_source.txt`.
 
-## 1.5.65 — final pre-release fidelity candidate
+## 1.7.19-water-faint-sprite-parity.1 — Phenac fidelity + faint/sprite ownership
+- Regrades Water/Phenac Colosseum on both full and Android GLES shaders so authentic pale stone retains grey joints, wall shade, water recesses and balcony depth instead of clipping to white.
+- Removes Mt. Battle sky/cloud textures from Water's background; the extracted M1 source scene now owns all visible stadium architecture while only a neutral interior fallback sits behind genuine geometry gaps.
+- Gen 1 raw `battle.fainted` is buffered until the engine's visible faint-slide boundary, preventing a lethal selection from collapsing/removing the CBE actor before the HP bar finishes draining, including at 4x.
+- Gen 2 2D battlers now re-resolve Gen1Recomp's live `pokemon.sprite` seam before native fallback, preserving Battle Arts/custom front/back sprite packages whenever CBE Colosseum models are not the selected presentation.
+- Retains the 1.7.18 Gen 1 full-viewport fix and all 1.7.17 camera-safe/source-arena work.
 
-- Corrected capture-ball solidity/depth behavior and source-hand release anchoring.
-- Colosseum `me_snatch` catch success now owns the success fanfare without layering `Caught_Mon`, and regenerates as PCM16 from the user ISO.
-- Lead/current WZX banks are actually completed before visible battle presentation instead of remaining queued and falling back for the whole fight.
-- MoveFX camera direction follows the live WazaSequence timeline, source attachment points, fight axis, and source-normalized actor geometry.
-- Retains source-first WazaSequence/GPT1/HSD effect rendering and fails open to native presentation when source data is unavailable.
+## 1.7.18-gen1-viewport-hotfix.1 — Gen 1 full-viewport compositor hotfix
+- Gen 1 CBE `worldOverride` is now scaled to the live playfield instead of inheriting the engine's physical-pixel 1/dpi assumption.
+- Fix is Gen 1-only; Gen 2 compositor remains untouched.
+- Includes all 1.7.17 arena fidelity/camera safety changes.
 
-## 1.5.64 — grounded capture shake / rotation correction
+## 1.7.17-arena-camera-fidelity.1 — Arena source parity + camera safety
 
-- Native Colosseum capture balls no longer free-spin while planted. The source ball model/texture stays intact, but grounded shake orientation is driven around the ball-floor contact point instead of around its centre.
-- Each engine shake is now a discrete physical beat: planted pause -> 27° primary tilt -> centre return -> small counter-recoil -> centre -> hold. Consecutive shakes alternate sides so 1/2/3-shake results are visually countable.
-- The native snatch_shake prop is held at its stable source frame during the grounded struggle to prevent decoded HSD root rotation from fighting CBE's world-space contact pivot.
-- Shake camera is slightly tighter and remains locked to the landing point, so it cannot visually cancel the ball movement.
-- The same capture module and timing remain shared by Gen 1 and Gen 2.
+- Adds arena-specific camera-safe volumes so source/Waza cameras cannot escape beneath floors, behind venue shells, or into unreadable bird's-eye framing.
+- Validates attacker + target screen framing for attack, impact, reaction, faint, and switch shots; preserves the requested source axis when possible and falls back to a stable combat master only when necessary.
+- Refreshes Water, Orre, Realgam, and Mt. Battle from the user's GC6E01 HSD scenes under the current material/GX-wrap serializer while preserving the authored Wildlands cache path.
+- Rebuilds only arena extraction/runtime-mesh caches for existing 1.7.16 installs; trainer, MoveFX, capture, and audio caches remain reusable.
+- Tightens Wildlands terrain shaping for a less procedural, more source-adjacent Orre presentation.
+- Fixes the remaining Mobile Battle UI quarter-screen regression only on the Gen 1 worldOverride compositor boundary; Gen 2's known-good compositor is explicitly untouched.
+- Bumps compact arena runtime meshes to v2 so Android cannot silently reuse stale geometry after the source-parity refresh.
 
-## 1.5.63 — hard BattleState ownership / unified capture / global Pokémon scale
-
-- COLOSSEUM ARENAS ON is now an absolute host contract on both generations. CBE always starts and retains its standalone BattleState/world/camera/trainer compositor; the old Gen I Stadium-provider delegation path is removed.
-- Fixes the actual Gen I reversion race: StadiumBattleFX reattaches its BattleHost on every `battle.started`; CBE now reclaims the outermost BattleState wrapper at that same boundary and self-heals if a later mod displaces it. Epoch guards make stale nested CBE wrappers inert, and CBE reasserts `Renderer.worldOverride` after all inner renderers return, so another host cannot win the final frame by writing last.
-- Even if the selected CBE arena fails to begin/render, CBE retains an ownership-only BattleState lock instead of falling back to another compositor; the engine HUD/input may remain, but Battle Art/Stadium cannot silently replace the stage.
-- Battle Art / Dramatic Shape / compatible forks may still contribute resolved Pokémon sprites or portable `battleActors`, but full `OverworldBattle`, `battlePresentation`, Stadium-private arena, or external camera staging can no longer replace a CBE battle while arenas are enabled.
-- Capture uses one generation-neutral choreography. Successful catches are normalized to the same three source `snatch_shake` beats as Colosseum; failed catches preserve the engine's exact 0–3 shake count. Success vs breakout branches only after the final common shake.
-- Runtime trainer-hand selection now rejects ankle/knee JOBJ candidates and re-selects an upper-body lead-side joint from the retained ISO skeleton even with an existing 1.5.62 cache. A final world-space guard prevents any ball release below hand/torso height.
-- Native ISO ball animation now owns grounded orientation. CBE adds only a single forward airborne roll, removing the old compounded yaw/roll/manual wobble that made throws and shakes rotate without physical logic.
-- Pokémon model size now uses a universal allometric presentation curve rather than literal linear Pokédex height. Tiny species receive readability floors, giant species compress progressively, and length-measured serpentine bodies (Ekans/Arbok/Onix/Gyarados/Dragonair/Furret/Dunsparce/Steelix) receive standing-silhouette compensation. The same scale path is used by Gen I and Gen II.
-
-## 1.5.62 — native source ball / hand-throw capture fidelity
-
-- Capture/send-out props now use the actual ball-type-specific HSD model + source texture extracted from Colosseum's `snatch_*` WZX banks. The procedural red/white sphere is fallback-only.
-- Ball scale is derived from the original Colosseum ball-to-Red source ratio, removing the oversized prop from 1.5.61.
-- Trainer cache v10 retains source JOBJ hand positions and pose-joint motion so the ball stays attached to the real throwing hand until release.
-- Failed catches now show the authoritative engine shake count in a fixed low ball shot; the camera no longer follows/cancels the wobble. Breakout holds on the miss beat before returning to the Pokémon.
-- Extractor 12 adds the complete native capture-ball bank for 12 ball variants and preserves raw source WZX. Existing 1.5.61 caches migrate by rebuilding only trainer hand metadata + capture balls; arenas/transition/audio are reused.
-
-## 1.5.61 — Colosseum capture-sequence parity pass
-
-- Fixes the capture ball targeting the player's own Pokémon. Send-out and capture anchors are now separate; captures resolve against the live enemy-side arena anchor in every CBE arena.
-- Rebuilds capture presentation around the supplied Pokémon Colosseum reference: trainer/ball charge close-up, tracked throw, target impact, visible absorption, ball drop/landing, low ball-level shake camera, and breakout/success result framing.
-- Capture choreography now uses a real presentation clock, so Gen I battle-speed/fast-forward cannot burn through the throw, absorption, or shakes between rendered frames.
-- Enemy Pokémon are continuously absorbed into the ball. CBE 3D actors and resolved 2D sprite sources both scale to zero through the capture point and remain hidden during drop/shakes; breakout restores the target through the same effect.
-- Ball shakes now use a readable ~21° physical rock around the ground contact point rather than the old tiny lateral wobble. Capture FX add charge, impact, absorption, landing, and breakout energy shells around the real 3D prop.
-- Capture camera ownership remains locked for the complete sequence instead of timing out to a passive wide shot after 1.35 seconds. Lower-priority battle events are deferred until capture presentation is complete.
-- Successful catches now play Colosseum's real `me_snatch_song` / Snag-success jingle. The existing source-audio importer renders bgm_archive setup 9 from the user's own GC6E01 disc into `assets/audio/capture/me_snatch.wav`; no ripped audio is shipped in the mod.
-- Audio cache advances from 23 to 24 generated assets. Existing visual/Pokémon/trainer/arena/MoveFX caches are not invalidated.
-
-## 1.5.57 — render-stack crash fix / continuous trainer source motion
-
-- Fixes the Flame Wheel / repeated-MoveFX `Maximum stack depth reached (more pushes than pops?)` crash. Every CBE MoveFX/Type-2/Pokemon graphics scope now unwinds its LÖVE push even when a source particle, shader or mesh draw throws.
-- Individual malformed MoveFX particles/groups fail open and are quarantined after repeated render faults instead of aborting the complete arena frame. The arena compositor also keeps the stage/trainer frame alive when the actor/FX pass fails, eliminating the black-frame failure mode tied to caught draw exceptions.
-- Trainer playback no longer uses winner-take-all semantic pose switching. The v9 coherent B1 cache already stores COMMAND->ARM->SETTLE from one native gesture clip and BRACE->SHIFT from one native reaction clip; runtime now travels continuously between adjacent samples on those same source clips.
-- Trainer source weights use gentler low-pass continuity, preserving authored motion while removing the jagged mannequin-snap seen in commands/throws/reactions. No trainer cache rebuild is required from 1.5.56.
-- Pokemon extractor remains revision 29; MoveFX and arena cache revisions are unchanged.
-
-## 1.5.56 — Peck Blackout / Native Reaction Timing / Trainer Clip-Family Pass
-
-- Gen I native animation screen/picture effects are now fully quarantined whenever an executable Colosseum WazaSequence owns the move. The stock AnimPlayer still advances and still dispatches its row sounds, but SE_* palette flashes/dark-screen effects, native pic hides, shakes and OAM visuals can no longer black/invert the 3D arena. Hoothoot Peck is the primary regression target.
-- Pokemon action extraction now separates the PKX 60 Hz battle/timing clock from the HSD model animation frame clock. Exact HSD nativeAnimationInfo.endFrame drives source-pose sampling while PKX duration still drives real-time playback. This removes the previous 2x frame-index overshoot that made long Damage/Faint clips clamp onto their terminal pose for large parts of the reaction.
-- Reaction banks carry up to 72 real HSD intervals, never more than the source clip contains, with linear adjacent-source interpolation and the existing topology/finite/root-travel safety checks. Pokemon extractor revision 29 rebuilds affected species lazily on first use.
-- Trainer B1 pose extraction now selects coherent clip families: command -> arm -> settle are chronological frames from one authored gesture clip, while brace -> shift are chronological frames from one authored reaction clip. This replaces 1.5.54/1.5.55's independent cross-clip pose selection, which could be source-authentic at each endpoint but robotic between endpoints.
-- Trainer identity marker advances to v9, causing a one-time trainer-only rebuild. Arena, audio and existing MoveFX caches are not invalidated.
-- 1.5.55's full-distance Orre/Realgam scene retention and Type-2 black-carrier fixes remain intact.
-
-## 1.5.55 — Source Fidelity Pass II
-
-- Eliminates the portable Type-2 Waza blackout path: source effect/constant TEV carrier groups render as non-depth-writing luminous passes instead of opaque black masks.
-- Adds presentation-space root-travel safety to Damage/Faint banks so a valid source reaction cannot cross the portable camera and fill the frame.
-- Trainer B1 source poses now blend monotonically without spring overshoot; source silhouettes receive near-total authority and procedural whole-body motion is reduced to a tiny continuity layer.
-- Orre Colosseum now preserves the complete T1 source scene instead of radius-clipping the distant desert/ruin geometry.
-- Realgam Colosseum now preserves the complete D4 tower/casino exterior, restoring dozens of remote architecture groups and much deeper vertical/distance detail.
-- Orre/Realgam receive profile-specific extended far planes while retaining source sky/backdrop handling and existing TEV ghost-plane quarantine.
-
-## 1.5.54 — Source fidelity / trainer performance sweep
-
-- Exact trainer B1 SceneModelSet roots + seven-slot native HSD source-pose banks now own trainer silhouettes; procedural motion is residual-only.
-- Trainer material/depth state is retained, and trainer cache identity advances to v8 for a one-time rebuild.
-- Pokemon Damage/Faint banks warm first while preserving the same resident actor through complete Damage -> Faint choreography.
-- MoveFX rev 13 improves Type-2 HSD material/depth fidelity, replaces repeated/line trails with source-textured GPT1 ribbons, and fixes missing persisted `effect.lua` metadata that caused needless re-extraction on later launches.
-- Visual runtime is now independent from optional Colosseum music. Android/iOS/macOS/Linux skip the Windows-only Amuse renderer; audio failure cannot block arenas/models/trainers/MoveFX.
-- Real GC6E01 source validation resolves all 10 trainer battle models from authoritative roots and builds distinct authored idle/action pose banks.
-
-## 1.5.53 — actor-relative combat-space MoveFX scaling
-
-- Unifies GPT1 particle position, travel, attachment offsets and billboard sizing around the live Pokemon presentation scale instead of the raw ~16-unit cache body. Tiny/large Pokemon therefore scale their MoveFX with the same minimum/maximum normalization used by the actor itself.
-- Projectile/wave forward motion is bounded to the live attacker-target combat span while lateral/vertical motion stays actor-relative, preventing Hydro Pump/beam/wave effects from being correctly textured but spatially far too short/large.
-- Waza local Y is now arena-up; differing actor attachment heights no longer tilt the whole effect basis and ground-plane effects remain level.
-- Earthquake and Magnitude attack phases use a fight-centered ground-plane basis derived from the two live battle slots rather than hanging the field effect from one Pokemon's chest. Damage rows remain target-relative.
-- Type-2 HSD effect models are normalized from their own source bounds into the same combat-space target span as GPT1. Raw source model dimensions can no longer make one Waza object catastrophically huge/tiny.
-- Preserves 1.5.52's 251-move source lookup, WazaSequence timing, performance cleanup, actor scale ceiling/floor, cache compatibility and Gen-I/Gen-II parity. No Pokemon caches are invalidated.
-
-## 1.5.52 — maximum Pokémon scale + exhaustive Waza/MoveFX coverage
-
-- Added a maximum presentation scale alongside the tiny-Pokémon minimum; extreme long/coiled species receive silhouette-aware caps so large Pokémon remain imposing without swallowing the arena/camera.
-- Integrated the native 60 Hz WazaSequence phase-1 scheduler with PKX timing-point synchronization, typed entry lifecycle, Type-2 animated HSD effect models, Type-3 GPT1 particles and Type-5 GameSound sequencing.
-- MoveFX revision 12 now probes source-safe Japanese/retail stem aliases for every Gen-I/II move ID (1..251) plus exact English stems. Only exact WZX archive hits are accepted; misses fail open to native visuals.
-- Type-2 Waza HSD model caches now pack dense static/animated vertex rows into string payloads so large move models cannot hit LuaJIT's generated-chunk constant ceiling.
-- Preserves 1.5.51's resident actor reuse, split/lazy animation caches and cross-generation performance cleanup; existing Pokémon caches are not invalidated.
-
-# Colosseum Battle Environments 1.5.51
-
-## Cross-generation performance / model-runtime cleanup
-
-- Removes a Gen-I-specific actor churn path: lightweight battler/mon wrapper replacement no longer tears down and reacquires the same Dex/variant model between update and draw. Real switches remain owned by the explicit battle switch event.
-- Pokemon GPU scenes now use a resident fast path: repeated Summary opens and actor reacquires skip redundant cache stamp/filesystem checks once a species is already loaded.
-- Native action banks are lazy GPU resources. Battle entry loads the base body plus exact idle bank instead of parsing/uploading every attack/status/damage/faint mesh before the Pokemon can appear. Stats/Data showrooms load only the base body.
-- Common battle banks warm gradually after a fully visible idle is established, keeping heavy work off black transition/send-out frames. Exact actions still materialize synchronously if requested before warm-up, preserving behavior.
-- New Pokemon extractions emit only the semantic native banks the runtime can actually select (idle, physical, special, status, damage, faint), while preserving the same source fallback order when a primary slot is missing or invalid.
-- New caches use format v4: large native action payloads live in separate generated files, so `model_cache.lua` stays small and menu/battle entry no longer parses megabytes of unused action strings. Existing revision-28/v3 caches remain fully supported and are not forcibly rebuilt.
-- Adds lightweight actor performance counters to F9/status for scene loads/hits, action materialization, warm-up and resident reacquire verification.
-- No arena, camera, move-FX, trainer, shiny, Party portrait, battle logic, save logic or Gen-II functionality was removed or downgraded.
-
-# Colosseum Battle Environments 1.5.50
-
-## Large-species Pokémon cache / LuaJIT constant-limit fix
-
-- Fixes the reproduced Gen 1 Charizard failure shown by the F9 actor overlay: extraction completed, but `cache/pokemon/6/model_cache.lua` could not compile because its giant numeric table exceeded LuaJIT's 65,536 constants-per-function limit.
-- Pokémon extractor revision 28 replaces dense 44-float vertex table literals with one packed string payload per render group, including native action pages. The runtime expands those rows only after the small metadata chunk loads, then builds the exact same GPU meshes.
-- Existing revision-27 Pokémon caches are invalidated automatically and rebuild lazily from the user's Colosseum source. No manual cache deletion is required.
-- Keeps the 1.5.49 source-lifetime fix so uncached species can still be extracted on demand after arena bootstrap.
-- No Party/UI portrait behavior, battle logic, species selection, arena ownership, or sprite-source compatibility changed.
-
-# Colosseum Battle Environments 1.5.49
-
-## Gen 1 / Gen 2 Pokémon model parity — lazy source lifetime fix
-
-- Fixes the actual source of generation-dependent 3D Pokémon fallback: CBE no longer releases the launcher-owned Colosseum import immediately after the arena/audio bootstrap.
-- Pokémon PKX extraction is lazy by design. Keeping the source available means any uncached species can now be extracted on first battle send-out or first Stats/Data showroom request in either generation.
-- Previously, species already present in the shared generated cache appeared to work (commonly on the generation exercised first), while an uncached species failed `acquire()` and silently dropped to CBE's 2D resolved-sprite fallback.
-- This does not bundle, copy, or expose the user's ROM path. The launcher continues to own source access; CBE retains only its bounded import capability.
-- Arena, camera, battle logic, sprite-source compatibility, and Party portrait ownership are unchanged.
-
-## 1.5.48 — generation-neutral Stats/Data showroom bridge
-
-- Adds `informationModels` v3 `resolveShowroom`, a read-only CBE Colosseum Pokémon model seam for UI Stats/Data screens.
-- The showroom no longer inherits the save-local live-battle `COLOSSEUM MODELS` toggle, preventing Gen I and Gen II saves from presenting different Stats models solely because their battle preferences differ.
-- This does not claim battle actor ownership, alter arena/camera settings, or replace Party/PC/Pokédex portraits.
-- Existing `resolve` and `resolveColosseum` behavior remains available for older consumers.
-
-## 1.5.47 — dense native reactions / source-bounded MoveFX polish
-
-- Rebuilds Damage/Damage2/Faint as overlapping dense source-pose pages (up to 48 authored samples/sec) instead of one sparse 12-pose bank.
-- Removes cubic vertex overshoot and the extra CBE-authored sink from sampled Faint motion.
-- De-duplicates mirrored hit events and queues genuine multi-hit Damage reactions so reaction clips never restart/snap mid-pose.
-- Bounds GPT1 emission to the extracted WZX phase lifetime, retires stale same-attacker FX at the next move, and suppresses immediate duplicate damage FX.
-- Applies source alpha-edge/compare coverage and removes up-to-4x transparent-content billboard magnification.
-
-## 1.5.46 — native animation interpolation / MoveFX presentation polish
-
-- Removes the remaining stop-motion path from source-backed Pokémon actions. Verified Colosseum idle, attack, Damage and Faint banks now play continuously on their PKX 60 Hz timing instead of rounding attacks to one of twelve frozen poses.
-- Adds low-tension cubic pose interpolation across adjacent validated HSD samples. Pokémon extraction revision 26 records a per-slot validity mask so a failed sample is bridged between the nearest real source poses instead of causing a frame-0/neutral-body pop.
-- Keeps the complete twelve-sample source timeline for every native action bank, not only Damage/Faint, while preserving deterministic Damage -> Faint / Recall / queued Attack / Idle ownership from 1.5.45.
-- Locks each WZX/GPT1 effect to its initial source-world battle basis so free particles do not swim when the attacker/target animation moves. Live joint-follow particles still track their authored body point.
-- Expands Waza attachment support from the first eight PKX body-map slots to all sixteen and uses the source sequence root attachment when available; B7/B8 joint direction/force targets are no longer incorrectly reapplied as render origins.
-- Replaces repeated billboard trail stamping with a continuous faded ribbon for attack-role GPT1 trails, preventing card-like trail clumps while retaining the live source particle at the head.
-- MoveFX quads now scale relative to the projected Pokémon/camera size rather than only a fixed 768p pixel constant, source textures use stronger linear filtering where supported, and the bounded particle budget has been raised moderately for denser source emitters without removing mobile safety caps.
-
-## 1.5.45 — native Damage flow / source-backed Mt. Battle Summit
-
-- Makes Colosseum's actual PKX Damage slot authoritative on every hit. Extractor revision 25 no longer rejects legitimate recoil/stumble/root motion as "too much displacement"; only topology failure, non-finite bounds, collapse/explosion, or impossible multi-body-height corruption can invalidate a verified reaction frame.
-- Samples Damage/Damage2/Faint against the exact source 60 Hz duration with fractional HSD frame coordinates instead of rounded frame spacing, and smoothly reconstructs the reaction from adjacent source samples rather than visibly stepping through frozen poses.
-- Damage now owns the actor until its source duration completes. Idle, attack, recall and faint requests cannot truncate the reaction: the deterministic order is Damage -> Faint / Recall / queued Attack / Idle. Lethal damage therefore still plays the complete take-damage animation before the same actor enters its source Faint clip.
-- Normal hits use the canonical PKX Damage slot directly instead of silently substituting Damage2 when a cache bank is missing; failed source extraction falls open to the resident-body recoil without ever hiding the model.
-- Replaces the procedural Mt. Battle Platform 100 rebuild with direct HSD extraction from `D2_crater_colo.fsys` / `D2_crater_colo.dat` on the user's Colosseum source disc. Rock, bridge, battle deck, pylons, crater/background geometry, UVs, material colors and GX textures are now source-backed.
-- Removes the invented D2 sunset and procedural basalt/steel re-grading from source surfaces, extends the Summit depth/culling range for the actual background geometry, and leaves only a neutral screen-space fallback behind the extracted stage.
-
-Colosseum Battle Environments 1.5.44
-
-- Hit persistence is now a hard 3D-actor invariant: native HIDEPIC/damage-blink state cannot hide or release a resident CBE Pokemon model. Fly/Dig remain the only structural hide exceptions.
-- Lethal hits no longer jump straight from Damage to an empty field. The actor finishes its complete take-damage reaction first, queues faint on the same object, then plays the authored/fallback faint animation.
-- Same-species battler-wrapper churn is absorbed during attack/hit/faint presentation in both update and draw acquisition paths, closing the remaining one-frame actor replacement race.
-- Pokemon extraction revision 24 keeps the full sampled timeline for Damage/DamageHeavy/Faint banks even when an individual sampled frame fails validation; rejected slots hold the proven source action pose instead of shortening the whole reaction.
-- Damage-phase GPT1 trail history is no longer re-stamped as repeated billboards. That approximation was responsible for the foliage/leaf-like cloud around contact effects such as Peck; the live source particle remains.
-
-- Added COLOSSEUM MODELS ON/OFF in the BATTLE menu. ON gives CBE's GC6E01 Pokemon actor provider absolute presentation priority in CBE battles and Pokemon information-model surfaces; OFF returns ownership to the user's normal selected presentation.
-- Removed the remaining custom GameCube manifest fields. The package now declares only stock Gen1Recomp required-import vocabulary (`md5`, `format`, `max_size`) and does not depend on a custom launcher build.
-- Corrected GX I4/I8 MoveFX coverage: intensity remains available for Prim/Env shading but is also used as alpha, eliminating the opaque white texture cards seen around Peck/Harden-style effects.
-- Corrected GPT1 particle sizing so physical particle size is no longer multiplied by source texture resolution.
-
-1.5.42 - Gen2 presentation-boundary MoveFX + rooted generator runtime
-- Corrected the backwards Gen2 queue-sync gate: visible presentation_move/damage/faint events now reach CBE; early semantic events are the ones suppressed.
-- MoveFXVM v4 now distinguishes GPT1 generator spawns from particle spawns and executes child generator schedulers from source bytecode.
-- Authored PKX hurt/faint actions now receive the actual Gen2 visible damage/faint boundary.
-- Required import declares structural GameCube identity (GC6E01 rev 0) while retaining known hashes for older launchers.
-
-1.5.41 - MoveFX playback / hurt-animation runtime fix
-- Source WZX is acquired synchronously at the real move boundary; prefetch is no longer required for visible FX.
-- Verified CBE MoveFX now suppresses Gen1 native OAM move sprites without patching Gen1Recomp, including genuine damage-only sequences such as Peck.
-- Re-enabled validated PKX Damage clips; failed species fall back to resident-body recoil instead of disappearing.
-- Stable actor identity survives transient battler-wrapper replacement during damage.
-- GPT1 particle coordinates are scaled from source units into actor/world space, including joint-force coordinates.
-- Attack/damage camera shots keep the actual Pokemon/effect line in frame.
-
-## 1.5.40 — source WazaSequence / 3D MoveFX execution
-
-- Fixes real Colosseum EffectEntry recovery: CBE now reads the source WazaSequence start/hit/finish timing, attachment slot and root generator reference from the actual WZX entry instead of the earlier guessed effect-data offset.
-- Preserves source GPT1 intensity textures for primary/environment-color shading instead of collapsing grayscale particle artwork into a white-alpha mask.
-- Caches the exact ordered HSD joint origins for every extracted Pokémon pose and exposes animated PKX body-map attachments (origin, mouth, chest, tail, eyes, hands, feet, center) through the live actor.
-- Replaces the old attacker→target 2D particle plane with actor-world 3D source/target/right/up/forward projection. Explicit GPT1 joint attachments follow the Pokémon's current animated body point.
-- Expands the GPT1 VM with source render/physics state: gravity/friction flags, texture display/filter/index/flip/mirror state, PrimEnv, blend mode, trails, direction vectors, random kill, speed/axis velocity, joint direction/forces and additional spawn/reference commands.
-- Particle rendering now uses source primary/environment colors, source intensity, source blend mode, filtering, flips, direction-vector orientation and trail history, with a safe alpha fallback for unsupported mobile blend modes.
-- Verified against the imported GC6E01 CISO on Flame Wheel, Thunderbolt, Surf and Flamethrower; these tests execute real extracted WZX/GPT1 programs, not synthetic effect fixtures.
-
-## 1.5.39 — stock-launcher ISO/CISO import
-
-- Removed the Gen1Recomp companion-patch requirement.
-- CBE now uses only stock `required_imports` fields: a multi-hash `md5` allow-list plus `max_size`.
-- Canonical USA ISO/GCM (`e3f389dc5662b9f941769e370195ec90`) and the tested sparse CISO (`a2d58d82c6b76b42653dcd25c8966de7`) both import through the normal launcher path.
-- The launcher stores either physical container at CBE's private import path; CBE content-sniffs it and exposes a 1,459,978,240-byte logical GameCube disc to the extractor.
-- No direct Gen1Recomp source patch is needed for this build.
-
-## 1.5.38 — rooted MoveFX / damage quarantine / mobile ISO+CISO
-
-- Executes only the WZX-selected GPT1 root generator(s), keeps child generators source-spawned, and stops controller roots such as Flame Wheel from multiplying the whole particle program by `maxParticles`.
-- Adds safe framing for GPT1 TEXEDGE/DIRVEC commands and de-layers species/special WZX variants from the normal move sequence.
-- Keeps the proven Pokémon body resident during damage instead of swapping into the fragile native Damage geometry bank.
-- Exposes CBE Colosseum Pokémon actors through the `informationModels` v2 Party/Summary showroom bridge.
-- Adds logical raw ISO/GCM, trailing-trimmed raw, and sparse CISO source access. The companion Gen1Recomp patch keeps canonical raw ISO strict-MD5 while structurally validating alternate GameCube media for desktop and mobile imports.
-
-## 1.5.36 — damage-persistent 3D actors / GPT1 bytecode VM
-
-- Detaches persistent 3D Pokemon visibility from Gen1Recomp's native picture-layer damage blink. `b.sprite`, player/enemy hidden bits and transient picture hiding no longer remove a live model; actual switch/faint/vanish lifecycle still does.
-- Replaces 1.5.35's CBE-authored projectile/wave/contact/etc. compositor with a 60 Hz source GPT1 VM for particle motion, waits, velocity/gravity/friction, scale, rotation, colors, texture changes, loops/jumps and referenced spawns.
-- Preserves WazaSequence timing plus generator bytecode in MoveFX cache revision 7, and remaps per-phase GPT1 banks so attack/damage texture indices cannot collide.
-- Attack programs begin at the actual move boundary; damage/status programs begin at `battle.damage_dealt`. Native visuals are suppressed only when a verified, safely framed executable attack program + texture bank exists, otherwise CBE fails open.
-- This is the first source-program pass, not full GameCube GX/WazaSequence parity; uncommon opcodes/emitter semantics and exact blend/camera behavior remain validation targets.
-
-## 1.5.35 — MoveFX particle-bank pass / tiny-Pokémon readability
-- Rebuilds the WZX compositor around multi-emitter source texture banks instead of one/two rotating billboards. Projectile, contact, impact, target, aura/self and wave styles now have distinct source-backed motion and target impact behavior.
-- MoveFX cache revision 6 records visible-content bounds/alpha coverage for decoded GPT1 textures, so transparent-padded source sheets are sized from the actual effect artwork rather than the full texture canvas.
-- Every named Gen-I/II move can now probe an exact normalized WZX stem on the user's Colosseum disc; only a real archive hit becomes source FX, so misses still fail open to vanilla.
-- WZX attachment height follows the live Pokémon presentation scale instead of one fixed midpoint, reducing effects floating above tiny species or cutting through large ones.
-- Adds a battle-readability floor for extremely small Pokémon. Physical/Pokédex scale remains the baseline, but tiny species never render below roughly 30% of trainer height; Weedle receives a slightly stronger 34% floor for its thin silhouette.
-
-## 1.5.34 — Damage-pose integrity / trainer-relative scale / MoveFX phases
-- Rejects corrupt native action poses that retain topology but collapse or leave the camera, fixing Pokémon disappearing when the Colosseum Damage slot starts.
-- Pokémon cache revision 22 rebuilds species and falls back to the always-visible procedural hit only when a source Damage bank fails integrity checks.
-- Calibrates a 1.70 m Pokémon to the same final 6.9-unit stage height as a trainer, using each arena's figure scale, and preserves species scale during live rebuild/tuning.
-- MoveFX cache revision 5 discovers every phase present for a mapped WZX stem, keeps source attack/damage phases temporally separate, and preserves WazaSequence sound-command metadata.
-- Adds exact-name source discovery for 26 additional Gen-I/II moves whose English identifier is the Colosseum WZX stem.
-
-
-1.5.30 BATTLE DIRECTOR / TRAINER-Pokemon CHOREOGRAPHY PASS -- VISIBLE GEN2 MOVE/DAMAGE/FAINT SYNC; FULL 4X CAMERA CHOREOGRAPHY; SOURCE WZX PREFETCH; COMPLETE NATIVE FAINT TAILS; TRAINER RECALL/COMMAND/HIT/KO REACTIONS ON THE SAME GAME-TIME CLOCK
+1.7.16: HUD-safe attack camera, attack/impact axis lock, darker source-like Water grade, Android portable audio v5/48k source pan, and broader GPT1 selector ordinal resolution.

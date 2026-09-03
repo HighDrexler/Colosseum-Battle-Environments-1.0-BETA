@@ -3,6 +3,7 @@ local Waza=V and V.WazaSequenceRuntime
 local Assets=V and V.GeneratedAssets
 local CSM=V and V.CurrentSpriteModels
 local Audio=V and V.WazaAudioRuntime
+local RuntimeMeshCache=V and V.RuntimeMeshCache
 local H={installed=false,models={},opaque={},lastModel=nil,modelCache={},modelErrors={},textureCache={},drawError=nil}
 
 local FORMAT_STATIC={
@@ -79,6 +80,8 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
 }
 ]]
 local shaderStatic,shaderMorph
+local modelUseSerial=0
+local runtimeMeshHits,runtimeMeshWrites,runtimeMeshFallbacks=0,0,0
 
 local function key(inst,entry)
   return tostring(inst and inst.serial or "?")..":"..tostring(entry and entry.index or "?")
@@ -141,14 +144,52 @@ local function decodedVertices(group,expectedStride)
   return rows
 end
 
+local function runtimeRoot(path) return tostring(path or "cache/waza/model_cache.lua"):gsub("%.lua$","").."_runtime_v1" end
+local function runtimeMetaPath(path) return runtimeRoot(path).."/base.lua" end
+local function runtimeBinPath(path,i) return runtimeRoot(path)..("/base_%02d.f32"):format(tonumber(i) or 0) end
+local function sourceSize(path) local info=Assets and Assets.info and Assets.info(path) or nil;return info and tonumber(info.size) or nil end
+local function runtimeUsable(meta,path,size)
+  if type(meta)~="table" or tonumber(meta.runtimeMeshVersion)~=1 or tonumber(meta.sourceSize)~=size or type(meta.groups)~="table" or #meta.groups==0 then return false end
+  local stride=meta.morph and 44 or 8;local bpv=stride*4
+  for i,g in ipairs(meta.groups) do
+    local bin=(type(g)=="table" and g.runtimeBin) or runtimeBinPath(path,i)
+    local info=Assets and Assets.info and Assets.info(bin) or nil;local n=info and tonumber(info.size)
+    if not n or n<bpv or n%bpv~=0 then return false end
+  end
+  return true
+end
+local function compactGroup(g,path,i)
+  local o={};for k,v in pairs(g or {}) do if k~="vertices" and k~="verticesPacked" then o[k]=v end end
+  o.runtimeBin=runtimeBinPath(path,i);return o
+end
+local function writeRuntimeMeta(path,cache,size)
+  if not (RuntimeMeshCache and RuntimeMeshCache.writeLua and size) then return false end
+  local o={runtimeMeshVersion=1,sourceSize=size}
+  for k,v in pairs(cache or {}) do if k~="groups" then o[k]=v end end
+  o.groups={};for i,g in ipairs(cache.groups or {}) do o.groups[i]=compactGroup(g,path,i) end
+  local ok=RuntimeMeshCache.writeLua(runtimeMetaPath(path),o);if ok then runtimeMeshWrites=runtimeMeshWrites+1 end;return ok
+end
+
 local function loadCache(path)
   if not path then return nil,"Waza model cache missing" end
-  if H.modelCache[path]~=nil then return H.modelCache[path] or nil,H.modelErrors[path] end
+  if H.modelCache[path]~=nil then
+    local hit=H.modelCache[path]
+    if type(hit)=="table" then modelUseSerial=modelUseSerial+1;hit.__cbeUse=modelUseSerial end
+    return hit or nil,H.modelErrors[path]
+  end
   if not (love and love.graphics and love.graphics.newMesh) then return nil,"LÖVE mesh API unavailable" end
-  local cache,err=readLua(path);if not cache then H.modelCache[path]=false;H.modelErrors[path]=tostring(err);return nil,err end
+  local size=sourceSize(path)
+  local cache,err,fromRuntime
+  if RuntimeMeshCache and type(RuntimeMeshCache.readLua)=="function" and size then
+    local rt=select(1,RuntimeMeshCache.readLua(runtimeMetaPath(path)))
+    if runtimeUsable(rt,path,size) then cache=rt;fromRuntime=true;runtimeMeshHits=runtimeMeshHits+1 end
+  end
+  if not cache then cache,err=readLua(path) end
+  if not cache then H.modelCache[path]=false;H.modelErrors[path]=tostring(err);return nil,err end
   local morph=(tonumber(cache.morphFrames) or 0)>0
   local fmt=morph and FORMAT_MORPH or FORMAT_STATIC
   local textures,groups={},{}
+  local canonicalFallback=nil
   for i,g in ipairs(cache.groups or {}) do
     local img
     if g.texture then
@@ -159,10 +200,31 @@ local function loadCache(path)
         textures[tp]=img
       end
     end
-    local vertices,vErr=decodedVertices(g,morph and 44 or 8)
-    if not vertices then H.modelCache[path]=false;H.modelErrors[path]=tostring(vErr);return nil,vErr end
-    local ok,mesh=pcall(love.graphics.newMesh,fmt,vertices,"triangles","static")
-    if not ok then H.modelCache[path]=false;H.modelErrors[path]=tostring(mesh);return nil,mesh end
+    local stride=morph and 44 or 8
+    local mesh,vErr,vertices
+    if fromRuntime and RuntimeMeshCache and type(RuntimeMeshCache.meshFromPath)=="function" then
+      mesh,vErr=RuntimeMeshCache.meshFromPath(fmt,g.runtimeBin or runtimeBinPath(path,i),stride,"static")
+    end
+    if not mesh then
+      local sourceGroup=g
+      -- Same fail-open rule as trainer meshes: compact runtime metadata omits
+      -- the textual vertex payload. A backend that rejects the persistent f32
+      -- sidecar must reopen the canonical Waza cache instead of treating the
+      -- effect as empty/invisible (Windows has already exposed this class of
+      -- backend-specific sidecar failure for trainer models).
+      if fromRuntime and type(g.vertices)~="table" and type(g.verticesPacked)~="string" then
+        if canonicalFallback==nil then canonicalFallback=select(1,readLua(path)) or false end
+        if canonicalFallback and canonicalFallback.groups and canonicalFallback.groups[i] then
+          sourceGroup=canonicalFallback.groups[i];runtimeMeshFallbacks=runtimeMeshFallbacks+1
+        end
+      end
+      vertices,vErr=decodedVertices(sourceGroup,stride)
+      if not vertices then H.modelCache[path]=false;H.modelErrors[path]=tostring(vErr);return nil,vErr end
+      local ok,built=pcall(love.graphics.newMesh,fmt,vertices,"triangles","static")
+      if not ok then H.modelCache[path]=false;H.modelErrors[path]=tostring(built);return nil,built end
+      mesh=built
+      if RuntimeMeshCache and RuntimeMeshCache.supported and RuntimeMeshCache.supported() then RuntimeMeshCache.writeRows(runtimeBinPath(path,i),vertices,stride) end
+    end
     if img then mesh:setTexture(img) end
     local effectLike=g.effect==true or (g.useConstant==true and g.useDiffuseLighting==false)
     groups[#groups+1]={mesh=mesh,image=img,diffuse=g.diffuse or {1,1,1},alpha=tonumber(g.alpha) or 1,
@@ -175,9 +237,15 @@ local function loadCache(path)
       luminous=effectLike}
   end
   if #groups==0 then H.modelCache[path]=false;H.modelErrors[path]="Waza model cache empty";return nil,H.modelErrors[path] end
+  if not fromRuntime and RuntimeMeshCache and RuntimeMeshCache.supported and RuntimeMeshCache.supported() and size then
+    local all=true;local bpv=(morph and 44 or 8)*4
+    for i=1,#(cache.groups or {}) do local info=Assets.info and Assets.info(runtimeBinPath(path,i)) or nil;local n=info and tonumber(info.size);if not n or n<bpv or n%bpv~=0 then all=false;break end end
+    if all then writeRuntimeMeta(path,cache,size) end
+  end
   local out={groups=groups,bounds=cache.bounds,source=cache.source,textures=textures,morph=morph,
     morphFrames=tonumber(cache.morphFrames) or 0,startFrame=tonumber(cache.startFrame) or 0,endFrame=tonumber(cache.endFrame) or 0,
     animation=cache.animation}
+  modelUseSerial=modelUseSerial+1;out.__cbeUse=modelUseSerial
   H.modelCache[path]=out;H.modelErrors[path]=nil;return out
 end
 
@@ -276,7 +344,7 @@ local function opaqueStart(ctx,inst,entry)
   H.opaque[#H.opaque+1]={context=ctx,serial=inst.serial,frame=inst.frame,entryType=entry.entryType,
     kind=entry.kind,index=entry.index,identifier=entry.identifier,rawPath=entry.rawPath,
     rawOffset=entry.rawOffset,rawSize=entry.rawSize,payloadOffset=entry.payloadOffset,
-    commonMode=entry.commonMode,words=entry.words,subtype=entry.subtype,mode=entry.mode,value=entry.value}
+    commonMode=entry.commonMode,words=entry.words,subtype=entry.subtype,mode=entry.mode,value=entry.value,effectType=entry.effectType,effectFrames=entry.effectFrames}
   while #H.opaque>512 do table.remove(H.opaque,1) end
   return true
 end
@@ -457,6 +525,7 @@ local function cadd(a,b,s)return {(a[1] or 0)+(b[1] or 0)*(s or 1),(a[2] or 0)+(
 local function clerp(a,b,t)return {(a[1] or 0)+((b[1] or 0)-(a[1] or 0))*t,(a[2] or 0)+((b[2] or 0)-(a[2] or 0))*t,(a[3] or 0)+((b[3] or 0)-(a[3] or 0))*t} end
 local function cdist(a,b)local x=(b[1] or 0)-(a[1] or 0);local y=(b[2] or 0)-(a[2] or 0);local z=(b[3] or 0)-(a[3] or 0);return math.sqrt(x*x+y*y+z*z) end
 local function csmooth(t)t=math.max(0,math.min(1,tonumber(t) or 0));return t*t*(3-2*t) end
+local cameraContinuity={session=nil,currentSerial=nil,transitionFrom=nil,transitionStartFrame=0,lastPose=nil}
 local function latestCameraInstance()
   local best
   for _,inst in ipairs(Waza and Waza.active or {}) do
@@ -557,17 +626,102 @@ function H.cameraPose(ctx)
     fov=math.rad(36.0)
   end
 
-  return {eye=eye,focus=focus,fov=fov,sourceSerial=inst.serial,sourceFrame=frame,sourceProgress=p,
-    sourceStyle=style,sourceRole=role,blend=.20}
+  -- Attack and damage Waza rows are separate retail instances, but visually
+  -- they are one move.  Preserve the last source-led camera pose when the role
+  -- changes and blend only the first eight source frames of the new instance.
+  -- This removes the hard attack-camera -> damage-camera snap without slowing
+  -- the complete move with the semantic camera's generic easing.
+  local session=tonumber(inst.presentationSerial) or tonumber(inst.serial) or 0
+  if cameraContinuity.session~=session then
+    cameraContinuity.session=session;cameraContinuity.currentSerial=inst.serial
+    cameraContinuity.transitionFrom=nil;cameraContinuity.lastPose=nil
+  elseif cameraContinuity.currentSerial~=inst.serial then
+    cameraContinuity.transitionFrom=cameraContinuity.lastPose
+    cameraContinuity.transitionStartFrame=frame
+    cameraContinuity.currentSerial=inst.serial
+  end
+  if cameraContinuity.transitionFrom then
+    local q=csmooth(math.max(0,math.min(1,(frame-cameraContinuity.transitionStartFrame)/8)))
+    eye=clerp(cameraContinuity.transitionFrom.eye,eye,q)
+    focus=clerp(cameraContinuity.transitionFrom.focus,focus,q)
+    fov=(cameraContinuity.transitionFrom.fov or fov)+((fov)-(cameraContinuity.transitionFrom.fov or fov))*q
+    if q>=.999 then cameraContinuity.transitionFrom=nil end
+  end
+  local pose={eye=eye,focus=focus,fov=fov,sourceSerial=inst.serial,sourceFrame=frame,sourceProgress=p,
+    sourceStyle=style,sourceRole=role,presentationSerial=inst.presentationSerial,blend=.10}
+  cameraContinuity.lastPose={eye={eye[1],eye[2],eye[3]},focus={focus[1],focus[2],focus[3]},fov=fov}
+  return pose
 end
 function H.activeModels() local out={};for _,row in pairs(H.models) do out[#out+1]=row end;return out end
-function H.finish() H.models={};return true end
+function H.finish() H.models={};cameraContinuity={session=nil,currentSerial=nil,transitionFrom=nil,transitionStartFrame=0,lastPose=nil};return true end
+
+local function releaseLoveObject(obj,seen)
+  if obj==nil then return end
+  seen=seen or {}
+  if seen[obj] then return end
+  seen[obj]=true
+  pcall(function()
+    local release=obj.release
+    if type(release)=="function" then release(obj) end
+  end)
+end
+
+-- Release battle-used Waza GPU assets on Android without deleting the generated
+-- model/texture files in mod.cache. Shader programs stay resident, avoiding a
+-- compile hitch on the next move while preventing an unbounded per-move VRAM
+-- cache from growing throughout a long mobile play session.
+function H.trimRuntimeMemory()
+  -- Keep only the four most recently used Waza effect models. The previous
+  -- all-or-nothing purge guaranteed that common source effect meshes/textures
+  -- were reparsed and reuploaded in the next battle. Four entries keep the
+  -- working set tiny on mobile while avoiding that repeated first-use hitch.
+  local ranked={}
+  for path,asset in pairs(H.modelCache) do
+    if type(asset)=="table" then ranked[#ranked+1]={path=path,asset=asset,use=tonumber(asset.__cbeUse) or 0} end
+  end
+  table.sort(ranked,function(a,b)return a.use>b.use end)
+  local keep={};for i=1,math.min(4,#ranked) do keep[ranked[i].path]=true end
+  local keptImages={}
+  for path in pairs(keep) do
+    local asset=H.modelCache[path]
+    if type(asset)=="table" then
+      for _,g in ipairs(asset.groups or {}) do if type(g)=="table" and g.image then keptImages[g.image]=true end end
+      for _,img in pairs(asset.textures or {}) do if img then keptImages[img]=true end end
+    end
+  end
+  local seen={}
+  for path,asset in pairs(H.modelCache) do
+    if not keep[path] and type(asset)=="table" then
+      for _,g in ipairs(asset.groups or {}) do
+        if type(g)=="table" then
+          releaseLoveObject(g.mesh,seen)
+          if g.image and not keptImages[g.image] then releaseLoveObject(g.image,seen) end
+        end
+      end
+      for _,img in pairs(asset.textures or {}) do if not keptImages[img] then releaseLoveObject(img,seen) end end
+      H.modelCache[path]=nil;H.modelErrors[path]=nil
+    elseif asset==false then
+      -- Failed cache entries are tiny; keep the failure memo so a malformed
+      -- source effect is not reparsed every battle.
+    end
+  end
+  for key,img in pairs(H.textureCache or {}) do
+    if not keptImages[img] then releaseLoveObject(img,seen);H.textureCache[key]=nil end
+  end
+  H.models={};H.opaque={};H.lastModel=nil
+  cameraContinuity={session=nil,currentSerial=nil,transitionFrom=nil,transitionStartFrame=0,lastPose=nil}
+  -- Meshes/textures above are explicitly released. Avoid a stop-the-world Lua
+  -- collection on the battle-end seam; BattleRuntime performs incremental GC
+  -- while the player is back in the overworld.
+  return true
+end
+
 function H.status()
   local m=0;for _ in pairs(H.models) do m=m+1 end
   local cached=0;for _,v in pairs(H.modelCache) do if v then cached=cached+1 end end
-  return {installed=H.installed,activeModels=m,cachedModels=cached,opaqueEntries=#H.opaque,drawError=H.drawError,renderFaults=H.renderFaults or 0,
-    provenSourceTypes={model=2,particle=3,sound=5},opaqueSourceTypes={1,4,6},
-    cameraDecoder="WazaSequence source-timeline + live source fight geometry + fight_common CObj baseline lens; remaining raw controller subtype pending",
+  return {installed=H.installed,activeModels=m,cachedModels=cached,opaqueEntries=#H.opaque,drawError=H.drawError,renderFaults=H.renderFaults or 0,runtimeMeshHits=runtimeMeshHits,runtimeMeshWrites=runtimeMeshWrites,runtimeMeshFallbacks=runtimeMeshFallbacks,
+    provenSourceTypes={model=2,particle=3,effect=4,sound=5},opaqueSourceTypes={1,6},
+    cameraDecoder="source-session Waza attack->damage continuity + live fight geometry + fight_common CObj baseline lens; remaining raw controller subtype pending",
     modelDecoder="native-HSD-60Hz-morph-pages-v4-safe-tev-pass"}
 end
 return H

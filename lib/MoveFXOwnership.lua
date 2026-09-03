@@ -76,11 +76,12 @@ local function readySpec(id,move)
     if ok and specReady(spec) then return spec end
     lastErr=tostring(err or spec or lastErr)
   end
-  -- Never extract from the source disc on a visible move boundary.  Recent
+  -- Never extract from the source disc on a visible move boundary. Recent
   -- fidelity builds did this synchronously and the renderer sat on a black or
   -- stale frame until WZX decode/cache serialization finished. Queue the bank
-  -- for later preparation instead; an uncached first use fails open to native
-  -- timing/presentation rather than blocking the battle.
+  -- for later preparation instead. The native script still supplies timing and
+  -- unsuppressed audio, but its Crystal/GB visual layer remains hidden while CBE
+  -- owns the arena so a source-cache failure cannot masquerade as source FX.
   if type(MoveFX.queuePrefetch)=="function" then
     pcall(MoveFX.queuePrefetch,id,move,O.activeBattle)
     lastErr="source WZX queued; cache not ready on presentation boundary"
@@ -141,12 +142,20 @@ function O:event(ctx,name,payload)
       end
       self.active={battle=b or self.activeBattle,moveId=id,move=move,stem=spec.stem,
         spec=spec,source=name,started=true}
+      -- Decode the small static source-SE objects at the move boundary rather
+      -- than on the exact type-5 Waza frame. This keeps authored sound timing
+      -- precise without globally preloading hundreds of WAVs or growing an
+      -- unbounded audio working set. Missing/incomplete source audio remains a
+      -- no-op here and therefore still fails open to the native move SFX.
+      local audio=V and V.WazaAudioRuntime
+      if audio and type(audio.prewarmSpec)=="function" then pcall(audio.prewarmSpec,spec) end
       self.suppressions=self.suppressions+1
       self.error=nil
       return true
     end
-    -- Fail open. An unmapped / failed WZX move keeps the native visual rather
-    -- than becoming invisible.
+    -- Keep native timing/audio alive, but do not restore native visuals inside
+    -- a CBE arena. A missing source Waza remains an explicit source-runtime
+    -- failure instead of silently presenting Crystal/GB move art.
     clear("unmapped-or-unready")
     self.failOpen=self.failOpen+1
     self.error=err
@@ -154,6 +163,17 @@ function O:event(ctx,name,payload)
   end
   if name=="battle.turn_ended" or name=="battle.ended" then clear(name) end
   return self.active~=nil
+end
+
+function O:ownsNativeAudio(battle)
+  if not self.active then return false end
+  local b=prepare(battle)
+  if self.active.battle and b and not matches(self.active.battle,b) then return false end
+  local audio=V and V.WazaAudioRuntime
+  local readyFn=audio and (audio.readyForSpec or audio.prewarmSpec)
+  if type(readyFn)~="function" then return false end
+  local ok,complete=pcall(readyFn,self.active.spec)
+  return ok and complete==true
 end
 
 function O:suppresses(battle)
@@ -171,11 +191,11 @@ function O:suppressesCapture(battle)
 end
 
 function O:suppressesNativeVisuals(battle)
-  -- A CBE arena is a complete 3D presentation surface.  Native Gen1/Gen2
-  -- battle-animation sprites, scanline effects and palette flashes may keep
-  -- RUNNING for authoritative timing/SFX, but they must never be composited
-  -- over the arena.  Earlier builds only suppressed moves with a ready WZX
-  -- bank, which let vanilla artifacts reappear on cache misses and captures.
+  -- A CBE arena is a source-only presentation surface. Native Gen1/Gen2
+  -- animation scripts still RUN for battle pacing and unsuppressed audio, but
+  -- their sprites/palette effects/screen transforms must never composite over
+  -- the Colosseum world. 1.7.12/1.7.13 exposed Crystal/GB visuals whenever a
+  -- Waza failed to arm, which hid the actual source-runtime regression.
   if cbeOwnsWorld(prepare(battle)) then return true end
   return self:suppressesCapture(battle) or self:suppresses(battle)
 end
@@ -199,9 +219,9 @@ local function activeMoveTokens()
   return out
 end
 function O:suppressesAnim(battle,animName)
-  -- Same rule as Gen 2's BattleAnimView gate: once CBE owns the battle world,
-  -- the stock animation queue is timing/audio only.  This keeps battle speed
-  -- and queue semantics authoritative without ever exposing GB/GBC sprites.
+  -- Stock move visuals are timing-only while the CBE compositor owns the
+  -- battlefield. A source failure stays visible in CBE diagnostics instead of
+  -- silently reverting to Crystal/GB art.
   if cbeOwnsWorld(prepare(battle)) then return true end
   if self:suppressesCapture(battle) then
     if animName==nil then return true end
@@ -354,6 +374,7 @@ function O.status()
   return {installed=O.installed,active=O.active and true or false,capture=O.capture and true or false,
     moveId=O.active and O.active.moveId or nil,stem=O.active and O.active.stem or nil,
     suppressions=O.suppressions,failOpen=O.failOpen,error=O.error,last=O.last,
-    policy="CBE arena owns all battle animation visuals; native queues remain timing/audio-only, with typed WazaSequence and 3D capture choreography rendered by CBE"}
+    sourceAudioComplete=O.active and O:ownsNativeAudio(O.active.battle) or false,
+    policy="CBE arena owns all move visuals source-only; native animation scripts remain timing/audio-only; native move SFX suppress only when every type-5 GameSound is cached"}
 end
 return O

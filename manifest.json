@@ -1,7 +1,7 @@
 {
   "id": "COLOSSEUM_BATTLE_ENVIRONMENTS",
   "name": "Colosseum Battle Environments",
-  "version": "1.6.1",
+  "version": "1.8.4-capture-member-hsd.1",
   "api": 2,
   "entry": "main.lua",
   "profile": "content",
@@ -17,33 +17,29 @@
     "STADIUM_BATTLE_FX",
     "STADIUM2_OVERWORLD_MODELS",
     "colosseum_ui_overhaul",
+    "BATTLE_ART_VOXEL_GEN2",
     "BATTLE_ART_VOXEL_FORK",
     "DRAMATIC_SHAPE"
   ],
   "conflicts": [],
   "incompatible": [],
   "permissions": [
-    "engine_internals",
-    "compute"
+    "engine_internals"
   ],
   "affects_link": false,
-  "description": "Colosseum battle arenas with CBE-owned battle presentation on Gen 1 + Gen 2, source-backed Pokemon/trainer actors, battle-entry precache, solid-floor actor constraints, exhaustive source Waza MoveFX routing, native ISO-derived capture choreography, optional fail-open Colosseum audio, and content-validated cross-platform GameCube source handling.",
+  "description": "Colosseum battle environments with GC6E01 source-backed arenas, source-faithful Water/Phenac lighting, arena-safe camera framing, Gen 1 visible-boundary faint synchronization, Battle Art 2.x/custom-sprite priority when Colosseum Models are OFF, Gen 1 mobile full-viewport isolation, Android compact arena caching, source MoveFX/audio/capture, and trainer animation. 1.7.22 unifies trainer morph binding to a single seven-attribute path on every platform, restoring full ten-pose source animation on Windows. 1.7.21 was a pure performance pass: faster source decompression and texture decoding for shorter first-run cache builds, and a cached sky plus reduced per-frame allocation and uniform traffic for smoother battles on weaker hardware. Presentation-only; compatible with Gen 1 and Gen 2 battle presentation providers. 1.8.0 capture-source fix removes the invalid capture byte-window assumption entirely: every retail type-2 entry is HSD-decoded, ball-like geometry and cross-phase recurrence select the source prop, unsupported source animation falls back to the exact static retail model, and capture extraction can no longer block the entire CBE runtime when an optional ball prop is unresolved. 1.8.1 capture-presentation pass keeps successful and failed throws on one identical camera path until the authored outcome reveal, replaces the floaty projectile easing with a physical hand-release/ballistic arc/drop/settle sequence, and permanently suppresses a successfully caught battler through Pok\u00e9dex and nickname flow so it cannot reappear beside the ball. 1.8.2 capture-source lock makes the retail Pok\u00e9 Ball path platform-stable: the canonical ball is selected by cross-phase embedded/visual fingerprints rather than loose geometry scoring, phase-local models are accepted only when they match that canonical source fingerprint, and capture props are compiled as exact static ISO geometry/materials/textures so Android never falls through merely because native HSD morph-page rendering is unavailable. Existing arenas, trainers, MoveFX and audio caches are preserved; only the capture bank is incrementally rebuilt. 1.8.3 fixes the 1.8.2 retail-ball lockout exposed by real hardware: cross-phase fingerprint recurrence is now supporting evidence rather than a requirement. Each ball is resolved from its own retail snatch WZX family using phase semantics (shake first), successful Type-2 HSD decode, textured compact geometry scoring, and successful static source compilation; the single proven retail prop is then shared across throw/land/shake/miss choreography. This preserves exact Colosseum geometry/materials/textures on Android without permitting procedural fallback to masquerade as source cache success. 1.8.4 corrects the extraction layer itself: retail snatch FSYS members are treated as complete .fdat asset containers, every HSD root in the member is enumerated (including deep archives beyond the old 64 KiB scan), the compact textured ball root is preferred before Waza type-2 payloads, and source incompleteness is reported separately from structural capture-bank readiness so a capture prop can never brick the entire CBE runtime.",
   "required_imports": [
     {
       "id": "pokemon_colosseum_usa",
       "name": "Pokemon Colosseum (USA) Disc",
-      "description": "Pokemon Colosseum USA GC6E01 source. Representation-aware Gen1Recomp builds accept structurally valid raw ISO/GCM, safely scrubbed/trimmed raw images, and GameCube CISO regardless of filename extension; older launchers retain the canonical ISO and tested CISO hash path. Audio extraction is optional and never blocks CBE visuals.",
+      "description": "Pokemon Colosseum USA GC6E01 source. Current Gen1Recomp validates required imports before CBE runs; this manifest accepts the canonical USA ISO and the specifically tested CISO digest listed below. Other scrubbed, trimmed, recompressed, or differently generated CISO images may be rejected by the launcher before CBE can inspect their structure. Audio extraction is optional and never blocks CBE visuals.",
       "file": "pokemon_colosseum_usa.iso",
       "md5": [
         "e3f389dc5662b9f941769e370195ec90",
         "a2d58d82c6b76b42653dcd25c8966de7"
       ],
       "format": "raw",
-      "max_size": 2147483648,
-      "gcn_ciso": true,
-      "allow_scrubbed": true,
-      "disc_id": "GC6E01",
-      "disc_revision": 0
+      "max_size": 2147483648
     }
   ]
 }

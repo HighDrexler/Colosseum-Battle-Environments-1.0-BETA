@@ -1,4 +1,4 @@
-local M={version=8,source="GC6E01 GPT1 handler runtime for WazaSequence scheduler"}
+local M={version=12,source="GC6E01 GPT1 selector/resource-linked runtime + dual retail ordinal resolution"}
 
 -- Runtime interpreter for the subset of Colosseum's GPT1 particle bytecode that
 -- directly controls visible particle state. Extraction preserves each generator
@@ -265,41 +265,74 @@ function M.hasRole(spec,role)
   return false
 end
 
-local function matchesEntry(gen,entry)
+local function exactPhaseMatches(gen,entry)
   if type(entry)~="table" then return true end
-  if entry.gptOffset~=nil and gen.gptOffset~=nil
-      and tonumber(entry.gptOffset)~=tonumber(gen.gptOffset) then return false end
-  if entry.sourceBank~=nil and gen.sourceBank~=nil
-      and tonumber(entry.sourceBank)~=tonumber(gen.sourceBank) then return false end
-  -- For a scheduler-selected type-3 row, rootRef names the generator that this
-  -- SequenceEntry starts.  gen.rootRef describes the owner GPT1's *original*
-  -- root and is therefore wrong for later rows that reuse the same bank.
-  if entry.rootRef~=nil and gen.refId~=nil
-      and tonumber(entry.rootRef)~=tonumber(gen.refId) then return false end
+  if entry.phase~=nil and gen.phase~=nil
+      and tostring(entry.phase):lower()~=tostring(gen.phase):lower() then return false end
   return true
 end
 
-local function entrySelectsGenerator(gen,entry)
-  if type(entry)~="table" then return gen.root==true end
-  if not matchesEntry(gen,entry) then return false end
-  if entry.rootRef~=nil and gen.refId~=nil then
-    return tonumber(entry.rootRef)==tonumber(gen.refId)
+local function bankMatchesEntry(gen,entry)
+  if type(entry)~="table" then return true end
+  if entry.sourceBank~=nil and gen.sourceBank~=nil
+      and tonumber(entry.sourceBank)~=tonumber(gen.sourceBank) then return false end
+  if entry.bank~=nil and gen.bank~=nil
+      and tonumber(entry.bank)~=tonumber(gen.bank) then return false end
+  return true
+end
+
+local function executableGenerator(gen,role,entry)
+  return phaseRole(gen.phase)==role and exactPhaseMatches(gen,entry)
+      and type(gen.commandHex)=="string" and #gen.commandHex>=2
+      and programSupported(gen.commandHex)
+end
+
+-- Type-3 Waza rows pass an exact generator selector to Colosseum's particle
+-- bank runtime. That selected program may spawn any other generator template
+-- authored in the same WZX phase.  The
+-- complete phase is therefore the dependency pool; bank/REF metadata selects
+-- the entry point only.  This is deliberately move-agnostic and applies to all
+-- 251 move banks, including nested/cross-bank generator chains.
+local function selectEntryRoot(spec,entry,role)
+  local programs=type(spec)=="table" and (spec.generatorPrograms or {}) or {}
+  local wantedRef=type(entry)=="table" and tonumber(entry.selector~=nil and entry.selector or entry.rootRef) or nil
+  local exactRef,exactBank,ordinalExact,ordinalZero,bankRoot,phaseRoot,first
+  for _,g in ipairs(programs) do
+    if executableGenerator(g,role,entry) then
+      first=first or g
+      local sameBank=bankMatchesEntry(g,entry)
+      if wantedRef~=nil and g.refId~=nil and tonumber(g.refId)==wantedRef then
+        exactRef=exactRef or g
+        if sameBank then exactBank=exactBank or g end
+      end
+      -- Retail particle banks can address generators by table ordinal when no
+      -- REF table is present. Preserve that bank-local selector rule here too.
+      if wantedRef~=nil and sameBank then
+        -- Different retail particle-bank tables expose selector zero either as
+        -- ordinal 0 (our cached bankIndex is one-based) or directly as the
+        -- first stored script id. Preserve both source table conventions; REF
+        -- matches still outrank ordinal lookup.
+        if tonumber(g.bankIndex)==wantedRef then ordinalExact=ordinalExact or g end
+        if tonumber(g.bankIndex)==wantedRef+1 then ordinalZero=ordinalZero or g end
+      end
+      if g.root==true then
+        phaseRoot=phaseRoot or g
+        if sameBank then bankRoot=bankRoot or g end
+      end
+    end
   end
-  return gen.root==true
+  if wantedRef~=nil then return exactBank or exactRef or ordinalExact or ordinalZero or bankRoot or phaseRoot or first end
+  return bankRoot or phaseRoot or first
 end
 
 function M.hasEntry(spec,entry,role)
   if type(spec)~="table" or type(entry)~="table" then return false end
   role=tostring(role or phaseRole(entry.phase))
-  local textureBanks={}
-  for _,t in ipairs(spec.textures or {}) do textureBanks[tonumber(t.bank) or 1]=true end
-  for _,g in ipairs(spec.generatorPrograms or {}) do
-    local bank=tonumber(g.bank) or 1
-    if phaseRole(g.phase)==role and entrySelectsGenerator(g,entry)
-        and type(g.commandHex)=="string" and #g.commandHex>=2
-        and textureBanks[bank] and programSupported(g.commandHex) then return true end
-  end
-  return false
+  -- A particle phase must have at least one extracted texture somewhere in the
+  -- phase, but controller generators themselves are allowed to live in a bank
+  -- without textures because they can dispatch visible children elsewhere.
+  if #(spec.textures or {})<1 then return false end
+  return selectEntryRoot(spec,entry,role)~=nil
 end
 
 local function safeSequenceFrame(value)
@@ -363,7 +396,7 @@ local function newParticle(fx,emitter,position,velocity)
   end
   local flags=tonumber(gen.flags) or 0
   local p={
-    alive=true,frame=0,bank=gen.bank or 1,generator=gen.index or emitter.index,
+    alive=true,frame=0,bank=gen.bank or 1,sourceBank=gen.sourceBank,gptOffset=gen.gptOffset,generator=gen.index or emitter.index,
     position=pos,velocity=vel,gravity=gravity,friction=1,
     applyGravity=hasBit(flags,0x00000001),applyFriction=hasBit(flags,0x00000002),
     size=1,sizeTarget=1,sizeTime=0,
@@ -390,16 +423,33 @@ local function newParticle(fx,emitter,position,velocity)
   return p
 end
 
-local function findTemplateForRef(fx,bank,ref)
+local function findTemplateForRef(fx,parent,ref)
   ref=tonumber(ref)
   if not ref then return nil end
+  local bank=tonumber(parent and parent.bank)
+  local gptOffset=tonumber(parent and parent.gptOffset)
+  local sameBank,sameGPT,global,globalCount=nil,nil,nil,0
   for _,e in ipairs(fx.templates or {}) do
-    if e.gen.bank==bank and tonumber(e.gen.refId)==ref then return e end
+    if tonumber(e.gen.refId)==ref then
+      global=global or e;globalCount=globalCount+1
+      if bank~=nil and tonumber(e.gen.bank)==bank then sameBank=sameBank or e end
+      if gptOffset~=nil and tonumber(e.gen.gptOffset)==gptOffset then sameGPT=sameGPT or e end
+    end
   end
-  -- Some files use a generator ordinal rather than the REF id.
+  -- Retail programs normally reference siblings inside their GPT1 bank. Prefer
+  -- that, then the originating GPT payload. If the REF is unique across the
+  -- whole WZX phase, allow a cross-bank dependency rather than dropping it.
+  if sameBank then return sameBank end
+  if sameGPT then return sameGPT end
+  if globalCount==1 then return global end
+  -- Some files use a generator ordinal rather than the REF id. Keep that
+  -- compatibility fallback bank-local because ordinals are not globally unique.
+  for _,e in ipairs(fx.templates or {}) do
+    if bank~=nil and tonumber(e.gen.bank)==bank and tonumber(e.gen.bankIndex)==ref then return e end
+  end
   local ordinal=ref+1
   for _,e in ipairs(fx.templates or {}) do
-    if e.gen.bank==bank and tonumber(e.gen.bankIndex)==ordinal then return e end
+    if bank~=nil and tonumber(e.gen.bank)==bank and tonumber(e.gen.bankIndex)==ordinal then return e end
   end
   return nil
 end
@@ -427,7 +477,7 @@ local function emitterInstance(fx,template,startFrame,origin,velocity,parent)
 end
 
 local function spawnParticleRef(fx,parent,ref,inheritVelocity)
-  local template=findTemplateForRef(fx,parent.bank,ref)
+  local template=findTemplateForRef(fx,parent,ref)
   if not template then return nil end
   fx.spawnSerial=(fx.spawnSerial or 0)+1
   local seed=(tonumber(template.gen.bank) or 1)*7919+(tonumber(template.gen.bankIndex) or template.index or 1)*104729+fx.spawnSerial*97
@@ -439,7 +489,7 @@ local function spawnParticleRef(fx,parent,ref,inheritVelocity)
 end
 
 local function spawnGeneratorRef(fx,parent,ref,inheritVelocity)
-  local template=findTemplateForRef(fx,parent.bank,ref)
+  local template=findTemplateForRef(fx,parent,ref)
   if not template then return nil end
   local vel=inheritVelocity and parent.velocity or {0,0,0}
   return emitterInstance(fx,template,fx.frame,parent.position,vel,parent)
@@ -743,13 +793,27 @@ function M.start(spec,opts)
   local role=tostring(opts.role or "attack")
   local fx={spec=spec,role=role,age=0,frame=0,accumulator=0,particles={},templates={},emitters={},done=false,joints=opts.joints or {},spawnSerial=0}
   local selectedEntry=type(opts.entry)=="table" and opts.entry or nil
+  local selectedRoot=selectedEntry and selectEntryRoot(spec,selectedEntry,role) or nil
+  -- Every executable generator from the selected WZX phase is retained as a
+  -- dormant dependency template. A typed Waza row auto-starts exactly one
+  -- selected root; the legacy no-entry compatibility path preserves its old
+  -- behavior and starts each authored phase root. The dependency rule is
+  -- otherwise universal: roots may spawn siblings, nested children, or a
+  -- unique REF in another GPT1 bank without CBE deleting that source data.
   for i,gen in ipairs(type(spec)=="table" and (spec.generatorPrograms or {}) or {}) do
-    if phaseRole(gen.phase)==role and matchesEntry(gen,selectedEntry)
-        and type(gen.commandHex)=="string" and #gen.commandHex>=2
-        and programSupported(gen.commandHex) then
-      local t={gen=gen,index=i,data=hexToBytes(gen.commandHex or ""),
-        autoRoot=selectedEntry and entrySelectsGenerator(gen,selectedEntry) or gen.root==true}
+    if executableGenerator(gen,role,selectedEntry) then
+      local autoRoot
+      if selectedEntry then autoRoot=(gen==selectedRoot) else autoRoot=(gen.root==true) end
+      local t={gen=gen,index=i,data=hexToBytes(gen.commandHex or ""),autoRoot=autoRoot}
       fx.templates[#fx.templates+1]=t
+    end
+  end
+  if selectedEntry and selectedRoot then
+    local wanted=tonumber(selectedEntry.selector~=nil and selectedEntry.selector or selectedEntry.rootRef)
+    if wanted~=nil and tonumber(selectedRoot.refId)~=wanted then
+      fx.entryFallback="selector-fallback"
+    elseif not bankMatchesEntry(selectedRoot,selectedEntry) then
+      fx.entryFallback="cross-bank-selector"
     end
   end
   -- Bound particle ownership to the source WZX phase instead of the old global

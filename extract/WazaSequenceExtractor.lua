@@ -1,4 +1,4 @@
-local W={revision=3}
+local W={revision=4}
 
 -- Lossless, loader-evidence-backed WazaSequence indexer for Pokemon Colosseum
 -- WZX members (GC6E01).
@@ -48,9 +48,14 @@ local function wordList(blob,off,count)
 end
 
 local function commonSizeAt(blob,at)
-  -- loadTotalSequence's common-entry loader checks source +0x68.  Mode 1 uses
-  -- a 0x6C-byte common block; every other observed mode uses 0x70.
-  return (be32(blob,at+0x68)==1) and 0x6C or 0x70
+  -- Retail fn_801DC46C reads the serialized layout selector at source +0x68.
+  -- Mode 1 advances by 0x6C, mode 2 by 0x68, and the normal layout by 0x70.
+  -- CBE previously treated mode 2 as 0x70, shifting every type-specific payload
+  -- eight bytes late and making valid Waza rows look empty/corrupt.
+  local mode=be32(blob,at+0x68) or 0
+  if mode==1 then return 0x6C end
+  if mode==2 then return 0x68 end
+  return 0x70
 end
 
 local function plausibleHeader(blob,at,expectedIdentifier)
@@ -64,7 +69,7 @@ local function plausibleHeader(blob,at,expectedIdentifier)
   -- These words are used by the sequence runtime as frame-domain/control
   -- values.  Negative sentinels are valid; absurd random payload values are a
   -- strong false-header signal.
-  for _,off in ipairs({0x10,0x14,0x18}) do
+  for _,off in ipairs({0x0C,0x10,0x14}) do
     local v=signed32(be32(blob,at+off))
     if v==nil or v < -0x100000 or v > 0x100000 then return false end
   end
@@ -81,15 +86,26 @@ local function header(blob,at,index)
     identifier=be32(blob,at) or 0,
     entryType=typ,
     kind=KIND[typ] or ("type"..tostring(typ)),
-    -- Retail common-loader timing dependency fields. These were historically
-    -- mislabelled start/hit/finish in CBE; they are identifiers/point indices,
-    -- not literal frame numbers.
-    anchorEntry=be32(blob,at+0x10) or 0,
-    localPoint=be32(blob,at+0x14) or 0,
-    anchorPoint=be32(blob,at+0x18) or 0,
-    attachment=be32(blob,at+0x1C) or 0,
+    -- Exact WazaSequenceNode source fields used by wazaSequenceEntryLink:
+    --   +08 linkedEntryKey, +0C source timing index, +10 target timing index,
+    --   +14 loader timing slot, +18 state/resource-link key, +1C flags,
+    --   +20 attachment, +24 part index, +28 position type, +2C timing[16].
+    -- Absolute start = linked.start + linked.timing[targetIndex]
+    --                  - this.timing[sourceIndex], or the same operation
+    -- against the active Pokemon/global Waza timing table when unlinked.
+    anchorEntry=be32(blob,at+0x08) or 0,
+    localPoint=be32(blob,at+0x0C) or 0,
+    anchorPoint=be32(blob,at+0x10) or 0,
+    timingIndex=be32(blob,at+0x14) or 0,
+    state=be32(blob,at+0x18) or 0,
+    flags=be32(blob,at+0x1C) or 0,
+    attachment=be32(blob,at+0x20) or 0,
+    partIndex=be32(blob,at+0x24) or 0,
+    positionType=be32(blob,at+0x28) or 0,
+    sourceIndex=be32(blob,at+0x0C) or 0,
+    targetIndex=be32(blob,at+0x10) or 0,
     timingPoints=(function()
-      local t={};for i=0,15 do t[#t+1]=signed32(be32(blob,at+0x20+i*4)) or 0 end;return t
+      local t={};for i=0,15 do t[#t+1]=signed32(be32(blob,at+0x2C+i*4)) or 0 end;return t
     end)(),
     flags60=be32(blob,at+0x60) or 0,
     flags64=be32(blob,at+0x64) or 0,
@@ -154,39 +170,53 @@ local function parseKnownEntry(blob,at,index)
     finish=e.dataOffset+align32(e.embeddedSize)
 
   elseif e.entryType==3 then
-    -- Particle-entry loader.  The type-specific header is 0x10 bytes.  Mode 3
-    -- has one additional source word before particle data.  Later entries may
-    -- contain no GPT1 of their own and instead reference a previously loaded
-    -- particle bank; retain the range either way.
+    -- Exact WazaParticleData layout used by _wazaSequenceParticleEntryLoad:
+    --   +00 selector, +04 animationMode, +08 resourceSize, +0C format.
+    -- The GPT1 payload begins at +10 (or +14 for format 3). If common `state`
+    -- is non-zero the row REUSES the particle resource loaded by that earlier
+    -- Waza entry and the retail loader does not consume/load a second GPT1.
     if not saneRange(extra,0x10,n) then return e,nil,"truncated particle payload" end
     e.particleWords=wordList(blob,extra,4)
-    e.rootRef=be32(blob,extra) or 0
-    e.effectParam=be32(blob,extra+0x04) or 0
+    e.selector=be32(blob,extra) or 0
+    e.animationMode=be32(blob,extra+0x04) or 0
     e.particleDataSize=be32(blob,extra+0x08) or 0
-    e.particleMode=be32(blob,extra+0x0C) or 0
-    e.effectMode=e.particleMode -- compatibility with the existing GPT1 runtime
-    local prefix=(e.particleMode==3) and 0x14 or 0x10
-    if e.particleMode==3 then
-      if not saneRange(extra,0x14,n) then return e,nil,"truncated particle mode-3 payload" end
-      e.mode3Word=be32(blob,extra+0x10) or 0
+    e.particleFormat=be32(blob,extra+0x0C) or 0
+    e.effectMode=e.particleFormat
+    -- Compatibility alias for old caches/callers; runtime selection now uses
+    -- `selector`, matching fn_801190DC(resource, selector, animationMode & 1).
+    e.rootRef=e.selector
+    local prefix=(e.particleFormat==3) and 0x14 or 0x10
+    if e.particleFormat==3 then
+      if not saneRange(extra,0x14,n) then return e,nil,"truncated particle format-3 payload" end
+      e.format3Word=be32(blob,extra+0x10) or 0
     end
     e.dataOffset=extra+prefix
-    if e.particleDataSize<0 or not saneRange(e.dataOffset,e.particleDataSize,n) then
-      return e,nil,"invalid/truncated particle data"
+    e.sharedResource=(tonumber(e.state) or 0)~=0
+    if e.sharedResource then
+      e.dataSize=0
+      finish=e.dataOffset
+    else
+      if e.particleDataSize<0 or not saneRange(e.dataOffset,e.particleDataSize,n) then
+        return e,nil,"invalid/truncated particle data"
+      end
+      e.dataSize=e.particleDataSize
+      if e.dataSize>0 then
+        e.dataMagic=blob:sub(e.dataOffset+1,math.min(n,e.dataOffset+4))
+        if e.dataMagic=="GPT1" then e.gptOffset=e.dataOffset end
+      end
+      finish=e.dataOffset+align32(e.particleDataSize)
     end
-    e.dataSize=e.particleDataSize
-    if e.dataSize>0 then
-      e.dataMagic=blob:sub(e.dataOffset+1,math.min(n,e.dataOffset+4))
-      if e.dataMagic=="GPT1" then e.gptOffset=e.dataOffset end
-    end
-    finish=e.dataOffset+align32(e.particleDataSize)
 
   elseif e.entryType==4 then
-    -- The retail loader delegates type 4 to a dedicated variable-layout helper.
-    -- Until every subtype is decoded, preserve it losslessly and use the next
-    -- sequential source identifier as the structural boundary.  Sequential ids
-    -- are a strong invariant of real WZX members and avoid false headers inside
-    -- embedded model/particle data.
+    -- Procedural effect descriptor. fn_801364A8 consumes the descriptor with
+    -- effect family at +00 and authored frame count at +04, then advances a
+    -- family-specific variable payload. Preserve the complete range and expose
+    -- the proven family/duration now; W.parse locates the next sequential row
+    -- to delimit the variable body losslessly.
+    if not saneRange(extra,0x0C,n) then return e,nil,"truncated type4 effect descriptor" end
+    e.effectType=be32(blob,extra) or 0
+    e.effectFrames=be32(blob,extra+0x04) or 0
+    e.effectHeaderWord=be32(blob,extra+0x08) or 0
     e.words=wordList(blob,extra,math.min(8,math.floor(math.max(0,n-extra)/4)))
     finish=nil -- resolved by W.parse with the next expected identifier
 
@@ -333,7 +363,7 @@ end
 
 function W.status()
   return {revision=W.revision,source="GC6E01 WZX loader-evidence typed timeline index",
-    provenTypes={model=2,particle=3,sound=5},opaqueTypes={1,4,6}}
+    provenTypes={model=2,particle=3,effect=4,sound=5},opaqueTypes={1,6}}
 end
 
 W._internal={parseEntry=parseKnownEntry,plausibleHeader=plausibleHeader,findExpectedHeader=findExpectedHeader,

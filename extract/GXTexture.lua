@@ -1,15 +1,26 @@
 local G={}
 local floor=math.floor
+local byte=string.byte
+local char=string.char
+local concat=table.concat
+
+-- Pre-interned single-byte strings. `string.char` is a C call plus a hash
+-- lookup for every channel; an array index is neither.
+local CHR={} for i=0,255 do CHR[i]=char(i) end
+-- Pre-expanded 4-bit -> 8-bit ramps and grayscale/alpha strings.
+local E4={} for i=0,15 do E4[i]=i*17 end
+local E5={} for i=0,31 do E5[i]=floor(i*255/31+.5) end
+local E6={} for i=0,63 do E6[i]=floor(i*255/63+.5) end
+-- Opaque grayscale pixel for every intensity value (I4/I8 fast path).
+local GREY={} for i=0,255 do GREY[i]=char(i,i,i,255) end
+
 local function be16(s,p)local a,b=s:byte(p,p+1);if not b then return 0 end;return a*256+b end
-local function c8(v)return string.char(math.max(0,math.min(255,floor(v+0.5)))) end
-local function rgba(r,g,b,a)return c8(r)..c8(g)..c8(b)..c8(a) end
 local function expand4(v)return v*17 end
 local function expand5(v)return floor(v*255/31+.5) end
 local function expand6(v)return floor(v*255/63+.5) end
-local function rgb565(v)return expand5(floor(v/2048)%32),expand6(floor(v/32)%64),expand5(v%32),255 end
--- Correct RGB5A3 expansion: high bit clear = AAA RGB4. Keep this separate to avoid bit ops.
+local function rgb565(v)return E5[floor(v/2048)%32],E6[floor(v/32)%64],E5[v%32],255 end
 local function rgb5a3c(v)
-  if v>=32768 then return expand5(floor((v-32768)/1024)%32),expand5(floor(v/32)%32),expand5(v%32),255 end
+  if v>=32768 then return E5[floor((v-32768)/1024)%32],E5[floor(v/32)%32],E5[v%32],255 end
   local a=floor(v/4096)%8;local r=floor(v/256)%16;local g=floor(v/16)%16;local b=v%16
   return r*17,g*17,b*17,floor(a*255/7+.5)
 end
@@ -19,13 +30,21 @@ local function palColor(pal,fmt,idx)
   elseif fmt==1 then return rgb565(v)
   else return rgb5a3c(v) end
 end
-local function set(px,w,h,x,y,r,g,b,a)
-  if x>=0 and y>=0 and x<w and y<h then px[y*w+x+1]=rgba(r,g,b,a) end
+
+-- Decode the TLUT once into ready-made 4-byte pixel strings instead of
+-- re-deriving a colour for every single texel that references it.
+local function palTable(pal,fmt,count)
+  local t={}
+  local n=math.min(count,floor(#pal/2))
+  for i=0,n-1 do
+    local r,g,b,a=palColor(pal,fmt,i)
+    t[i]=char(r,g,b,a)
+  end
+  local blank=char(0,0,0,0)
+  for i=n,count-1 do t[i]=blank end
+  return t
 end
-local function blockLoop(w,h,bw,bh,fn)
-  local bi=0
-  for by=0,h-1,bh do for bx=0,w-1,bw do bi=fn(bx,by,bi) end end
-end
+
 function G.dataSize(w,h,fmt)
   local bw,bh,bytes=4,4,32
   if fmt==0 or fmt==8 then bw,bh,bytes=8,8,32
@@ -34,44 +53,213 @@ function G.dataSize(w,h,fmt)
   elseif fmt==14 then bw,bh,bytes=8,8,32 end
   return math.ceil(w/bw)*math.ceil(h/bh)*bytes
 end
+
 function G.decode(data,w,h,fmt,palette,palFmt)
   assert(type(data)=="string" and w>0 and h>0,"bad GX texture")
-  local px={};for i=1,w*h do px[i]="\0\0\0\0" end
+  local px={};local blank="\0\0\0\0"
+  for i=1,w*h do px[i]=blank end
+
   if fmt==0 then -- I4
-    blockLoop(w,h,8,8,function(bx,by,o)
-      for y=0,7 do for x=0,7,2 do local q=data:byte(o+1) or 0;o=o+1;local a=expand4(floor(q/16));local b=expand4(q%16);set(px,w,h,bx+x,by+y,a,a,a,255);set(px,w,h,bx+x+1,by+y,b,b,b,255) end end;return o end)
+    local o=0
+    for by=0,h-1,8 do for bx=0,w-1,8 do
+      for y=0,7 do
+        local ry=by+y
+        if ry<h then
+          local row=ry*w
+          for x=0,7,2 do
+            local q=byte(data,o+1) or 0;o=o+1
+            local cx=bx+x
+            if cx<w then px[row+cx+1]=GREY[E4[floor(q/16)]] end
+            if cx+1<w then px[row+cx+2]=GREY[E4[q%16]] end
+          end
+        else o=o+4 end
+      end
+    end end
   elseif fmt==1 then -- I8
-    blockLoop(w,h,8,4,function(bx,by,o)for y=0,3 do for x=0,7 do local q=data:byte(o+1) or 0;o=o+1;set(px,w,h,bx+x,by+y,q,q,q,255) end end;return o end)
+    local o=0
+    for by=0,h-1,4 do for bx=0,w-1,8 do
+      for y=0,3 do
+        local ry=by+y
+        if ry<h then
+          local row=ry*w
+          for x=0,7 do
+            local q=byte(data,o+1) or 0;o=o+1
+            local cx=bx+x
+            if cx<w then px[row+cx+1]=GREY[q] end
+          end
+        else o=o+8 end
+      end
+    end end
   elseif fmt==2 then -- IA4
-    blockLoop(w,h,8,4,function(bx,by,o)for y=0,3 do for x=0,7 do local q=data:byte(o+1) or 0;o=o+1;local a=expand4(floor(q/16));local i=expand4(q%16);set(px,w,h,bx+x,by+y,i,i,i,a) end end;return o end)
+    local o=0
+    for by=0,h-1,4 do for bx=0,w-1,8 do
+      for y=0,3 do
+        local ry=by+y
+        if ry<h then
+          local row=ry*w
+          for x=0,7 do
+            local q=byte(data,o+1) or 0;o=o+1
+            local cx=bx+x
+            if cx<w then
+              local a=E4[floor(q/16)];local i=E4[q%16]
+              px[row+cx+1]=CHR[i]..CHR[i]..CHR[i]..CHR[a]
+            end
+          end
+        else o=o+8 end
+      end
+    end end
   elseif fmt==3 then -- IA8
-    blockLoop(w,h,4,4,function(bx,by,o)for y=0,3 do for x=0,3 do local a=data:byte(o+1) or 0;local i=data:byte(o+2) or 0;o=o+2;set(px,w,h,bx+x,by+y,i,i,i,a) end end;return o end)
+    local o=0
+    for by=0,h-1,4 do for bx=0,w-1,4 do
+      for y=0,3 do
+        local ry=by+y
+        if ry<h then
+          local row=ry*w
+          for x=0,3 do
+            local a=byte(data,o+1) or 0;local i=byte(data,o+2) or 0;o=o+2
+            local cx=bx+x
+            if cx<w then px[row+cx+1]=CHR[i]..CHR[i]..CHR[i]..CHR[a] end
+          end
+        else o=o+8 end
+      end
+    end end
   elseif fmt==4 or fmt==5 then
-    blockLoop(w,h,4,4,function(bx,by,o)for y=0,3 do for x=0,3 do local v=be16(data,o+1);o=o+2;local r,g,b,a;if fmt==4 then r,g,b,a=rgb565(v) else r,g,b,a=rgb5a3c(v) end;set(px,w,h,bx+x,by+y,r,g,b,a) end end;return o end)
+    local five=(fmt==4)
+    local o=0
+    for by=0,h-1,4 do for bx=0,w-1,4 do
+      for y=0,3 do
+        local ry=by+y
+        if ry<h then
+          local row=ry*w
+          for x=0,3 do
+            local v=be16(data,o+1);o=o+2
+            local cx=bx+x
+            if cx<w then
+              local r,g,b,a
+              if five then r,g,b,a=rgb565(v) else r,g,b,a=rgb5a3c(v) end
+              px[row+cx+1]=char(r,g,b,a)
+            end
+          end
+        else o=o+8 end
+      end
+    end end
   elseif fmt==6 then -- RGBA8: 32-byte AR plane + 32-byte GB plane per 4x4 block
-    blockLoop(w,h,4,4,function(bx,by,o)local ar=o;local gb=o+32;for y=0,3 do for x=0,3 do local a=data:byte(ar+1) or 0;local r=data:byte(ar+2) or 0;local g=data:byte(gb+1) or 0;local b=data:byte(gb+2) or 0;ar=ar+2;gb=gb+2;set(px,w,h,bx+x,by+y,r,g,b,a) end end;return o+64 end)
+    local o=0
+    for by=0,h-1,4 do for bx=0,w-1,4 do
+      local ar=o;local gb=o+32
+      for y=0,3 do
+        local ry=by+y
+        if ry<h then
+          local row=ry*w
+          for x=0,3 do
+            local a=byte(data,ar+1) or 0;local r=byte(data,ar+2) or 0
+            local g=byte(data,gb+1) or 0;local b=byte(data,gb+2) or 0
+            ar=ar+2;gb=gb+2
+            local cx=bx+x
+            if cx<w then px[row+cx+1]=char(r,g,b,a) end
+          end
+        else ar=ar+8;gb=gb+8 end
+      end
+      o=o+64
+    end end
   elseif fmt==8 or fmt==9 or fmt==10 then
     assert(type(palette)=="string","paletted GX texture without TLUT")
+    local pf=palFmt or 2
     if fmt==8 then
-      blockLoop(w,h,8,8,function(bx,by,o)for y=0,7 do for x=0,7,2 do local q=data:byte(o+1) or 0;o=o+1;for k,idx in ipairs({floor(q/16),q%16}) do local r,g,b,a=palColor(palette,palFmt or 2,idx);set(px,w,h,bx+x+k-1,by+y,r,g,b,a) end end end;return o end)
+      local LUT=palTable(palette,pf,16)
+      local o=0
+      for by=0,h-1,8 do for bx=0,w-1,8 do
+        for y=0,7 do
+          local ry=by+y
+          if ry<h then
+            local row=ry*w
+            for x=0,7,2 do
+              local q=byte(data,o+1) or 0;o=o+1
+              local cx=bx+x
+              if cx<w then px[row+cx+1]=LUT[floor(q/16)] end
+              if cx+1<w then px[row+cx+2]=LUT[q%16] end
+            end
+          else o=o+4 end
+        end
+      end end
     elseif fmt==9 then
-      blockLoop(w,h,8,4,function(bx,by,o)for y=0,3 do for x=0,7 do local idx=data:byte(o+1) or 0;o=o+1;local r,g,b,a=palColor(palette,palFmt or 2,idx);set(px,w,h,bx+x,by+y,r,g,b,a) end end;return o end)
+      local LUT=palTable(palette,pf,256)
+      local o=0
+      for by=0,h-1,4 do for bx=0,w-1,8 do
+        for y=0,3 do
+          local ry=by+y
+          if ry<h then
+            local row=ry*w
+            for x=0,7 do
+              local idx=byte(data,o+1) or 0;o=o+1
+              local cx=bx+x
+              if cx<w then px[row+cx+1]=LUT[idx] end
+            end
+          else o=o+8 end
+        end
+      end end
     else
-      blockLoop(w,h,4,4,function(bx,by,o)for y=0,3 do for x=0,3 do local idx=be16(data,o+1)%16384;o=o+2;local r,g,b,a=palColor(palette,palFmt or 2,idx);set(px,w,h,bx+x,by+y,r,g,b,a) end end;return o end)
+      -- C14X2 addresses up to 16384 entries but a real texture touches only a
+      -- handful, so this palette is memoized on demand instead of eagerly.
+      local LUT={}
+      local o=0
+      for by=0,h-1,4 do for bx=0,w-1,4 do
+        for y=0,3 do
+          local ry=by+y
+          if ry<h then
+            local row=ry*w
+            for x=0,3 do
+              local idx=be16(data,o+1)%16384;o=o+2
+              local cx=bx+x
+              if cx<w then
+                local e=LUT[idx]
+                if not e then
+                  local r,g,b,a=palColor(palette,pf,idx);e=char(r,g,b,a);LUT[idx]=e
+                end
+                px[row+cx+1]=e
+              end
+            end
+          else o=o+8 end
+        end
+      end end
     end
   elseif fmt==14 then -- CMPR / GC tiled DXT1
-    blockLoop(w,h,8,8,function(bx,by,o)
+    local o=0
+    for by=0,h-1,8 do for bx=0,w-1,8 do
       for sub=0,3 do
         local sx=(sub%2)*4;local sy=floor(sub/2)*4
-        local c0=be16(data,o+1);local c1=be16(data,o+3);local r0,g0,b0=rgb565(c0);local r1,g1,b1=rgb565(c1);local cs={{r0,g0,b0,255},{r1,g1,b1,255}}
-        if c0>c1 then cs[3]={floor((2*r0+r1)/3),floor((2*g0+g1)/3),floor((2*b0+b1)/3),255};cs[4]={floor((r0+2*r1)/3),floor((g0+2*g1)/3),floor((b0+2*b1)/3),255}
-        else cs[3]={floor((r0+r1)/2),floor((g0+g1)/2),floor((b0+b1)/2),255};cs[4]={0,0,0,0} end
-        for y=0,3 do local bits=data:byte(o+5+y) or 0;for x=0,3 do local idx=floor(bits/(2^(6-2*x)))%4+1;local c=cs[idx];set(px,w,h,bx+sx+x,by+sy+y,c[1],c[2],c[3],c[4]) end end
+        local c0=be16(data,o+1);local c1=be16(data,o+3)
+        local r0,g0,b0=rgb565(c0);local r1,g1,b1=rgb565(c1)
+        local p1=char(r0,g0,b0,255)
+        local p2=char(r1,g1,b1,255)
+        local p3,p4
+        if c0>c1 then
+          p3=char(floor((2*r0+r1)/3),floor((2*g0+g1)/3),floor((2*b0+b1)/3),255)
+          p4=char(floor((r0+2*r1)/3),floor((g0+2*g1)/3),floor((b0+2*b1)/3),255)
+        else
+          p3=char(floor((r0+r1)/2),floor((g0+g1)/2),floor((b0+b1)/2),255)
+          p4="\0\0\0\0"
+        end
+        for y=0,3 do
+          local ry=by+sy+y
+          if ry<h then
+            local row=ry*w
+            local bits=byte(data,o+5+y) or 0
+            local i0=floor(bits/64)%4
+            local i1=floor(bits/16)%4
+            local i2=floor(bits/4)%4
+            local i3=bits%4
+            local cx=bx+sx
+            if cx<w   then px[row+cx+1]=(i0==0 and p1) or (i0==1 and p2) or (i0==2 and p3) or p4 end
+            if cx+1<w then px[row+cx+2]=(i1==0 and p1) or (i1==1 and p2) or (i1==2 and p3) or p4 end
+            if cx+2<w then px[row+cx+3]=(i2==0 and p1) or (i2==1 and p2) or (i2==2 and p3) or p4 end
+            if cx+3<w then px[row+cx+4]=(i3==0 and p1) or (i3==1 and p2) or (i3==2 and p3) or p4 end
+          end
+        end
         o=o+8
       end
-      return o
-    end)
+    end end
   else error("unsupported GX texture format "..tostring(fmt)) end
-  return table.concat(px)
+  return concat(px)
 end
 return G

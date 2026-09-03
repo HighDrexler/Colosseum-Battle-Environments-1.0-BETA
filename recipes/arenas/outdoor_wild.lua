@@ -1,4 +1,4 @@
--- 0.0.51: ORRE WILDLANDS / MAX RUNTIME NATURALISM PASS
+-- 0.0.52: ORRE WILDLANDS / SOURCE-ADJACENT NATURALISM + CAMERA CLEARANCE PASS
 -- Generic wild outdoor battle biome.  The arena is intentionally nature-first:
 -- textured meadow/forest floor, layered grass, barked tapering trees, visible
 -- branch hierarchy, cutout leaf sprays, roots, undergrowth, rock and water.
@@ -43,7 +43,7 @@ local N=144
 local function groundH(x,z)
   local r=math.sqrt(x*x+z*z);local q=clamp((r-70)/115,0,1)
   local n=math.sin(x*.038+z*.012)*.42+math.cos(z*.046-x*.014)*.31+math.sin((x+z)*.021)*.24
-  return n*(.14+.88*q)+q*q*.86
+  return n*(.12+.78*q)+q*q*.62
 end
 local function outerH(x,z)
   local r=math.sqrt(x*x+z*z);local a=math.atan(z,x);local t=clamp((r-155)/480,0,1)
@@ -280,4 +280,4 @@ for i=0,35 do local a0=2*math.pi*i/36;local a1=2*math.pi*(i+1)/36;local r0=580+1
 for i=1,78 do local a=2*math.pi*i/78+.03*math.sin(i*1.3);local r=500+((i*23)%86);local x,z=math.cos(a)*r,math.sin(a)*r;local y=outerH(x,z)+24;for k=0,2 do leafQuad(farLeaf,x+math.cos(a+k*2.1)*6,y+k*3,z+math.sin(a+k*2.1)*6,24+(i%4)*3,19+(i%3)*3,a+k*1.05,.04,800+i+k) end end
 
 local total=0;for _,g in ipairs(groups) do total=total+#g.vertices end
-return {version=17,source="Pokemon Colosseum / Orre Wildlands grounded solid-grass artifact cleanup",prototype=false,bounds={min={-650,-8,-650},max={650,155,650}},groupCount=#groups,vertexCount=total,groups=groups}
+return {version=18,source="Pokemon Colosseum / Orre Wildlands source-adjacent grounded vegetation and camera-clearance fidelity",prototype=false,bounds={min={-650,-8,-650},max={650,155,650}},groupCount=#groups,vertexCount=total,groups=groups}

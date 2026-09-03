@@ -53,9 +53,20 @@ local function assetData(asset)
   return fd
 end
 local function assetPath(_,asset) return assetData(asset) end
-local function themeAvailable(theme)
+local function themeCached(theme)
   if not theme then return false end
-  return assetData(theme.intro)~=nil and assetData(theme.loop)~=nil
+  return GeneratedAssets.exists(theme.intro) and GeneratedAssets.exists(theme.loop)
+end
+local function registerTheme(game,theme)
+  if not theme or not themeCached(theme) then return false end
+  game=game or gameRef or (modRef and modRef.game)
+  local data=game and game.data;local songs=data and data.audio and data.audio.songs
+  if not songs then return false end
+  if songs[theme.song] then return true end
+  local intro=assetPath(modRef,theme.intro);local loop=assetPath(modRef,theme.loop)
+  if not (intro and loop) then return false end
+  songs[theme.song]={file=intro,loopFile=loop}
+  return true
 end
 local function settings(game)
   if not (game and game.save) then return {music="normal"} end
@@ -78,29 +89,29 @@ local function requestKind(song,ctx)
 end
 local function ensureSongs(game)
   game=game or gameRef or (modRef and modRef.game)
-  local data=game and game.data
-  local songs=data and data.audio and data.audio.songs
+  local data=game and game.data;local songs=data and data.audio and data.audio.songs
   if not songs then installed=false;return false,0 end
   local available=0
-  for _,theme in ipairs(THEMES) do
-    local intro=assetPath(modRef,theme.intro);local loop=assetPath(modRef,theme.loop)
-    if intro and loop then
-      songs[theme.song]={file=intro,loopFile=loop}
-      available=available+1
-      missingWarned[theme.id]=nil
-    elseif not missingWarned[theme.id] then
-      missingWarned[theme.id]=true
-      log(modRef,"warn","Optional Colosseum theme unavailable; using original game audio when selected: "..theme.id)
+  for _,theme in ipairs(THEMES) do if themeCached(theme) then available=available+1 end end
+  installed=available>0
+  -- Keep the persistent cache broad but runtime residency narrow on mobile.
+  -- Only the explicitly selected theme is materialized here. RANDOM defers its
+  -- one theme load until the authoritative battle music selection.
+  local mode=settings(game).music
+  if mode~="random" and mode~="original" then
+    local theme=BY_ID[mode] or BY_ID.normal
+    if theme and theme.song and themeCached(theme) then
+      if registerTheme(game,theme) then missingWarned[theme.id]=nil end
+    elseif theme and not missingWarned[theme.id] then
+      missingWarned[theme.id]=true;log(modRef,"warn","Optional Colosseum theme unavailable; using original game audio when selected: "..theme.id)
     end
   end
-  installed=available>0
   return installed,available
 end
 local function chooseRandom(game)
-  ensureSongs(game or gameRef)
   local available={}
   for _,theme in ipairs(THEMES) do
-    if themeAvailable(theme) then available[#available+1]=theme end
+    if themeCached(theme) then available[#available+1]=theme end
   end
   if #available<1 then randomBattleTheme=nil;return nil end
   randomBattleTheme=available[math.random(1,#available)]
@@ -109,10 +120,10 @@ end
 function M.themeOptions(game)
   ensureSongs(game or gameRef);local out={}
   local haveTheme=false
-  for _,t in ipairs(THEMES) do if themeAvailable(t) then haveTheme=true break end end
+  for _,t in ipairs(THEMES) do if themeCached(t) then haveTheme=true break end end
   if haveTheme then
     out[#out+1]={id="random",label="RANDOM"}
-    for _,t in ipairs(THEMES) do if themeAvailable(t) then out[#out+1]={id=t.id,label=t.label} end end
+    for _,t in ipairs(THEMES) do if themeCached(t) then out[#out+1]={id=t.id,label=t.label} end end
   end
   out[#out+1]={id="original",label=haveTheme and "ORIGINAL / OFF" or "ORIGINAL / CACHE REQUIRED"}
   return out
@@ -136,8 +147,8 @@ function M.install(mod)
       if kind=="battle" then
         ensureSongs(game)
         local theme=randomBattleTheme
-        if not (theme and themeAvailable(theme)) then theme=chooseRandom(game) end
-        if theme and themeAvailable(theme) then return theme.song end
+        if not (theme and themeCached(theme)) then theme=chooseRandom(game) end
+        if theme and registerTheme(game,theme) then return theme.song end
       elseif kind=="result" then
         randomBattleTheme=nil
       else
@@ -149,7 +160,7 @@ function M.install(mod)
     randomBattleTheme=nil
     local theme=BY_ID[mode] or BY_ID.normal
     ensureSongs(game)
-    if kind=="battle" and theme and theme.song and themeAvailable(theme) then return theme.song end
+    if kind=="battle" and theme and theme.song and registerTheme(game,theme) then return theme.song end
     return selected
   end,1200)
   hookInstalled=true;installed=ensureSongs(gameRef) or installed;return installed
@@ -169,9 +180,9 @@ end
 function M.status()
   local list={};local available=0
   for _,t in ipairs(THEMES) do
-    local ready=themeAvailable(t);if ready then available=available+1 end
+    local ready=themeCached(t);if ready then available=available+1 end
     list[#list+1]={id=t.id,label=t.label,sequence=t.seq,song=t.song,available=ready}
   end
-  return {installed=installed,hookInstalled=hookInstalled,availableThemes=available,totalThemes=#THEMES,mode=M.getMode(gameRef),modeLabel=M.themeLabel(gameRef),themeOptions=M.themeOptions(gameRef),themes=list,randomChoice=randomBattleTheme and randomBattleTheme.id or nil,renderer="CBE generated-audio cache / MusyX source compiler (optional/fail-open)",sourceGroup="snd_music"}
+  return {installed=installed,hookInstalled=hookInstalled,availableThemes=available,totalThemes=#THEMES,mode=M.getMode(gameRef),modeLabel=M.themeLabel(gameRef),themeOptions=M.themeOptions(gameRef),themes=list,randomChoice=randomBattleTheme and randomBattleTheme.id or nil,renderer="CBE generated-audio cache / lazy runtime theme residency / MusyX source compiler",sourceGroup="snd_music"}
 end
 return M

@@ -91,7 +91,11 @@ local function alignSampleFeet(base,sample,height)
   sample.bounds={min=mn,max=mx,center={(mn[1]+mx[1])/2,(mn[2]+mx[2])/2,(mn[3]+mx[3])/2}}
   return true
 end
-local POSE_OFFSET={breath=9,look=12,arm=15,shift=18,settle=21,command=24,brace=27}
+local POSE_OFFSET={
+  breath=9,look=12,
+  gesture1=15,gesture2=18,gesture3=21,gesture4=24,gesture5=27,
+  reaction1=30,reaction2=33,reaction3=36,reaction4=39,reaction5=42,
+}
 local function sameTopology(base,sample)
   if not (base and sample and #(base.groups or {})==#(sample.groups or {})) then return false end
   for gi,g in ipairs(base.groups or {}) do
@@ -144,11 +148,11 @@ local function poseMetrics(base,sample,height)
   local function rr(v,c)return c>0 and math.sqrt(v/c)/H or 0 end
   local l=rr(left,nLeft);local r=rr(right,nRight)
   return {overall=rr(sum,n),upper=rr(upper,nu),lower=rr(lower,nl),head=rr(head,nh),
-    asym=math.abs(l-r),torsoDy=(torsoN>0 and torsoDy/torsoN/H or 0),max=maxD/H}
+    left=l,right=r,asym=math.abs(l-r),torsoDy=(torsoN>0 and torsoDy/torsoN/H or 0),max=maxD/H}
 end
 local function finiteMetric(m)
   if type(m)~="table" then return false end
-  for _,k in ipairs({"overall","upper","lower","head","asym","torsoDy","max"}) do
+  for _,k in ipairs({"overall","upper","lower","head","left","right","asym","torsoDy","max"}) do
     local v=tonumber(m[k]);if not v or v~=v or v==math.huge or v==-math.huge then return false end
   end
   return m.overall<=.78 and m.max<=1.85
@@ -229,7 +233,14 @@ local function attachSourcePoseBank(model,target,referenceBounds,progressLabel)
     for _,c in ipairs(row.samples or {}) do
       local m=c.metrics or {};local sc
       if kind=="gesture" then
-        sc=(m.upper or 0)*1.34+(m.asym or 0)*.82+(m.head or 0)*.10-(m.lower or 0)*.24+(m.overall or 0)*.18
+        -- Battle throw/command clips are strongly one-hand-led. Prefer motion
+        -- on the source actor's lead side and penalize equally large opposite
+        -- arm travel; this rejects the broad two-arm "swimming" silhouettes
+        -- that the old strongest-upper-body classifier could accidentally pick.
+        local leadSide=tonumber(target and target.releaseSide) or -1
+        local lead=(leadSide<0) and (m.left or 0) or (m.right or 0)
+        local off=(leadSide<0) and (m.right or 0) or (m.left or 0)
+        sc=lead*1.95+(m.asym or 0)*1.10+(m.upper or 0)*.62-off*.42-(m.lower or 0)*.22+(m.overall or 0)*.12
       else
         sc=(m.lower or 0)*.74+(m.upper or 0)*.46+(m.overall or 0)*.58+math.abs(m.torsoDy or 0)*1.05
       end
@@ -255,28 +266,57 @@ local function attachSourcePoseBank(model,target,referenceBounds,progressLabel)
     end
     return best
   end
-  -- Gesture progression uses three chronological frames from ONE real B1 clip.
-  local command=nearestPhase(gesture,.20)
-  local arm=nearestPhase(gesture,.52)
-  local settle=nearestPhase(gesture,.84)
-  -- Reaction progression likewise stays inside one authored clip.
-  local brace=nearestPhase(reaction,.36)
-  local shift=nearestPhase(reaction,.68)
+  -- 1.7.1: retain FIVE chronological samples from each selected native B1 clip.
+  -- The previous 3-pose gesture / 2-pose reaction approximation could only draw
+  -- straight-line morphs between widely separated silhouettes; arms therefore
+  -- appeared to "swim" through the torso even though the endpoints came from
+  -- Colosseum.  Five samples preserve the actual source clip arc closely enough
+  -- for the runtime to interpolate adjacent authored frames rather than inventing
+  -- intermediate body motion.
+  local phases={.20,.36,.52,.68,.84}
+  local gestureFrames,reactionFrames={},{}
+  for i,f in ipairs(phases) do
+    gestureFrames[i]=nearestPhase(gesture,f)
+    reactionFrames[i]=nearestPhase(reaction,f)
+  end
 
-  -- Sparse-model fail-open: if the B1 actor exposes too few distinct clips, use
-  -- the strongest available source rows but never synthesize limb geometry.
+  -- Sparse-model fail-open: stay source-only. If one sample is unavailable,
+  -- borrow the nearest retained frame from that SAME selected clip family. We
+  -- never synthesize limb geometry and never cross-blend unrelated clips.
+  local function fillSameFamily(frames,row)
+    local first
+    for _,c in ipairs(frames) do if c then first=c;break end end
+    if not first and row then first=nearestPhase(row,.52) end
+    for i=1,#phases do
+      if not frames[i] then
+        local best,bestD=nil,math.huge
+        for j,c in ipairs(frames) do if c then
+          local d=math.abs(j-i);if d<bestD then best,bestD=c,d end
+        end end
+        frames[i]=best or first
+      end
+    end
+  end
+  fillSameFamily(gestureFrames,gesture)
+  fillSameFamily(reactionFrames,reaction)
+
   local all={}
   for _,row in ipairs(actionByClip) do for _,c in ipairs(row.samples or {}) do all[#all+1]=c end end
   local strongest=function(m)return -(m.overall or 0) end
-  command=command or chooseCandidate(all,strongest)
-  arm=arm or command
-  settle=settle or arm or command
-  brace=brace or chooseCandidate(all,function(m)return -((m.lower or 0)+(m.overall or 0)*.5) end)
-  shift=shift or brace
+  if not gestureFrames[1] then
+    local c=chooseCandidate(all,strongest)
+    for i=1,5 do gestureFrames[i]=c end
+  end
+  if not reactionFrames[1] then
+    local c=chooseCandidate(all,function(m)return -((m.lower or 0)+(m.overall or 0)*.5) end)
+    for i=1,5 do reactionFrames[i]=c end
+  end
   breath=breath or look
   look=look or breath
 
-  local selected={breath=breath,look=look,arm=arm,shift=shift,settle=settle,command=command,brace=brace}
+  local selected={breath=breath,look=look}
+  for i=1,5 do selected["gesture"..i]=gestureFrames[i] end
+  for i=1,5 do selected["reaction"..i]=reactionFrames[i] end
   for name,c in pairs(selected) do
     if c and attachPose(model,c.model,name) then
       model.nativePoseMap[name]={clip=c.clip,frame=c.frame,phase=c.phase,metrics=c.metrics}
@@ -284,6 +324,8 @@ local function attachSourcePoseBank(model,target,referenceBounds,progressLabel)
   end
   model.nativeGestureClip=gesture and gesture.clip or nil
   model.nativeReactionClip=reaction and reaction.clip or nil
+  model.nativeGestureEndFrame=gesture and gesture.endFrame or nil
+  model.nativeReactionEndFrame=reaction and reaction.endFrame or nil
   return model
 end
 
@@ -296,7 +338,7 @@ local function selectReleaseJoint(model,target)
   local base=model and model.jointPositions
   if type(base)~="table" or #base==0 then return nil end
   local poses=model.poseJointPositions or {}
-  local action=poses.arm or poses.command or poses.settle or base
+  local action=poses.gesture3 or poses.gesture4 or poses.gesture2 or base
   local parents=model.jointParents or {}
   local b=model.bounds or {};local mn=b.min or {0,0,0};local mx=b.max or {0,16,0};local center=b.center or {0,8,0}
   local h=math.max(.001,(tonumber(mx[2]) or 16)-(tonumber(mn[2]) or 0))
@@ -348,15 +390,15 @@ local function cacheLua(target,model,texturePaths,sourceName)
     return "{"..table.concat(rows,",").."}"
   end
   local poseJoints={}
-  for _,name in ipairs({"breath","look","arm","shift","settle","command","brace"}) do
+  for _,name in ipairs({"breath","look","gesture1","gesture2","gesture3","gesture4","gesture5","reaction1","reaction2","reaction3","reaction4","reaction5"}) do
     local pts=model.poseJointPositions and model.poseJointPositions[name]
     if type(pts)=="table" then poseJoints[#poseJoints+1]=name.."="..pointsLua(pts) end
   end
-  for _,name in ipairs({"breath","look","arm","shift","settle","command","brace"}) do
+  for _,name in ipairs({"breath","look","gesture1","gesture2","gesture3","gesture4","gesture5","reaction1","reaction2","reaction3","reaction4","reaction5"}) do
     local p=model.nativePoseMap and model.nativePoseMap[name]
     if p then poseMap[#poseMap+1]=name.."={clip="..num(p.clip)..",frame="..num(p.frame)..",rms="..num(p.metrics and p.metrics.overall or 0).."}" end
   end
-  local out={"-- Generated locally from the user's Pokemon Colosseum GC6E01 disc.\nreturn {formatVersion=25,morphFormat=\"source-hsd-coherent-clipfamilies-v6-hand-topology-end-effector\",source=",q("Pokemon Colosseum / "..target.id.." / "..sourceName),
+  local out={"-- Generated locally from the user's Pokemon Colosseum GC6E01 disc.\nreturn {formatVersion=26,morphFormat=\"source-hsd-dense-clipfamilies-v7-five-sample-adjacent-interpolation\",source=",q("Pokemon Colosseum / "..target.id.." / "..sourceName),
     ",sourceRoot=",q(model.sourceRootMode or "unknown"),",nativeClipCount=",num(model.nativeClipCount or 0),",poseMap={",table.concat(poseMap,","),"},releaseJoint=",num(model.releaseJoint or 0),",releaseSide=",num(model.releaseSide or -1),",releaseJointScore=",num(model.releaseJointScore or 0),",jointPositions=",pointsLua(model.jointPositions),",jointParents=",intsLua(model.jointParents),",poseJointPositions={",table.concat(poseJoints,","),"},bounds={min={",num(b.min[1]),",",num(b.min[2]),",",num(b.min[3]),"},max={",num(b.max[1]),",",num(b.max[2]),",",num(b.max[3]),"},center={",num(b.center[1]),",",num(b.center[2]),",",num(b.center[3]),"}},groups={\n"}
   for gi,g in ipairs(model.groups) do
     out[#out+1]="{material="..q("source_group_"..gi)
@@ -376,10 +418,9 @@ local function cacheLua(target,model,texturePaths,sourceName)
     for _,v in ipairs(g.vertices) do
       local x,y,z,u,w,nx,ny,nz=v[1],v[2],v[3],v[4] or 0,v[5] or 0,v[6] or 0,v[7] or 1,v[8] or 0
       local row={x,y,z,u,w,nx,ny,nz}
-      for _,off in ipairs({9,12,15,18,21,24,27}) do
+      for _,off in ipairs({9,12,15,18,21,24,27,30,33,36,39,42}) do
         row[#row+1]=v[off] or x;row[#row+1]=v[off+1] or y;row[#row+1]=v[off+2] or z
       end
-      row[#row+1]=0
       local parts={};for i=1,#row do parts[i]=num(row[i]) end;out[#out+1]="{"..table.concat(parts,",").."},\n"
     end
     out[#out+1]="}},\n"
@@ -421,7 +462,7 @@ function T.run(mod,disc,progress,generated,options)
     end
   end
 
-  local archives={};local diag={"CBE trainer scan / extractor rev 12 / coherent native B1 clip-family bank v6 / semantic scene root / residual procedural motion","mode="..(options.directOnly and "exact-source repair" or "full"),"archives requested="..#archiveNames}
+  local archives={};local diag={"CBE trainer scan / extractor rev 13 / dense native B1 clip-family bank v7 / five-sample adjacent interpolation / semantic scene root","mode="..(options.directOnly and "exact-source repair" or "full"),"archives requested="..#archiveNames}
   for _,name in ipairs(archiveNames) do
     local arc=openArchive(disc,name)
     if arc then
@@ -590,7 +631,7 @@ function T.run(mod,disc,progress,generated,options)
       local sourceName=best.source.archive.." :: "..best.source.entry.name
       write(mod,cachePath,cacheLua(target,model,texturePaths,sourceName),generated)
       local poseCount=0;for _ in pairs(model.nativePoseMap or {}) do poseCount=poseCount+1 end
-      local nativePose=("clip1/frame0 + %d source pose targets / %d clips / root=%s"):format(poseCount,tonumber(model.nativeClipCount) or 0,tostring(model.sourceRootMode or "?"))
+      local nativePose=("clip1/frame0 + %d dense source pose targets / %d clips / root=%s"):format(poseCount,tonumber(model.nativeClipCount) or 0,tostring(model.sourceRootMode or "?"))
       resolved[target.id]={archive=best.source.archive,entry=best.source.entry.index,name=best.source.entry.name,score=bestScore,vertices=model.vertexCount,groups=#model.groups,cache=cachePath,archiveBase=model.archive and model.archive.base or 0,nativePose=nativePose}
       diag[#diag+1]=( "%s %s <- %s:%s idx=%d score=%.4f vertices=%d groups=%d hsdBase=0x%X nativePose=%s" ):format(target.exactName and "EXACT" or "RESOLVED",target.id,safeName(best.source.archive),safeName(best.source.entry.name),tonumber(best.source.entry.index) or -1,bestScore,model.vertexCount,#model.groups,resolved[target.id].archiveBase,nativePose)
     end

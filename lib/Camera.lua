@@ -14,9 +14,9 @@ local AUTHORED_ZOOM_OUT = 1.045
 -- but they are NOT camera buttons. Commit to readable shots and coalesce
 -- lower-priority events rather than cutting once per queue notification.
 local EVENT_HOLDS = {
-  attack = 0.82,
-  damage = 0.68,
-  reaction = 0.86,
+  attack = 1.02,
+  damage = 0.88,
+  reaction = 0.96,
   capture = 1.35,
   faint = 2.05,
   switch = 1.42,
@@ -25,12 +25,13 @@ local EVENT_HOLDS = {
   command = 1.05,
 }
 local EVENT_PRIORITY = { passive=0, command=1, attack=2, damage=3, reaction=3, capture=4, switch=4, faint=5, exit=6 }
-local MIN_INTERRUPT_AGE = 0.44
+local MIN_INTERRUPT_AGE = 0.58
 
 -- Gen1Recomp fast-forward advances the battle fixed step multiple times per
--- rendered frame. Colosseum choreography belongs to that same game-time clock:
--- 4X should look like the original battle fast-forwarded, NOT replace the
--- authored shot sequence with a wide master or stretch individual holds.
+-- rendered frame. The battle simulation may run at 2X/4X/10X, but the camera
+-- is a presentation device: its velocity, hold lengths and easing must remain
+-- wall-clock stable. Fast-forward may make battle events arrive sooner; it must
+-- never multiply camera travel or turn one readable cut into a violent orbit.
 local function battleSpeed(ctx)
   local b=type(ctx)=="table" and (ctx.battle or (ctx.kind and ctx)) or nil
   local game=(b and b.game) or (ctx and ctx.game) or (V and V.mod and V.mod.game)
@@ -48,8 +49,8 @@ local function battleSpeed(ctx)
 end
 
 local function holdScale(speed)
-  -- Holds are authored in game-time. Fast-forward shortens their wall-clock
-  -- duration naturally because the game clock advances faster.
+  -- state.time is a presentation clock, so authored holds are already in
+  -- wall-clock seconds and require no battle-speed compensation.
   return 1
 end
 
@@ -84,12 +85,19 @@ local state = {
   eventSide=nil,eventIndex=0,eventResult=nil,resultPending=nil,resultAt=0,shotOffset=0,special=nil,specialUntil=0,
   manual=false, manualLocked=false, manualIdle=0, returning=false, keys={},
   shotLockUntil=0,pendingEvent=nil,lastCutTime=-999,lastEventName=nil,logicSpeed=1,
+  sourcePose=nil,sourcePoseAt=0,wallAt=nil,
   orbit=DEFAULT.orbit,elevation=DEFAULT.elevation,radius=DEFAULT.radius,fov=DEFAULT.fov,
   focus={DEFAULT.focus[1],DEFAULT.focus[2],DEFAULT.focus[3]},
   mouseX=nil,mouseY=nil,
 }
 
 local function clamp(v,a,b) if v<a then return a elseif v>b then return b else return v end end
+local function wallClock()
+  if love and love.timer and type(love.timer.getTime)=="function" then
+    local ok,v=pcall(love.timer.getTime);if ok and type(v)=="number" then return v end
+  end
+  return nil
+end
 local function smooth(t) t=clamp(t,0,1); return t*t*(3-2*t) end
 local function copy3(v) return {v[1],v[2],v[3]} end
 local function copyPose(p)
@@ -102,11 +110,68 @@ local function mix(a,b,t)
   local function v3(x,y) return {x[1]+(y[1]-x[1])*t,x[2]+(y[2]-x[2])*t,x[3]+(y[3]-x[3])*t} end
   return {eye=v3(a.eye,b.eye),focus=v3(a.focus,b.focus),fov=a.fov+(b.fov-a.fov)*t}
 end
+local function approach(a,b,maxDelta)
+  local d=b-a
+  if d>maxDelta then return a+maxDelta end
+  if d< -maxDelta then return a-maxDelta end
+  return b
+end
+local function length3(x,y,z) return math.sqrt(x*x+y*y+z*z) end
+local function approach3(a,b,maxDistance)
+  if not a then return copy3(b) end
+  local dx,dy,dz=b[1]-a[1],b[2]-a[2],b[3]-a[3]
+  local d=length3(dx,dy,dz)
+  if d<=maxDistance or d<1e-8 then return copy3(b) end
+  local q=maxDistance/d
+  return {a[1]+dx*q,a[2]+dy*q,a[3]+dz*q}
+end
+local function stableSourcePose(raw)
+  if not raw then state.sourcePose=nil;state.sourcePoseAt=state.time;return nil end
+  local now=state.time
+  local dt=math.max(0,math.min(.08,now-(tonumber(state.sourcePoseAt) or now)))
+  state.sourcePoseAt=now
+  if not state.sourcePose then state.sourcePose=copyPose(raw);return copyPose(raw) end
+  -- Cap camera translation/focus/lens velocity in wall-clock units. Raw Waza
+  -- source progress can jump by several 60 Hz frames during 4X fast-forward;
+  -- the target composition may advance, but the virtual camera cannot teleport
+  -- to it faster than it would at 1X.
+  local eyeSpeed=30
+  local focusSpeed=22
+  local fovSpeed=math.rad(24)
+  state.sourcePose.eye=approach3(state.sourcePose.eye,raw.eye,eyeSpeed*dt)
+  state.sourcePose.focus=approach3(state.sourcePose.focus,raw.focus,focusSpeed*dt)
+  state.sourcePose.fov=approach(state.sourcePose.fov,raw.fov,fovSpeed*dt)
+  return copyPose(state.sourcePose)
+end
 local function widenAuthored(pose)
   if not pose then return pose end
   local out=copyPose(pose)
   -- Widen field width without turning the camera into a fisheye lens.
   out.fov=2*math.atan(math.tan(out.fov*0.5)*AUTHORED_ZOOM_OUT)
+  return out
+end
+local function mobilePlatform()
+  if not (love and love.system and type(love.system.getOS)=="function") then return false end
+  local ok,osName=pcall(love.system.getOS)
+  if not ok then return false end
+  osName=tostring(osName or ""):lower()
+  return osName=="android" or osName=="ios"
+end
+
+-- Mobile battle controls consume a large lower-third region of the viewport.
+-- Keep attack/impact cinematography above that HUD without changing actor/world
+-- coordinates: lower the optical target slightly (subjects then project higher
+-- on screen) and widen the lens just enough to retain the complete combat line.
+-- This is applied after both semantic and source-Waza composition, so native
+-- source camera poses cannot accidentally put the actual MoveFX behind buttons.
+local function hudSafePose(pose,phase)
+  if not pose or not mobilePlatform() then return pose end
+  if phase~="attack" and phase~="damage" and phase~="reaction" and phase~="faint" then return pose end
+  local out=copyPose(pose)
+  out.focus[2]=out.focus[2]-1.85
+  out.fov=math.min(math.rad(52),out.fov+math.rad(3.6))
+  local fx,fy,fz=out.focus[1],out.focus[2],out.focus[3]
+  out.eye={fx+(out.eye[1]-fx)*1.035, fy+(out.eye[2]-fy)*1.02, fz+(out.eye[3]-fz)*1.035}
   return out
 end
 local function arenaFrame(pose,arena)
@@ -128,6 +193,115 @@ local function arenaFrame(pose,arena)
     out.focus[2]=out.focus[2]+1.35
   end
   return out
+end
+
+
+local function finite(v)
+  return type(v)=="number" and v==v and v~=math.huge and v~=-math.huge
+end
+local function cameraAspect()
+  if love and love.graphics and type(love.graphics.getDimensions)=="function" then
+    local ok,w,h=pcall(love.graphics.getDimensions)
+    if ok and tonumber(w) and tonumber(h) and h>0 then return clamp(w/h,1.0,2.5) end
+  end
+  return 16/9
+end
+local function safeCameraSpec(arena)
+  local c=arena and arena.camera
+  local s=c and c.safe or nil
+  return s or {minRadius=27,maxRadius=78,minY=6.5,maxY=32,maxPitch=24,minPitch=-10,minFov=31,maxFov=52}
+end
+local function clampCameraVolume(pose,arena,phase)
+  if not (pose and pose.eye and pose.focus) then return pose end
+  local out=copyPose(pose);local spec=safeCameraSpec(arena)
+  for i=1,3 do
+    if not finite(out.eye[i]) then out.eye[i]=(i==2 and 20 or (i==1 and 54 or 13)) end
+    if not finite(out.focus[i]) then out.focus[i]=(i==2 and 6 or 0) end
+  end
+  if not finite(out.fov) then out.fov=math.rad(40) end
+  out.fov=clamp(out.fov,math.rad(spec.minFov or 31),math.rad(spec.maxFov or 52))
+  out.focus[2]=clamp(out.focus[2],3.8,9.2)
+  local dx,dz=out.eye[1]-out.focus[1],out.eye[3]-out.focus[3]
+  local horizontal=math.max(.001,math.sqrt(dx*dx+dz*dz))
+  local dy=out.eye[2]-out.focus[2]
+  local pitch=math.deg(math.atan(dy,horizontal))
+  local maxPitch=tonumber(spec.maxPitch) or 24
+  local minPitch=tonumber(spec.minPitch) or -10
+  -- Attack/impact cameras should never become survey/bird's-eye shots. Source
+  -- Waza cameras still choose the axis/composition; this cap only rejects the
+  -- pathological elevation that hides the actual battle under the floor.
+  if phase=="attack" or phase=="damage" or phase=="reaction" then maxPitch=math.min(maxPitch,21) end
+  pitch=clamp(pitch,minPitch,maxPitch)
+  local radius=math.sqrt(horizontal*horizontal+dy*dy)
+  radius=clamp(radius,tonumber(spec.minRadius) or 27,tonumber(spec.maxRadius) or 78)
+  local pr=math.rad(pitch);local hr=math.max(.001,math.cos(pr)*radius)
+  local oldh=math.sqrt(dx*dx+dz*dz)
+  local nx,nz
+  if oldh<.001 then nx,nz=1,0 else nx,nz=dx/oldh,dz/oldh end
+  out.eye[1]=out.focus[1]+nx*hr
+  out.eye[3]=out.focus[3]+nz*hr
+  out.eye[2]=clamp(out.focus[2]+math.sin(pr)*radius,tonumber(spec.minY) or 6.5,tonumber(spec.maxY) or 32)
+  return out
+end
+local function projectPose(pose,p)
+  local ex,ey,ez=pose.eye[1],pose.eye[2],pose.eye[3]
+  local fx,fy,fz=pose.focus[1]-ex,pose.focus[2]-ey,pose.focus[3]-ez
+  local fl=math.sqrt(fx*fx+fy*fy+fz*fz);if fl<.001 then return nil end
+  fx,fy,fz=fx/fl,fy/fl,fz/fl
+  -- right = forward x worldUp
+  local rx,ry,rz=-fz,0,fx
+  local rl=math.sqrt(rx*rx+rz*rz);if rl<.001 then return nil end
+  rx,rz=rx/rl,rz/rl
+  local ux,uy,uz=ry*fz-rz*fy,rz*fx-rx*fz,rx*fy-ry*fx
+  local qx,qy,qz=p[1]-ex,p[2]-ey,p[3]-ez
+  local depth=qx*fx+qy*fy+qz*fz;if depth<=.15 then return nil end
+  local x=qx*rx+qy*ry+qz*rz
+  local y=qx*ux+qy*uy+qz*uz
+  local t=math.tan((pose.fov or math.rad(40))*.5);if t<=.001 then return nil end
+  return x/(depth*t*cameraAspect()),y/(depth*t),depth
+end
+local function combatSubjects(arena,phase,side)
+  side=side or "player"
+  if phase=="attack" then return arenaPoint(arena,side,6.0),arenaPoint(arena,other(side),6.0) end
+  if phase=="damage" or phase=="reaction" or phase=="faint" then
+    return arenaPoint(arena,other(side),6.0),arenaPoint(arena,side,6.0)
+  end
+  if phase=="switch" then return arenaPoint(arena,side,6.0),arenaPoint(arena,other(side),6.0) end
+end
+local function subjectsReadable(pose,arena,phase,side)
+  local a,b=combatSubjects(arena,phase,side);if not a then return true end
+  local ax,ay,az=projectPose(pose,a);local bx,by,bz=projectPose(pose,b)
+  if not (ax and bx) then return false end
+  local xlim=(mobilePlatform() and .72 or .80)
+  local ylim=(mobilePlatform() and .58 or .70)
+  if math.abs(ax)>xlim or math.abs(bx)>xlim or math.abs(ay)>ylim or math.abs(by)>ylim then return false end
+  return az>4 and bz>4
+end
+local function safeCombatMaster(arena,side,phase)
+  side=side or "player"
+  local a=arenaPoint(arena,side,6.0);local b=arenaPoint(arena,other(side),6.0)
+  local mid={(a[1]+b[1])*.5,6.0,(a[3]+b[3])*.5}
+  local dx,dz=b[1]-a[1],b[3]-a[3];local l=math.max(.001,math.sqrt(dx*dx+dz*dz))
+  local rx,rz=-dz/l,dx/l
+  local sign=side=="player" and 1 or -1
+  local distance=(phase=="damage" and 51 or 55)
+  return {eye={mid[1]+rx*distance*sign,17.0,mid[3]+rz*distance*sign},focus=mid,fov=math.rad(46)}
+end
+local function readabilityGuard(pose,arena,phase,side)
+  if not pose then return pose end
+  local out=clampCameraVolume(pose,arena,phase)
+  if phase~="attack" and phase~="damage" and phase~="reaction" and phase~="faint" and phase~="switch" then return out end
+  if subjectsReadable(out,arena,phase,side) then return out end
+  -- First preserve the requested axis and simply pull back/widen. This keeps as
+  -- much source composition as possible before falling back to a safe master.
+  for _=1,3 do
+    local f=out.focus
+    out.eye={f[1]+(out.eye[1]-f[1])*1.12,f[2]+(out.eye[2]-f[2])*1.05,f[3]+(out.eye[3]-f[3])*1.12}
+    out.fov=math.min(math.rad(52),out.fov+math.rad(2.0))
+    out=clampCameraVolume(out,arena,phase)
+    if subjectsReadable(out,arena,phase,side) then return out end
+  end
+  return clampCameraVolume(safeCombatMaster(arena,side,phase),arena,phase)
 end
 local function resetManual()
   state.orbit=DEFAULT.orbit;state.elevation=DEFAULT.elevation;state.radius=DEFAULT.radius;state.fov=DEFAULT.fov
@@ -291,13 +465,17 @@ local function eventShot(ctx,arena,side,kind,variant)
     if variant==2 then return {eye={-52,19,-sgn*13},focus=focus,fov=math.rad(45)} end
     return {eye={sgn*48,20,-sgn*18},focus=focus,fov=math.rad(46)}
   elseif kind=="damage" then
-    -- Center the damaged Pokemon but retain enough of the combat line to show
-    -- incoming source particles and the authored hurt animation together.
-    local attacker=arenaPoint(arena,other(side),6.1)
-    local focus={a[1]*.78+attacker[1]*.22,6.05,a[3]*.78+attacker[3]*.22}
-    if variant==1 then return {eye={50,18,z+sgn*7},focus=focus,fov=math.rad(42)} end
-    if variant==2 then return {eye={-47,18,z+sgn*8},focus=focus,fov=math.rad(43)} end
-    return {eye={54,20,z*.25},focus=focus,fov=math.rad(44)}
+    -- Preserve the attack's screen direction through impact. The old damage
+    -- shot derived its sign from the *target* and could flip the 180-degree
+    -- axis exactly when the Waza projectile arrived, which read as a violent
+    -- camera jump at high battle speed.
+    local attackerSide=other(side)
+    local attacker=arenaPoint(arena,attackerSide,6.1)
+    local attackSgn=attackerSide=="player" and 1 or -1
+    local focus={a[1]*.76+attacker[1]*.24,6.00,a[3]*.76+attacker[3]*.24}
+    if variant==1 then return {eye={52,17.5,z+attackSgn*10},focus=focus,fov=math.rad(43)} end
+    if variant==2 then return {eye={-49,17.5,z+attackSgn*10},focus=focus,fov=math.rad(43)} end
+    return {eye={attackSgn*50,18.5,-attackSgn*14},focus=focus,fov=math.rad(44)}
   elseif kind=="reaction" then
     -- Reactions belong to the affected side, not to a specific model mod. If a
     -- trainer is actually present, keep the Pokemon as the foreground subject
@@ -347,8 +525,14 @@ local function eventShot(ctx,arena,side,kind,variant)
       -- keeps the authentic small ball readable in the throwing hand.
       return {eye=eyeAt(tp,5.9,7.8,8.4),focus={ball[1],ball[2]+.05,ball[3]},fov=math.rad(31)}
     elseif phase=="throw" then
-      local lead={ball[1]+fx*2.0,ball[2]-.12,ball[3]+fz*2.0}
-      return {eye=eyeAt(ball,5.8,10.8-u*2.4,8.8-u*.8),focus=lead,fov=math.rad(33)}
+      local lead={ball[1]+fx*1.65,ball[2]-.10,ball[3]+fz*1.65}
+      -- Do not bolt the camera directly to the projectile. A lightly tracking
+      -- sideline dolly preserves the trainer->target axis while the ball moves
+      -- freely through frame, which reads much closer to an authored battle
+      -- shot and avoids the old weightless "camera carrying the ball" look.
+      local trackU=.30+.34*u
+      local track={tp[1]+dx*trackU,6.0,tp[3]+dz*trackU}
+      return {eye=eyeAt(track,7.9,10.0,8.45),focus=lead,fov=math.rad(34)}
     elseif phase=="impact" then
       return {eye=eyeAt(target,13.2,-8.0,8.7),focus={ball[1],ball[2],ball[3]},fov=math.rad(29)}
     elseif phase=="absorb" then
@@ -556,11 +740,19 @@ end
 
 local function acceptEvent(ev)
   if not ev then return end
+  local previousPhase=state.phase
   state.startPose=copyPose(state.lastPose)
   state.phase=ev.phase or state.phase
   state.phaseAge=0
   if ev.side then state.eventSide=ev.side end
-  if ev.indexed then state.eventIndex=state.eventIndex+1 end
+  if ev.indexed then
+    -- One attack, its impact, and the optional trainer reaction are one camera
+    -- sentence. Reusing the same variant keeps all three beats on the same
+    -- side of the action axis instead of cycling to a new camera every event.
+    local continuation=(state.phase=="damage" and previousPhase=="attack")
+      or (state.phase=="reaction" and (previousPhase=="damage" or previousPhase=="attack"))
+    if not continuation then state.eventIndex=state.eventIndex+1 end
+  end
   state.lastCutTime=state.time
   state.lastEventName=ev.name
   local speed=battleSpeed(ev.ctx)
@@ -580,7 +772,7 @@ local function queueEvent(ev)
   -- signal we receive for impact, so it is allowed to take ownership as soon
   -- as the attack shot has actually registered on screen. A faint can then
   -- take ownership after the impact has had a short readable beat.
-  local impactBeat = ev.phase=="damage" and state.phase=="attack" and age>=0.42
+  local impactBeat = ev.phase=="damage" and state.phase=="attack" and age>=0.72
   local hardEnd = ev.phase=="exit" and age>=MIN_INTERRUPT_AGE
   if impactBeat or hardEnd then
     acceptEvent(ev)
@@ -599,6 +791,7 @@ function C:begin(ctx)
   state.time=0;state.idleClock=0;state.phaseAge=0;state.phase="intro";state.eventSide=nil;state.eventIndex=0;state.eventResult=nil;state.resultPending=nil;state.resultAt=0
   state.lastPose=nil;state.startPose=nil;state.special=nil;state.specialUntil=0
   state.shotLockUntil=0;state.pendingEvent=nil;state.lastCutTime=-999;state.lastEventName=nil;state.logicSpeed=battleSpeed(ctx)
+  state.sourcePose=nil;state.sourcePoseAt=0;state.wallAt=wallClock()
   state.shotOffset=battleHash(ctx)%#PASSIVE_SHOTS
   state.manual=false;state.manualLocked=false;state.manualIdle=0;state.returning=false;resetManual()
 end
@@ -606,9 +799,20 @@ function C:update(ctx,dt)
   dt=tonumber(dt) or 0
   local speed=battleSpeed(ctx)
   state.logicSpeed=speed
-  -- Follow game-time exactly. 4X/10X fast-forward therefore accelerates the
-  -- same choreography instead of changing which shots exist.
-  local cameraDt=dt
+  -- Camera motion is wall-clock presentation time, never battle simulation
+  -- time. Gen1Recomp may implement fast-forward by executing several fixed
+  -- input/update steps before one rendered frame; a dt-based camera advances
+  -- several times and visibly "tweaks" at 4X. The monotonic wall clock advances
+  -- only once across that batch. Fall back to dt/speed only on hosts without a
+  -- timer. Clamp post-load stalls so a resumed frame cannot launch the camera.
+  local wall=wallClock()
+  local cameraDt
+  if wall and state.wallAt then
+    cameraDt=math.max(0,math.min(.05,wall-state.wallAt));state.wallAt=wall
+  else
+    cameraDt=math.max(0,math.min(.05,dt/math.max(1,speed)))
+    state.wallAt=wall
+  end
   state.time=state.time+cameraDt
   state.phaseAge=state.phaseAge+cameraDt
 
@@ -637,15 +841,15 @@ function C:update(ctx,dt)
         resultDelay=math.max(resultDelay,tonumber(fd)+.10)
       end
     end
-    -- Result delay is authored in game-time, so fast-forward naturally
-    -- compresses it in wall-clock time without changing the battle direction.
+    -- Result delay is presentation-time. Battle fast-forward may resolve the
+    -- result sooner, but the KO/result composition remains human-readable.
     state.resultAt=state.time+resultDelay
   end
   -- The authored opening is a presentation-time sequence, not a battle-state
   -- phase. Gen1Recomp can remain in intro/messages until the user dismisses
   -- text, so waiting for turn_started leaves the camera parked forever on the
   -- final intro angle. Hand control to the passive/menu master once the opening
-  -- has actually played; fast-forward advances this same sequence in game-time.
+  -- has actually played; the opening itself remains presentation-time stable.
   if state.phase=="intro" and state.phaseAge>=4.20 then
     state.startPose=copyPose(state.lastPose)
     state.phase="passive";state.phaseAge=0;state.idleClock=0
@@ -658,8 +862,13 @@ function C:update(ctx,dt)
     local okCapture,captureStatus=pcall(PlayerTrainer.captureStatus,PlayerTrainer,ctx)
     captureStillActive=okCapture and type(captureStatus)=="table" and captureStatus.active==true
   end
+  -- Capture owns the lens until its final shake/outcome beat has actually
+  -- finished. In successful catches BattleState.result / battle.ended can be
+  -- known almost immediately; allowing higher-priority exit events through
+  -- here was the camera tell that revealed success the instant the ball left
+  -- Red's hand. Queue everything non-capture behind the authored sequence.
   local pendingBlockedByCapture=captureStillActive and state.pendingEvent
-    and (EVENT_PRIORITY[state.pendingEvent.phase] or 0)<EVENT_PRIORITY.capture
+    and state.pendingEvent.phase~="capture"
   if state.pendingEvent and not pendingBlockedByCapture and state.time>=state.shotLockUntil and state.time>=(state.pendingEvent.notBefore or 0) then
     local ev=state.pendingEvent;state.pendingEvent=nil;acceptEvent(ev)
   elseif not captureStillActive and not state.pendingEvent and state.time>=state.shotLockUntil and state.shotLockUntil>0
@@ -672,11 +881,16 @@ function C:update(ctx,dt)
     state.phase="passive";state.phaseAge=0;state.idleClock=0
     state.lastCutTime=state.time;state.lastEventName="auto.return";state.shotLockUntil=0
   end
-  if state.resultPending and state.time>=state.resultAt then
+  if state.resultPending and state.time>=state.resultAt and not captureStillActive then
     local committed=state.resultPending
     state.resultPending=nil;state.eventResult=committed
-    state.pendingEvent=nil
-    acceptEvent({name="battle.result",phase="exit",side=nil,indexed=false,ctx=ctx})
+    -- battle.ended may already have been queued behind capture ownership. If it
+    -- became the exit shot above, do not immediately restart the same camera
+    -- blend from a duplicate BattleState.result observation.
+    if state.phase~="exit" then
+      state.pendingEvent=nil
+      acceptEvent({name="battle.result",phase="exit",side=nil,indexed=false,ctx=ctx})
+    end
   end
   if pressed("f8") then
     state.manualLocked=not state.manualLocked
@@ -708,8 +922,9 @@ function C:event(ctx,name,payload)
   -- early semantic move event and cut only when StandaloneHost reports the
   -- corresponding visible queue row. Gen 1 keeps its native move boundary.
   local gen2=ctx and ctx.battle and ctx.battle.__cbeGeneration==2
-  local queueSync=gen2 and ctx.battle.__cbePresentationQueueSync==true
-  if queueSync and (name=="battle.move_used" or name=="battle.damage_dealt" or name=="battle.fainted") then return end
+  local queueSync=ctx and ctx.battle and ctx.battle.__cbePresentationQueueSync==true
+  if queueSync and ((gen2 and (name=="battle.move_used" or name=="battle.damage_dealt" or name=="battle.fainted"))
+      or ((not gen2) and name=="battle.fainted")) then return end
   local phase=requestedPhase(name,ctx)
   if not phase then return end
   local speed=battleSpeed(ctx)
@@ -719,9 +934,13 @@ function C:event(ctx,name,payload)
   -- but they still belong to the same authored sequence. The scheduler below
   -- coalesces genuinely superseded events; speed itself never deletes a shot.
   if not phaseAllowedAtSpeed(phase,speed) then return end
-  local indexed=name=="battle.move_used" or name=="battle.presentation_move" or name=="battle.damage_dealt" or name=="battle.presentation_damage"
-    or name=="battle.status_inflicted" or name=="battle.ball_thrown"
-    or name=="battle.fainted" or name=="battle.presentation_faint" or name=="battle.battler_switched"
+  -- Variant ownership advances once per authored action, not once per queue
+  -- notification. Damage/status/faint belong to the same move camera axis as
+  -- the attack that caused them. Incrementing on every sub-event made a single
+  -- move jump through several unrelated angles and was especially chaotic when
+  -- 4X delivered all of those notifications in one rendered frame.
+  local indexed=name=="battle.move_used" or name=="battle.presentation_move"
+    or name=="battle.ball_thrown" or name=="battle.battler_switched"
   local ev={name=name,phase=phase,side=eventSideFor(ctx,name,payload),indexed=indexed,ctx=ctx}
   -- Gen1Recomp emits the faint semantic state before the complete visual fall
   -- has necessarily finished. Hold the impact composition briefly, then move
@@ -735,10 +954,22 @@ function C:event(ctx,name,payload)
     ev.notBefore=state.time+delay
   end
 
+  -- A successful wild catch can publish battle.ended/result before the CBE
+  -- capture presentation has reached its reveal. Never let that already-known
+  -- engine result select a different lens path. Defer exit behind the exact
+  -- same throw/impact/absorb/fall/shake camera used by a failed catch.
+  local captureOwnsLens=false
+  if phase=="exit" and PlayerTrainer and type(PlayerTrainer.captureStatus)=="function" then
+    local okCapture,captureStatus=pcall(PlayerTrainer.captureStatus,PlayerTrainer,ctx)
+    captureOwnsLens=okCapture and type(captureStatus)=="table" and captureStatus.active==true
+  end
+
   -- Intro owns its authored sequence until actual battle events begin.
   -- After that, inputs merely advancing text/menus cannot reset the camera:
   -- only semantic battle events enter this scheduler.
-  if state.time<state.shotLockUntil or (ev.notBefore and state.time<ev.notBefore) then
+  if captureOwnsLens then
+    queueEvent(ev)
+  elseif state.time<state.shotLockUntil or (ev.notBefore and state.time<ev.notBefore) then
     queueEvent(ev)
   else
     acceptEvent(ev)
@@ -776,10 +1007,17 @@ function C:shot(ctx,phase,progress,base,arena)
   if wh and type(wh.cameraPose)=="function" and not state.manual and (activePhase=="attack" or activePhase=="damage") then
     local ok,sourcePose=pcall(wh.cameraPose,ctx)
     if ok and type(sourcePose)=="table" and sourcePose.eye and sourcePose.focus and sourcePose.fov then
-      target=sourcePose
-      sourceBlend=tonumber(sourcePose.blend)
+      target=stableSourcePose(sourcePose)
+      -- A source camera supplies composition, not permission to accelerate the
+      -- lens. Keep the normal event blend; the wall-clock rate limiter above
+      -- handles the fine motion inside the source shot.
+      sourceBlend=math.max(.42,tonumber(sourcePose.blend) or .46)
     end
+  else
+    state.sourcePose=nil;state.sourcePoseAt=state.time
   end
+  target=hudSafePose(target,activePhase)
+  target=readabilityGuard(target,arena,activePhase,state.eventSide)
   if state.manual then
     if state.phaseAge<0.24 and state.startPose then pose=mix(state.startPose,target,state.phaseAge/0.24) else pose=target end
   elseif state.returning then
@@ -789,10 +1027,9 @@ function C:shot(ctx,phase,progress,base,arena)
   elseif activePhase=="passive" or activePhase=="command" then
     if state.startPose and state.phaseAge<0.72 then pose=mix(state.startPose,target,state.phaseAge/0.72) else pose=target end
   else
-    -- Source Waza cameras are already moving on the decoded 60 Hz effect clock;
-    -- use their shorter blend request so the semantic camera cannot spend most
-    -- of a fast move easing toward an angle the effect has already left.
-    local blend=sourceBlend or 0.38
+    -- Waza supplies a source-authentic target composition, but easing remains
+    -- presentation-time so battle speed never multiplies camera velocity.
+    local blend=sourceBlend or 0.46
     pose=mix(state.startPose or base,target,state.phaseAge/math.max(.04,blend))
   end
   state.lastPose=copyPose(pose);return pose,nil
@@ -800,9 +1037,10 @@ end
 function C:finish(ctx,reason)
   state.lastPose=nil;state.startPose=nil;state.mouseX=nil;state.mouseY=nil;state.special=nil
   state.pendingEvent=nil;state.resultPending=nil;state.resultAt=0;state.shotLockUntil=0;state.lastCutTime=-999;state.lastEventName=nil
+  state.sourcePose=nil;state.sourcePoseAt=0;state.wallAt=nil
   state.manual=false;state.manualLocked=false;state.manualIdle=0;state.returning=false
 end
 function C:status()
-  return {manual=state.manual,manualLocked=state.manualLocked,manualIdle=state.manualIdle,radius=state.radius,elevation=state.elevation,fov=state.fov,focus=copy3(state.focus),idleShots=#PASSIVE_SHOTS,director="colosseum-semantic-director-v9-waza-source-geometry",shotOffset=state.shotOffset,eventIndex=state.eventIndex,authoredZoomOut=AUTHORED_ZOOM_OUT,phase=state.phase,eventSide=state.eventSide,shotLockRemaining=math.max(0,state.shotLockUntil-state.time),pendingEvent=state.pendingEvent and state.pendingEvent.phase or nil,lastEvent=state.lastEventName,eventResult=state.eventResult,resultPending=state.resultPending,logicSpeed=state.logicSpeed,clock="game-time-from-fixed-step",highSpeedMaster=false}
+  return {manual=state.manual,manualLocked=state.manualLocked,manualIdle=state.manualIdle,radius=state.radius,elevation=state.elevation,fov=state.fov,focus=copy3(state.focus),idleShots=#PASSIVE_SHOTS,director="colosseum-semantic-director-v12-safe-volume-readability",shotOffset=state.shotOffset,eventIndex=state.eventIndex,authoredZoomOut=AUTHORED_ZOOM_OUT,phase=state.phase,eventSide=state.eventSide,shotLockRemaining=math.max(0,state.shotLockUntil-state.time),pendingEvent=state.pendingEvent and state.pendingEvent.phase or nil,lastEvent=state.lastEventName,eventResult=state.eventResult,resultPending=state.resultPending,logicSpeed=state.logicSpeed,clock="presentation-time-speed-invariant",highSpeedMaster=false,mobileHudSafe=true,safeVolumes=true,subjectReadabilityGuard=true,sourceEyeSpeed=30,sourceFocusSpeed=22,sourceFovSpeed=24}
 end
 return C
