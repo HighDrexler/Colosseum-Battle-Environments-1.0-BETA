@@ -23,7 +23,7 @@ replacement='''    state.current_stage="audio";state.audio_ready=0
     saveState();finishManifest(mod,generated);update("RUNTIME READY / AUDIO 24/24",9,9)
     return {state="READY",visualReady=true,audioReady=true,canonicalAudioReady=true,files=#disc.files,fsys=fsysCount,trainerResolved=state.trainer_resolved,trainerTotal=state.trainer_total,trainerDiagnostic=state.trainer_diagnostic,message=state.message}
 '''
-s,n=re.subn(pattern,replacement,s,count=1,flags=re.S)
+s,n=re.subn(pattern,lambda m: replacement,s,count=1,flags=re.S)
 if n!=1:
     raise SystemExit(f'cold-cache audio block patch failed: {n}')
 
@@ -44,7 +44,7 @@ replacement='''    if (failedStage=="audio" or failedStage=="audio_portable") an
       pcall(function()finishManifest(mod,generated)end)
       return {state="READY / AUDIO EXTRACTION FAILED",visualReady=true,audioReady=false,audioUnavailable=true,trainerResolved=state.trainer_resolved,trainerTotal=state.trainer_total,trainerDiagnostic=state.trainer_diagnostic,trainerFirstError=state.trainer_first_error,trainerSourceError=state.trainer_source_error,message=state.message}
     end'''
-s,n=re.subn(pattern,replacement,s,count=1,flags=re.S)
+s,n=re.subn(pattern,lambda m: replacement,s,count=1,flags=re.S)
 if n!=1:
     raise SystemExit(f'cold-cache audio failure block patch failed: {n}')
 
