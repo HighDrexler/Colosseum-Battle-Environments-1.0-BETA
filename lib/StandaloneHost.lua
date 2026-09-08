@@ -35,8 +35,10 @@ local function enabled(game)
   return true
 end
 
--- CBE arena ownership is absolute while the standalone host has a live
--- session. Legacy full-frame 3D providers are never allowed to replace this
+-- CBE arena ownership is absolute while the standalone host has a live,
+-- successfully rendering session. A renderer fault fails open to the engine
+-- field for visibility/input safety and CBE retries on later frames. Legacy
+-- full-frame 3D providers are never allowed to replace this
 -- world/camera/trainer compositor. Compatible external Pokemon presentation
 -- must come through CurrentSpriteModels' portable actor/presentation seams.
 
@@ -97,11 +99,24 @@ end
 
 local function cameraPose(s)
   local base=baseCamera(s.context.arena)
+  if V.BossIntro then
+    local intro=V.BossIntro.camera(base,s.context);if intro then if V.FreeLookCamera then V.FreeLookCamera.reset()end;return intro end
+  end
+  local doubles=V.DoublesRuntime and (V.DoublesRuntime.presentation or V.DoublesRuntime.combat)(s.battle)
+  if doubles then
+    local cinematic=syncCameraOwnership(s)
+    local pose=cinematic and V.DoublesPresenter.camera(base,doubles,s.context)
+      or (V.DoublesCamera and V.DoublesCamera.neutral(base)) or base
+    -- Free look is a relative presentation layer. Never feed its result back
+    -- into the director: that freezes/contaminates the next automatic shot.
+    local adjusted=V.FreeLookCamera and V.FreeLookCamera.pose(s.context,pose)
+    return adjusted or pose
+  end
   if not Camera or not syncCameraOwnership(s) then return base end
   local okClaim,claim=pcall(Camera.claim,Camera,s.context,s.context.phase)
   if not okClaim or claim==false then return base end
   local ok,pose=pcall(Camera.shot,Camera,s.context,s.context.phase,s.context.progress,base,s.context.arena)
-  if ok and pose and pose.eye and pose.focus and pose.fov then return pose end
+  if ok and pose and pose.eye and pose.focus and pose.fov then return (V.FreeLookCamera and V.FreeLookCamera.pose(s.context,pose)) or pose end
   return base
 end
 
@@ -147,13 +162,15 @@ function H.begin(battle)
   local ok,why=beginProviders(s)
   if not ok then
     if s.battle then s.battle.__cbePresentationQueueSync=nil end
-    -- Keep an ownership-only session alive. A missing/broken CBE arena is
-    -- allowed to fail visibly, but it is NEVER a signal that Battle Art,
-    -- Stadium or another full-stage compositor may take the BattleState back.
-    -- drawWrapper will preserve engine HUD/input while suppressing every
-    -- competing battle field until this battle ends.
+    -- Keep a SAFE retry session instead of dropping all CBE knowledge or
+    -- suppressing the engine world. On Android a transient GLES/shader/canvas
+    -- failure must become neither the old permanent black frame nor Gen II's
+    -- stock white paper field. Native battlers/HUD remain authoritative while
+    -- the CBE stage retries on later frames.
     s.started=false
-    s.ownershipOnly=true
+    s.ownershipOnly=false
+    s.failOpen=true
+    s.retryBegin=true
     s.beginError=tostring(why)
     H.lastError=tostring(why)
     local m=V.mod
@@ -161,7 +178,7 @@ function H.begin(battle)
       pcall(m.cache.write,m.cache,"build/android_battle_render_error.txt",("stage=Arena.begin\nerror=%s\ngeneration=%s\n"):format(tostring(why),tostring(battle and battle.__cbeGeneration or "?")))
     end
     local level=(why=="arena definition unavailable" or why=="arena declined") and "warn" or "error"
-    log(level,"standalone arena begin failed under retained CBE ownership: %s",tostring(why))
+    log(level,"standalone arena begin failed; retaining safe retry host: %s",tostring(why))
     return false
   end
   s.started=true
@@ -405,6 +422,19 @@ local function render(s)
   s.battle=battle;s.context.battle=battle;s.context.game=(battle and battle.game) or s.context.game
   syncBattlers(s)
   if not (battle and Arena) then return false end
+  -- Arena.begin may fail on the first Android frame while the driver finalizes
+  -- its graphics context. Retry the complete provider begin instead of either
+  -- abandoning CBE for the whole battle or retaining blank ownership.
+  if not s.started then
+    local okBegin,whyBegin=beginProviders(s)
+    if not okBegin then
+      s.presented=false;s.failOpen=true;s.retryBegin=true
+      H.lastError=tostring(whyBegin);persistRenderError("Arena.begin.retry",whyBegin)
+      return nil
+    end
+    s.started=true;s.retryBegin=false;s.beginError=nil
+    if s.battle then s.battle.__cbePresentationQueueSync=true end
+  end
   s.context.services.camera={pose=cameraPose(s)}
   local ok,surface=pcall(Arena.render,Arena,s.context,s.context.arena,function(world)
     world=world or {}
@@ -423,12 +453,15 @@ local function render(s)
     if CurrentSprites then CurrentSprites:drawWorld(s.context) end
   end)
   if not ok then
-    H.lastError=tostring(surface);persistRenderError("Arena.render",surface);log("error","standalone arena render failed: %s",tostring(surface));return nil
+    s.presented=false;s.failOpen=true
+    H.lastError=tostring(surface);persistRenderError("Arena.render",surface);log("error","standalone arena render failed open: %s",tostring(surface));return nil
   end
   if not surface or surface==true or surface==V.FALLBACK then
+    s.presented=false;s.failOpen=true
     persistRenderError("Arena.render.return",surface)
     return nil
   end
+  s.failOpen=false;s.retryBegin=false;s.started=true
   local gen2=Compat and Compat.isGen2Battle(battle)
   local renderer=battle.game and battle.game.renderer
   if not gen2 then
@@ -450,6 +483,7 @@ end
 local function cbeWorldOwns(battle)
   local s=H.session
   local same=s and ((Compat and Compat.matches(s.battle,battle)) or s.battle==battle)
+  if same and s.failOpen==true then return false end
   if same and s.started then return true end
   local bridge=V.StadiumBridge
   if bridge and type(bridge.ownsArena)=="function" then
@@ -612,6 +646,26 @@ local function withoutBattleField(battle,fn)
   g.rectangle=rectangle
   if not ok then error(res,0) end
   return res
+end
+
+local function drawSafeFailureBase()
+  local g=love and love.graphics
+  if not g then return false end
+  local pushed=false
+  local ok=pcall(function()
+    g.push("all");pushed=true
+    if g.origin then g.origin() end
+    if g.setScissor then g.setScissor() end
+    if g.setShader then g.setShader() end
+    if g.setDepthMode then g.setDepthMode() end
+    -- Neutral CBE stage fallback. This is intentionally dark/blue rather than
+    -- Gen II's opaque white paper field and is visible only while the real arena
+    -- renderer is unavailable. Native battlers, text and input draw above it.
+    g.clear(0.025,0.075,0.145,1)
+    g.pop();pushed=false
+  end)
+  if pushed then pcall(g.pop) end
+  return ok
 end
 
 local function installGen1FrameIsolation(req)
@@ -917,17 +971,18 @@ function H.install(force)
         return unpack(results)
       end
       if owns then
-        -- A CBE render failure is a CBE failure, never permission for Battle
-        -- Art/Stadium/another compositor to take over the battle. Preserve the
-        -- engine HUD/input flow but suppress the native/external battle field.
+        -- A CBE renderer fault must expose neither the historical black frame nor
+        -- Gen II's native white paper battlefield. Clear stale worldOverride,
+        -- paint a neutral stage, then run the authoritative native HUD/actors with
+        -- only the opaque battle-field paper suppressed. render() keeps retrying.
+        local renderer=(battle and battle.game and battle.game.renderer) or (self.game and self.game.renderer)
+        if renderer and type(renderer.setWorldOverride)=="function" then renderer:setWorldOverride(nil) end
+        self.letterboxWhite=false
+        drawSafeFailureBase()
         if Compat and Compat.isGen2Battle(battle) then
           return withoutGen2Field(self,battle,function() return inner(self,unpack(args)) end)
         end
-        self.letterboxWhite=false
-        love.graphics.clear(0,0,0,0)
         local results={withoutBattleField(self,function() return inner(self,unpack(args)) end)}
-        local renderer=(battle and battle.game and battle.game.renderer) or (self.game and self.game.renderer)
-        if renderer and type(renderer.setWorldOverride)=="function" then renderer:setWorldOverride(nil) end
         return unpack(results)
       end
       self.letterboxWhite=nil
@@ -961,8 +1016,10 @@ function H.install(force)
         return withoutGen2Field(self,battle,function() return inner(self,w,h,unpack(args)) end,w,h)
       end
       if owns and Compat and Compat.isGen2Battle(battle) then
-        -- Never turn a CBE renderer fault into an apparently successful vanilla
-        -- battle. Preserve HUD/input while keeping the native paper field out.
+        -- Do not delegate to Gold's stock white paper field. Keep native UI and
+        -- battler pictures visible over the neutral CBE fallback while the arena
+        -- retries. This restores the Android invariant established in 1.7.3.
+        drawSafeFailureBase()
         return withoutGen2Field(self,battle,function() return inner(self,w,h,unpack(args)) end,w,h)
       end
       return inner(self,w,h,unpack(args))
@@ -975,6 +1032,7 @@ function H.install(force)
 end
 
 function H.finish(reason)
+  if V.BossIntro then V.BossIntro.finish(reason or "arena closed") end
   local s=H.session
   if not s then return end
   if CurrentSprites then pcall(CurrentSprites.finish,CurrentSprites,s.context,reason) end
@@ -983,18 +1041,19 @@ function H.finish(reason)
   if s.battle then s.battle.__cbePresentationQueueSync=nil end
   if Compat then Compat.release(s.battle) end
   H.session=nil
+  if V.FreeLookCamera then V.FreeLookCamera.reset() end
 end
 
 function H.status()
   local s=H.session
   local ps=s and s.context and s.context.sides and s.context.sides.player and s.context.sides.player.battler
   local es=s and s.context and s.context.sides and s.context.sides.enemy and s.context.sides.enemy.battler
-  return {installed=H.installed,active=s~=nil,started=s and s.started==true,ownershipOnly=s and s.ownershipOnly==true,generation=(s and s.battle and s.battle.__cbeGeneration) or 1,arena=s and s.context.arena and s.context.arena.id or nil,
+  return {installed=H.installed,active=s~=nil,started=s and s.started==true,presented=s and s.presented==true,failOpen=s and s.failOpen==true,ownershipOnly=s and s.ownershipOnly==true,generation=(s and s.battle and s.battle.__cbeGeneration) or 1,arena=s and s.context.arena and s.context.arena.id or nil,
     actor="current-sprites",playerSpecies=ps and ps.mon and ps.mon.species or nil,enemySpecies=es and es.mon and es.mon.species or nil,
     cameraActive=s and s.cameraActive==true,cameraMode=not s and "inactive" or (s.cameraActive and "cinematic" or "neutral-static"),frames=H.frames,
     externalPresentation=s and s.externalPresentation or nil,externalFrames=H.externalFrames,presentationMoveEvents=H.presentationMoveEvents,presentationDamageEvents=H.presentationDamageEvents,presentationFaintEvents=H.presentationFaintEvents,gen1PresentationFaintEvents=H.gen1PresentationFaintEvents or 0,
     captureQueueHolds=H.captureQueueHolds or 0,captureRowsStripped=H.captureRowsStripped or 0,captureUiSuppressed=H.captureUiSuppressed or 0,
     captureFlow=s and s.captureHold and "cbe-wall-clock-hold" or nil,gen1FrameResets=H.gen1FrameResets or 0,gen1ViewportRescales=H.gen1ViewportRescales or 0,gen1ViewportLast=H.gen1ViewportLast,
-    error=H.lastError,updateError=H.lastUpdateError,contract="CBE BattleState/world/camera/trainer stage is absolute on Gen 1 + Gen 2 while Arenas ON; render failure never delegates"}
+    error=H.lastError,updateError=H.lastUpdateError,contract="CBE owns the stage while rendering successfully; renderer failure fails open to the authoritative engine field and retries on later frames"}
 end
 return H

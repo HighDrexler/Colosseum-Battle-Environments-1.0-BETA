@@ -1,12 +1,22 @@
 local V=...
 local Assets=V and V.GeneratedAssets
-local A={version=2,source="GC6E01 WazaSequence type-5 GameSound + snd_se_battle SFXGroup",active={},events={},missing={},cache={},presence={},use={},useSerial=0,cacheLimit=32}
+local A={version=3,source="GC6E01 WazaSequence type-5 GameSound definitions + snd_se_battle SFXGroup",active={},events={},missing={},cache={},presence={},use={},useSerial=0,cacheLimit=32}
 
 local function key(inst,entry)
   return tostring(inst and inst.serial or "?")..":"..tostring(entry and entry.index or "?")
 end
 local function pathFor(id)
   return ("cache/waza/sfx/%04d.wav"):format(math.max(0,math.floor(tonumber(id) or 0)))
+end
+local releaseStems={monsterball=true,superball=true,hyperball=true,masterball=true,
+ safariball=true,netball=true,diveball=true,nestball=true,repeatball=true,timerball=true,
+ gorgeousball=true,puremiyaball=true}
+local function presentationGain(inst,entry)
+ local spec=inst and inst.spec
+ local release=inst and inst.presentation=="release"
+ release=release or (spec and releaseStems[spec.stem] and
+   ((entry and entry.phase=="open") or (spec.phaseSelection and spec.phaseSelection.attack=="open")))
+ return release and .85 or 1
 end
 local loadSource
 local function record(row)
@@ -38,6 +48,13 @@ end
 
 function A.has(id)
   id=math.floor(tonumber(id) or -1);if id<0 then return false end
+  if not A.verifiedIds then
+    local index=Assets and Assets.readLua and Assets.readLua("cache/waza/sfx/index.lua")
+    if type(index)~="table" or index.version~=3 or index.renderer~="lua-musyx-sfx-v3-gamesound-table" then return false end
+    A.verifiedIds={}
+    for _,readyId in ipairs(index.readyIds or {}) do A.verifiedIds[readyId]=true end
+  end
+  if not A.verifiedIds[id] then return false end
   if A.presence[id]~=nil then return A.presence[id] end
   if not (Assets and Assets.info) then A.presence[id]=false;return false end
   local info=Assets.info(pathFor(id));local ok=type(info)=="table" and (tonumber(info.size) or 0)>=44
@@ -102,8 +119,12 @@ function A:start(ctx,inst,entry)
     local ok,v=pcall(template.clone,template);if ok then src=v end
   end
   src=src or template
+  local gain=presentationGain(inst,entry)
+  -- Reset absolute playback gain on every use. clone-less hosts may reuse the
+  -- template, so multiplying its current volume would compound across battles.
+  if src and type(src.setVolume)=="function" then pcall(src.setVolume,src,gain) end
   local row={key=k,serial=inst and inst.serial,soundId=id,mode=tonumber(entry.soundMode) or 0,
-    param=entry.soundParam,frame=inst and inst.frame or 0,source=src,asset=pathFor(id),fallback=not src and why or nil}
+    param=entry.soundParam,gain=gain,frame=inst and inst.frame or 0,source=src,asset=pathFor(id),fallback=not src and why or nil}
   A.active[k]=row;record({event="start",serial=row.serial,frame=row.frame,soundId=id,mode=row.mode,asset=row.asset,sourceReady=src and true or false})
   if src and type(src.play)=="function" then pcall(src.play,src) end
   -- Claim the Waza entry even when the source macro cache is not built yet: the

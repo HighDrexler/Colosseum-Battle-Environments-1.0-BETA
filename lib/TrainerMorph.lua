@@ -1,37 +1,10 @@
 local V=...
 local M={}
 
--- ---------------------------------------------------------------------------
--- Unified trainer morph binding (1.7.22)
---
--- Before this module there were two divergent trainer animation paths:
---
---   * non-Windows declared FIFTEEN vertex attributes (position, texcoord,
---     normal, breath, look, gesture1..5, reaction1..5) and a shader with ten
---     morph weights;
---   * Windows declared seven and only ever carried TWO morph slots, so Windows
---     ran visibly poorer trainer animation than every other platform, could not
---     use the compact runtime .f32 mesh sidecar, and had to keep every dense
---     Lua vertex row resident in order to rewrite meshes on the fly.
---
--- Fifteen enabled vertex attributes is above the eight GLES2 guarantees and at
--- the 16 that most mobile drivers cap at, which is a real robustness risk on
--- weaker Android hardware.
---
--- The key observation is that TrainerPerformance's adjacent-frame timeline
--- never produces more than TWO non-zero source-pose weights at a time. The ten
--- attribute slots existed only so the pose data could live statically in the
--- vertex buffer; the shader never blended more than two of them. So two
--- attribute slots are sufficient, and the Windows shader was always the
--- correct general design -- it simply had no way to reach the other eight
--- poses.
---
--- This module keeps the dense 44-float mesh EXACTLY as the cache and the
--- runtime sidecar already store it (no cache format change, no rebuild), and
--- rebinds whichever two source poses are currently active into two shader
--- attribute slots. Every platform now runs the same seven-attribute shader and
--- the same ten source poses.
--- ---------------------------------------------------------------------------
+-- Shared trainer animation binding. Native track caches stream adjacent source
+-- frames (positions and normals) through seven shader attributes. Older caches
+-- retain the sparse-pose fallback. Unsupported attribute binding uses that
+-- fallback for both the visible body and hand anchors.
 
 -- Dense mesh layout. Unchanged: this is what trainer cache formatVersion 26
 -- and the 44-float runtime sidecars already contain.
@@ -92,6 +65,7 @@ M.VERTEX=[[
 uniform mat4 vp; uniform mat4 model;
 uniform float breathMix; uniform float lookMix;
 uniform float actionAMix; uniform float actionBMix; uniform float sourcePoseGain;
+uniform float nativeTrackMix; uniform float nativeTrackEnabled;
 attribute vec3 VertexNormal;
 attribute vec3 BreathPosition;
 attribute vec3 LookPosition;
@@ -110,10 +84,11 @@ vec4 position(mat4 transform_projection, vec4 vertex_position) {
     p=mix(base,target,action);
   }
   float secondary=1.0-action;
-  p+=(BreathPosition-base)*breathMix*secondary;
-  p+=(LookPosition-base)*lookMix*secondary;
+  p+=(BreathPosition-base)*breathMix*secondary*(1.0-nativeTrackEnabled);
+  p+=(LookPosition-base)*lookMix*secondary*(1.0-nativeTrackEnabled);
   vec4 world=model*vec4(p,1.0); worldPos=world.xyz;
-  worldNormal=normalize((model*vec4(normalize(VertexNormal),0.0)).xyz);
+  vec3 n=mix(VertexNormal,mix(BreathPosition,LookPosition,nativeTrackMix),nativeTrackEnabled*action);
+  worldNormal=normalize((model*vec4(normalize(n),0.0)).xyz);
   return vp*world;
 }]]
 
@@ -174,9 +149,9 @@ local function probeAttach()
   local ok,m=pcall(love.graphics.newMesh,M.DENSE_FORMAT,3,"triangles","static")
   if not ok or not m or type(m.attachAttribute)~="function" then return attachStyle end
   -- 11.3+: (name, mesh, step, attachname)
-  if pcall(m.attachAttribute,m,"Gesture1Position",m,"pervertex","ActionAPosition") then attachStyle="step4"
+  if pcall(m.attachAttribute,m,"ActionAPosition",m,"pervertex","Gesture1Position") then attachStyle="step4"
   -- 11.2: (name, mesh, attachname)
-  elseif pcall(m.attachAttribute,m,"Gesture1Position",m,"ActionAPosition") then attachStyle="name3" end
+  elseif pcall(m.attachAttribute,m,"ActionAPosition",m,"Gesture1Position") then attachStyle="name3" end
   pcall(function() if m.release then m:release() end end)
   return attachStyle
 end
@@ -191,18 +166,190 @@ function M.dense() return M.mode()=="attached" end
 
 local function attachOne(mesh,sourceAttr,slot)
   if attachStyle=="step4" then
-    return pcall(mesh.attachAttribute,mesh,sourceAttr,mesh,"pervertex",slot)
+    return pcall(mesh.attachAttribute,mesh,slot,mesh,"pervertex",sourceAttr)
   end
-  return pcall(mesh.attachAttribute,mesh,sourceAttr,mesh,slot)
+  return pcall(mesh.attachAttribute,mesh,slot,mesh,sourceAttr)
 end
 
 M.rebinds=0
 M.rewrites=0
 
+-- HSD schedules opaque geometry before its translucent material pass. Keep
+-- the original group order for native-track indices and build a separate,
+-- stable render list once when the model loads. Drawing an early XLU group
+-- before the body lets later opaque triangles erase the visible overlay.
+function M.materialOrder(groups)
+  local order={}
+  for pass=1,2 do
+    for _,g in ipairs(groups or {}) do
+      if (g.xlu and 2 or 1)==pass then order[#order+1]=g end
+    end
+  end
+  return order
+end
+
+function M.textureWrap(spec,group,id)
+  local s,t=spec.wrapS,spec.wrapT
+  -- Pre-sweep caches omitted TOBJ wraps. GC6E01 boss999_a1's three 16x8
+  -- unlit glow overlays are the only repeating trainer textures in the ten
+  -- shipped source actors. Match that exact material, never all of Nascour.
+  if s==nil and t==nil and id=="nascour" and spec.w==16 and spec.h==8
+      and tonumber(group and group.renderFlags)==0x60006013 then s,t=1,1 end
+  local function wrap(v)
+    if tonumber(v)==1 then return "repeat" end
+    if tonumber(v)==2 then return "mirroredrepeat" end
+    return "clamp"
+  end
+  return wrap(s),wrap(t)
+end
+
 -- Point the two shader slots at the currently active source poses. Call once
 -- per frame before drawing a trainer's groups; it is a no-op unless the active
 -- pair actually changed.
+-- Source-track playback is separate from the legacy sparse-pose fallback.
+local TRACK_FORMAT={{"NativePosition","float",3},{"NativeNormal","float",3}}
+local function nativeRole(kind)
+  if not kind then return "idle" end
+  if kind=="brace" or kind=="concern" or kind=="frustration" or kind=="defeat" then return "reaction" end
+  return "gesture"
+end
+function M.loadTracks(id,groups)
+  if not probeAttach() then return nil end
+  local runtime=V.RuntimeMeshCache
+  if not (runtime and runtime.readLua and V.GeneratedAssets) then return nil end
+  local track=runtime.readLua(("cache/trainers/%s/native_v1/index.lua"):format(id))
+  if type(track)~="table" or track.version~=1 or not track.roles then return nil end
+  local loaded={}
+  for role,clip in pairs(track.roles) do
+    if not (clip.count and clip.count>=2 and clip.endFrame and clip.endFrame>0 and type(clip.groups)=="table" and #clip.groups==#groups) then return nil end
+    local bytes={}
+    for gi,g in ipairs(clip.groups) do
+      if not groups[gi].mesh then return nil end
+      local data=loaded[g.path] or (clip.bytes and clip.bytes[gi]) or V.GeneratedAssets.read(g.path)
+      if type(data)~="string" or #data~=g.vertices*24*clip.count then return nil end
+      loaded[g.path]=data;bytes[gi]=data
+    end
+    clip.bytes=bytes
+  end
+  for _,g in ipairs(groups) do g.nativeTrack=track end
+  return track
+end
+function M.trackSample(track,kind,age,actionAge,duration)
+  local role=(kind and track and track.roles[kind]) and kind or nativeRole(kind);local clip=track and track.roles[role]
+  if not clip then return nil end
+  local frame
+  if not kind then frame=(math.max(0,age or 0)*(track.fps or 60))%clip.endFrame
+  else frame=math.min(1,math.max(0,(actionAge or 0)/math.max(.001,duration or (clip.endFrame/(track.fps or 60)))))*clip.endFrame end
+  local a=math.min(math.floor(frame),clip.count-2)
+  local b=a+1;local span=math.min(b,clip.endFrame)-a
+  return clip,a+1,b+1,span>0 and (frame-a)/span or 0,role
+end
+local function smoothUnit(x)
+  x=math.max(0,math.min(1,x));return x*x*(3-2*x)
+end
+function M.actionWeight(motion)
+  local kind=motion.nativeKind
+  if not kind then return 1 end
+  local age=math.max(0,motion.nativeActionAge or 0)
+  local duration=math.max(.001,motion.nativeDuration or 1)
+  local weight=smoothUnit(age/math.min(.12,duration*.2))
+  if kind~="victory" and kind~="defeat" and kind~="throw" and kind~="sendout" and kind~="recall" then
+    weight=weight*smoothUnit((duration-age)/math.min(.20,duration*.2))
+  end
+  if kind=="brace" or kind=="concern" then weight=weight*math.max(0,math.min(1,motion.nativeStrength or 1)) end
+  return weight
+end
+local function idleReference(track,motion)
+  local clip,a,b,u=M.trackSample(track,nil,motion.nativeAge)
+  return clip,u and u>=.5 and b or a
+end
+function M.trackJoint(track,index,motion)
+  local c,a,b,u=M.trackSample(track,motion.nativeKind,motion.nativeAge,motion.nativeActionAge,motion.nativeDuration)
+  local p=c and c.joints and c.joints[a] and c.joints[a][index]
+  local q=c and c.joints and c.joints[b] and c.joints[b][index]
+  if not p or not q then return nil end
+  local point={p[1]+(q[1]-p[1])*u,p[2]+(q[2]-p[2])*u,p[3]+(q[3]-p[3])*u}
+  if motion.nativeKind then
+    local idle,frame=idleReference(track,motion)
+    local base=idle and idle.joints and idle.joints[frame] and idle.joints[frame][index]
+    if base then local w=M.actionWeight(motion);for k=1,3 do point[k]=base[k]+(point[k]-base[k])*w end end
+  end
+  return point
+end
+function M.releaseTracks(groups)
+  for _,g in ipairs(groups or {}) do
+    for _,mesh in ipairs(g.nativeBuffers or {}) do pcall(mesh.release,mesh) end
+    g.nativeBuffers=nil;g.nativeTrack=nil;g.nativePair=nil;g.nativeIdleFrame=nil;g.nativeClip=nil;g.nativeFrames=nil
+  end
+end
+local function bindNative(groups,motion)
+  local track=groups and groups[1] and groups[1].nativeTrack
+  local clip,a,b,u,role=M.trackSample(track,motion.nativeKind,motion.nativeAge,motion.nativeActionAge,motion.nativeDuration)
+  if not clip or not probeAttach() then return false end
+  local idle,idleFrame=idleReference(track,motion)
+  local weight=M.actionWeight(motion)
+  local pair=role..":"..a..":"..b
+  for gi,g in ipairs(groups) do
+    if g.nativePair~=pair then
+      g.nativeBuffers=g.nativeBuffers or {}
+      g.nativeFrames=g.nativeFrames or {}
+      -- The old B frame is usually the new A frame. Rotate its GPU buffer
+      -- rather than copying the same source vertices a second time.
+      if g.nativeClip==clip and g.nativeFrames[2]==a then
+        g.nativeBuffers[1],g.nativeBuffers[2]=g.nativeBuffers[2],g.nativeBuffers[1]
+        g.nativeFrames[1],g.nativeFrames[2]=g.nativeFrames[2],g.nativeFrames[1]
+      end
+      for slot,frame in ipairs({a,b}) do
+        if g.nativeClip~=clip or g.nativeFrames[slot]~=frame then
+          local n=clip.groups[gi].vertices;local stride=n*24
+          local bytes=clip.bytes[gi]:sub((frame-1)*stride+1,frame*stride)
+          if not g.nativeBuffers[slot] then
+            g.nativeBuffers[slot]=assert(love.graphics.newMesh(TRACK_FORMAT,n,"triangles","stream"))
+          end
+          local data=love.data.newByteData(bytes)
+          g.nativeBuffers[slot]:setVertices(data)
+          if data.release then data:release() end
+          g.nativeFrames[slot]=frame
+        end
+      end
+      g.nativeClip=clip;g.nativePair=pair
+    end
+    local function attach(slot,buffer,name)
+      if attachStyle=="step4" then g.mesh:attachAttribute(slot,buffer,"pervertex",name)
+      else g.mesh:attachAttribute(slot,buffer,name) end
+    end
+    if idle and (weight<1 or not g.nativeBuffers[3]) then
+      if g.nativeIdleFrame~=idleFrame then
+        local n=idle.groups[gi].vertices;local stride=n*24
+        g.nativeBuffers[3]=g.nativeBuffers[3] or assert(love.graphics.newMesh(TRACK_FORMAT,n,"triangles","stream"))
+        local data=love.data.newByteData(idle.bytes[gi]:sub((idleFrame-1)*stride+1,idleFrame*stride))
+        g.nativeBuffers[3]:setVertices(data);if data.release then data:release() end
+        g.nativeIdleFrame=idleFrame
+      end
+      attach("VertexPosition",g.nativeBuffers[3],"NativePosition")
+      attach("VertexNormal",g.nativeBuffers[3],"NativeNormal")
+    end
+    attach("ActionAPosition",g.nativeBuffers[1],"NativePosition")
+    attach("ActionBPosition",g.nativeBuffers[2],"NativePosition")
+    -- Reuse the two secondary-pose slots for normals: still seven attributes.
+    attach("BreathPosition",g.nativeBuffers[1],"NativeNormal")
+    attach("LookPosition",g.nativeBuffers[2],"NativeNormal")
+    g.posePair=nil;g.nativeAttached=true
+  end
+  motion.nativeMix=u;motion.nativeWeight=idle and M.actionWeight(motion) or 1;motion.nativeBound=true
+  return true
+end
+
 function M.bindPair(groups,motion)
+  motion=motion or {}
+  motion.nativeBound=false
+  if bindNative(groups,motion) then return end
+  for _,g in ipairs(groups or {}) do
+    if g.nativeAttached then
+      for _,name in ipairs({"VertexPosition","VertexNormal","BreathPosition","LookPosition"}) do g.mesh:detachAttribute(name) end
+      g.nativeAttached=nil;g.posePair=nil
+    end
+  end
   local keyA,_,keyB=M.actionPair(motion)
   local pair=tostring(keyA or "base").."|"..tostring(keyB or "base")
   local dense=M.dense()
@@ -234,6 +381,9 @@ end
 function M.sendMixes(shader,motion)
   motion=motion or {}
   local _,wA,_,wB=M.actionPair(motion)
+  if motion.nativeBound then local w=motion.nativeWeight or 1;wA=(1-motion.nativeMix)*w;wB=motion.nativeMix*w end
+  shader:send("nativeTrackEnabled",motion.nativeBound and 1 or 0)
+  shader:send("nativeTrackMix",motion.nativeMix or 0)
   shader:send("breathMix",motion.breath or 0)
   shader:send("lookMix",motion.look or 0)
   shader:send("actionAMix",wA or 0)

@@ -55,14 +55,29 @@ local function battleSpeed(ctx)
   if not speed or speed~=speed or speed<1 then speed=1 end
   return speed
 end
--- Presentation follows battle GAME-TIME. At 4x the source performance should
--- fast-forward exactly like Colosseum itself, not remain at 1x while Pokemon,
--- FX and the battle state advance four times faster.
-function A.realDt(ctx,dt) return math.max(0,tonumber(dt) or 0) end
+-- Each actor supplies its own clock. Repeated fast-forward logic ticks in one
+-- rendered frame cannot spend the same wall time again. Long stalls are capped
+-- so resuming does not leap through a whole throw/reaction in one update.
+function A.realDt(ctx,dt,clock)
+  local requested=math.max(0,tonumber(dt) or 0)
+  if not clock then return math.min(requested,.05) end
+  local timer=love and love.timer and love.timer.getTime
+  local now=timer and timer()
+  if type(now)=="number" and now==now then
+    local previous=clock.now;clock.now=now
+    if requested==0 or not previous or now<previous then return 0 end
+    return math.min(math.max(0,now-previous),.05)
+  end
+  return math.min(requested/math.max(1,battleSpeed(ctx)),.05)
+end
 function A.speed(ctx) return battleSpeed(ctx) end
 
-function A.shouldTrigger(ctx,current,currentAge,newKind)
+function A.shouldTrigger(ctx,current,currentAge,newKind,currentDuration)
   local age=tonumber(currentAge) or 0
+  if current=="defeat" or current=="victory" then return false end
+  local duration=currentDuration or DURATIONS[current] or 0
+  if current and age<duration and (current=="throw" or current=="sendout" or current=="recall")
+    and newKind~="defeat" and newKind~="victory" then return false end
   -- Do not let duplicate/rapid semantic events hammer the same source pose back
   -- to frame zero.  Damage, multi-hit and host wrappers can publish closely
   -- spaced presentation events; Colosseum trainers read as one reaction, not a
@@ -74,6 +89,20 @@ function A.shouldTrigger(ctx,current,currentAge,newKind)
   if current and cp>np and age<.92 then return false end
   if (current=="frustration" or current=="defeat") and age<1.55 and np<6 then return false end
   return true
+end
+
+function A.damageReaction(damage,maxhp)
+  damage=tonumber(damage) or 0
+  if damage<=0 then return nil end
+  local ratio=damage/math.max(1,tonumber(maxhp) or damage)
+  if ratio>=.30 then return "concern",1 end
+  return "brace",clamp(.45+ratio,.45,.75)
+end
+function A.terminal(kind) return kind=="defeat" or kind=="victory" end
+function A.queueReaction(pending,kind,strength)
+  if kind~="brace" and kind~="concern" and kind~="frustration" then return pending end
+  if not pending or A.priority(kind)>A.priority(pending.kind) then return {kind=kind,strength=strength or 1} end
+  return pending
 end
 
 local function zero(p)
@@ -149,7 +178,8 @@ end
 -- Five-stage performances: anticipation -> action -> readable hold -> follow-through -> recovery.
 -- The same phase structure is used by every trainer; profiles only reshape it.
 function A.motion(id,kind,t,strength,side)
-  local p=cloneProfile(id);local m=zero(p);if not kind then return m end
+  local p=cloneProfile(id);local m=zero(p)
+  if not kind or (p.id=="red" and kind=="victory") then return m end
   local d=A.duration(id,kind);local u=clamp((tonumber(t) or 0)/math.max(.001,d),0,1)
   local e=p.energy or 1;local g=p.gesture or 1;local r=p.reaction or 1;local w=p.weight or 1
   local turnSign=(side=="enemy") and -1 or 1
@@ -225,6 +255,10 @@ local function ambientWindow(age,period,offset,attack,hold,release)
 end
 function A.idle(id,age,kind,actionAge,strength,side)
   local p=cloneProfile(id);age=tonumber(age) or 0
+  -- Keep the semantic victory state/priority in the host, but present Red in
+  -- his neutral native idle. His mapped victory/gesture clip raises a straight
+  -- arm; neither that track nor its sparse-pose fallback should play here.
+  if p.id=="red" and kind=="victory" then kind=nil end
   local live=smooth((age-.48)/.70);local idle=p.idle or 1;local comp=p.composure or 1
   local phase=(#tostring(id or "")*0.37)%2.7
   local breath=clamp((.105+.032*math.sin(age*1.36+phase)+.012*math.sin(age*.51+1.2+phase))*live*idle,.015,.18)
@@ -275,6 +309,8 @@ function A.idle(id,age,kind,actionAge,strength,side)
   out.lean=(out.lean or 0)*residual;out.turn=(out.turn or 0)*residual
   out.bob=(out.bob or 0)*residual;out.sway=(out.sway or 0)*residual
   out.forward=(out.forward or 0)*residual
+  out.nativeKind=kind;out.nativeAge=age;out.nativeActionAge=actionAge or 0
+  out.nativeDuration=A.duration(id,kind);out.nativeStrength=strength or 1
   return out
 end
 
@@ -305,7 +341,8 @@ function A.resetState(state,id)
 end
 function A.step(state,id,age,kind,actionAge,strength,side,dt)
   state=state or A.newState(id);id=tostring(id or state.id or "balanced"):lower();state.id=id
-  dt=clamp(tonumber(dt) or 0,0,.060)
+  dt=math.max(0,tonumber(dt) or 0)
+  if dt~=dt or dt==math.huge then dt=0 end
   local target=A.idle(id,age,kind,actionAge,strength,side)
   -- Do not randomly perturb source-pose weights. Once CBE has classified an
   -- authored B1 silhouette, replay that silhouette consistently; only the
@@ -316,7 +353,7 @@ function A.step(state,id,age,kind,actionAge,strength,side,dt)
     reaction1=true,reaction2=true,reaction3=true,reaction4=true,reaction5=true}
   for _,k in ipairs(DYNAMIC_KEYS) do
     local x=tonumber(state.current[k]);local goal=tonumber(target[k]) or 0;if x==nil then x=goal end
-    if sourceKeys[k] and kind then
+    if sourceKeys[k] and kind and k~="breath" and k~="look" then
       -- Decisive trainer actions are already a continuous interpolation of
       -- adjacent frames from one real B1 source clip.  Do not spring-filter
       -- those source weights again: that second filter was visibly delaying
@@ -330,7 +367,15 @@ function A.step(state,id,age,kind,actionAge,strength,side,dt)
     else
       local vel=tonumber(state.velocity[k]) or 0
       local tune=RESPONSE[k] or {10,7};local stiffness=tune[1]/continuity;local damping=tune[2]/math.sqrt(continuity)
-      vel=vel+(goal-x)*stiffness*stiffness*dt;vel=vel*math.exp(-damping*dt);x=x+vel*dt;state.velocity[k]=vel
+      -- Stable substeps consume the elapsed time rather than dropping time
+      -- whenever rendering falls below ~17 FPS. Bound extreme pause recovery.
+      local remaining=math.min(dt,.5)
+      while remaining>0 do
+        local h=math.min(remaining,1/120)
+        vel=vel+(goal-x)*stiffness*stiffness*h
+        vel=vel*math.exp(-damping*h);x=x+vel*h;remaining=remaining-h
+      end
+      state.velocity[k]=vel
     end
     state.current[k]=x;target[k]=x
   end
@@ -355,5 +400,5 @@ function A.root(id,motion)
     compression=(motion.brace or 0)*.020*residual,
   }
 end
-function A.status() return {version=12,vocabulary={"opening","sendout","recall","command","brace","concern","frustration","victory","defeat"},profiles=PROFILES,clock="game-time-from-fixed-step",sharedPlayerEnemy=true,statefulContinuity=true,sourceAuthority=true,sourcePoseBank="native-b1-dense-five-sample-clipfamilies",sourcePlayback="adjacent-authored-frame-interpolation",proceduralRoot="one-percent-continuity-only",randomVariation=false} end
+function A.status() return {version=14,vocabulary={"opening","sendout","recall","command","brace","concern","frustration","victory","defeat"},profiles=PROFILES,clock="wall-clock-presentation",sharedPlayerEnemy=true,statefulContinuity=true,sourceAuthority=true,sourcePoseBank="native-a1-full-frame-tracks",sourcePlayback="adjacent-authored-frame-interpolation",proceduralRoot="one-percent-continuity-only",randomVariation=false} end
 return A

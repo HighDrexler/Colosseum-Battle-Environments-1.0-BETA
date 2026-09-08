@@ -196,6 +196,7 @@ local DEFAULT_WZX={
 local DEFAULT_CAM={
   "fight_common.fsys","fight_demo.fsys","camera_shake_data.fsys",
   "D4_casino_colo.fsys","D2_crater_colo.fsys","T1_ancient_colo.fsys",
+  "M2_earth_colo.fsys","M4_bottom_colo.fsys","M3_cave_1F_1_bf.fsys","S1_out_bf.fsys",
 }
 
 local function describeWaza(blob,name)

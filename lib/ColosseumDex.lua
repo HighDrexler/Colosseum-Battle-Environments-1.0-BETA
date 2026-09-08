@@ -275,9 +275,9 @@ D.species={
 D.unownForms={"unknown_a","unknown_b","unknown_c","unknown_d","unknown_e","unknown_f","unknown_g","unknown_h","unknown_i","unknown_j","unknown_k","unknown_l","unknown_m","unknown_n","unknown_o","unknown_p","unknown_q","unknown_r","unknown_s","unknown_t","unknown_u","unknown_v","unknown_w","unknown_x","unknown_y","unknown_z","unknown_ex","unknown_qu"}
 
 -- Colosseum does NOT ship a shiny model per species. Only these stems have a
--- pkx_rare_<stem>.fsys, and they are story/cinematic assets. Shiny colouring
--- for every other species is a runtime palette shift, exactly as the source
--- game does it -- a missing rare_ archive is NOT an error.
+-- pkx_rare_<stem>.fsys source variants. Every other species uses its native
+-- PKX channel-routing/brightness recipe on the shared body and textures.
+-- A missing rare_ archive is expected only for species not in this table.
 D.rare={
   [3]="rare_fushigibana",
   [6]="rare_lizardon",
@@ -300,8 +300,25 @@ D.rare={
   [251]="rare_cerebi",
 }
 
+function D.number(dex)
+  return tonumber(dex) or (type(dex)=="string" and tonumber(dex:match("^(%d+):shiny$"))) or nil
+end
+function D.variant(dex,variant)
+  if variant~=nil then return variant=="shiny" and "shiny" or "normal" end
+  return type(dex)=="string" and dex:match(":shiny$") and "shiny" or "normal"
+end
+function D.modelKey(dex,variant)
+  local n=D.number(dex);if not n then return nil end
+  return D.variant(dex,variant)=="shiny" and D.rare[n] and (tostring(n)..":shiny") or n
+end
+function D.cacheRoot(dex,variant)
+  local n=D.number(dex) or 0
+  return ("cache/pokemon/%d"):format(n)..(type(D.modelKey(dex,variant))=="string" and "/shiny" or "")
+end
+
 function D.archive(dex,variant,unownForm)
-  dex=tonumber(dex)
+  variant=D.variant(dex,variant)
+  dex=D.number(dex)
   local entry=dex and D.species[dex]
   if not entry then return nil,"no Colosseum asset for dex "..tostring(dex) end
   if dex==201 then
@@ -315,7 +332,7 @@ function D.archive(dex,variant,unownForm)
 end
 
 function D.supported(dex)
-  dex=tonumber(dex)
+  dex=D.number(dex)
   return dex~=nil and D.species[dex]~=nil
 end
 

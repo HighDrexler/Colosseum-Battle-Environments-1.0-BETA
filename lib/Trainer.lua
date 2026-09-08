@@ -1,4 +1,6 @@
 local V = ...
+local pendingReaction=nil
+local animationClock={}
 local BattleDirector=V.BattleDirector
 local GeneratedAssets=V.GeneratedAssets
 local mod, Mat4, TrainerRig = V.mod, V.Mat4, V.TrainerRig
@@ -110,19 +112,26 @@ local function trainerRuntimeTag(wanted) return tostring(wanted or "trainer"):gs
 local function trainerRuntimeRoot(wanted) return "cache/runtime_mesh_v1/trainers/"..trainerRuntimeTag(wanted) end
 local function trainerRuntimeMetaPath(wanted) return trainerRuntimeRoot(wanted).."/base.lua" end
 local function trainerRuntimeBinPath(wanted,i) return trainerRuntimeRoot(wanted)..("/base_%02d.f32"):format(tonumber(i) or 0) end
-local function trainerSourceSize(cfg)
+local function trainerSourceSize(cfg,meta)
   local info=GeneratedAssets and GeneratedAssets.info and GeneratedAssets.info(cfg and cfg.cache) or nil
-  return info and tonumber(info.size) or nil
+  if not info then return nil end
+  -- 0 means "source exists, backend omitted byte size". Trainer identity v13
+  -- commits canonical + runtime sidecar as one contract, while each .f32 payload
+  -- is independently stride-validated before use.
+  return tonumber(info.size) or tonumber(meta and meta.sourceSize) or 0
 end
 local function trainerRuntimeUsable(meta,wanted,sourceSize)
   if not (RuntimeMeshCache and type(RuntimeMeshCache.readLua)=="function") then return false end
   if type(meta)~="table" or tonumber(meta.runtimeMeshVersion)~=TRAINER_RUNTIME_MESH_VERSION or tonumber(meta.formatVersion)~=26 then return false end
-  if not sourceSize or tonumber(meta.sourceSize)~=sourceSize or type(meta.groups)~="table" or #meta.groups==0 then return false end
+  if sourceSize==nil or type(meta.groups)~="table" or #meta.groups==0 then return false end
+  local recorded=tonumber(meta.sourceSize) or 0
+  if sourceSize>0 and recorded>0 and recorded~=sourceSize then return false end
   for i,g in ipairs(meta.groups) do
     local path=type(g)=="table" and (g.runtimeBin or trainerRuntimeBinPath(wanted,i)) or nil
     local info=path and GeneratedAssets.info and GeneratedAssets.info(path) or nil
-    local size=info and tonumber(info.size)
-    if not size or size<176 or size%176~=0 then return false end
+    if not info then return false end
+    local size=tonumber(info.size)
+    if size and (size<176 or size%176~=0) then return false end
   end
   return true
 end
@@ -133,7 +142,7 @@ local function trainerGroupCompact(g,wanted,i)
   return out
 end
 local function writeTrainerRuntimeMeta(wanted,cache,sourceSize)
-  if not (RuntimeMeshCache and RuntimeMeshCache.writeLua and sourceSize) then return false end
+  if not (RuntimeMeshCache and RuntimeMeshCache.writeLua) or sourceSize==nil then return false end
   local out={runtimeMeshVersion=TRAINER_RUNTIME_MESH_VERSION,sourceSize=sourceSize,formatVersion=cache.formatVersion}
   for k,v in pairs(cache or {}) do if k~="groups" then out[k]=v end end
   out.groups={}
@@ -142,7 +151,7 @@ local function writeTrainerRuntimeMeta(wanted,cache,sourceSize)
   if ok then trainerRuntimeWrites=trainerRuntimeWrites+1 end
   return ok
 end
-local function imageFromRaw(spec)
+local function imageFromRaw(spec,wrapS,wrapT)
   local bytes,readErr=GeneratedAssets.read(spec.path); if not bytes then return nil,readErr or ("missing "..tostring(spec.path)) end
   local ok,data=pcall(love.image.newImageData,spec.w,spec.h,"rgba8",bytes)
   if not ok then return nil,data end
@@ -152,7 +161,7 @@ local function imageFromRaw(spec)
     local okf=pcall(img.setFilter,img,"linear","linear",16)
     if not okf then pcall(img.setFilter,img,"linear","linear") end
   end
-  if img.setWrap then pcall(img.setWrap,img,"clamp","clamp") end
+  if img.setWrap then pcall(img.setWrap,img,wrapS or "clamp",wrapT or "clamp") end
   return img
 end
 local function shadowVertex(x,y,z,u,v)
@@ -258,6 +267,7 @@ local function releaseLoveObject(obj,seen)
 end
 local function releaseScene(entry)
   if type(entry)~="table" then return end
+  if TrainerMorph.releaseTracks then TrainerMorph.releaseTracks(entry.groups) end
   local seen={}
   for _,g in ipairs(entry.groups or {}) do
     if type(g)=="table" then releaseLoveObject(g.mesh,seen) end
@@ -304,12 +314,14 @@ local function loadConfig(ctx,cfg,reason)
     if not ok or not sh then errorText=(cfg.label or wanted).." shader: "..tostring(sh or "unavailable");sceneErrors[wanted]=errorText;return nil,errorText end
     shader=sh
   end
-  local sourceSize=trainerSourceSize(cfg)
   local cache,err,fromRuntime
+  local rt
   if DENSE_MESH and RuntimeMeshCache and type(RuntimeMeshCache.readLua)=="function" then
-    local rt=select(1,RuntimeMeshCache.readLua(trainerRuntimeMetaPath(wanted)))
+    rt=select(1,RuntimeMeshCache.readLua(trainerRuntimeMetaPath(wanted)))
+    local sourceSize=trainerSourceSize(cfg,rt)
     if trainerRuntimeUsable(rt,wanted,sourceSize) then cache=rt;fromRuntime=true;trainerRuntimeHits=trainerRuntimeHits+1 end
   end
+  local sourceSize=trainerSourceSize(cfg,rt)
   if not cache then cache,err=readLua(cfg.cache) end
   if not cache then errorText=tostring(err);sceneErrors[wanted]=errorText;return nil,errorText end
   if tonumber(cache.formatVersion)~=26 then
@@ -320,11 +332,14 @@ local function loadConfig(ctx,cfg,reason)
   local canonicalFallback=nil
   for i,g in ipairs(cache.groups or {}) do
     local path=g.texture and g.texture.path
-    local img=path and textures[path] or nil
+    local wrapS,wrapT="clamp","clamp"
+    if path and TrainerMorph.textureWrap then wrapS,wrapT=TrainerMorph.textureWrap(g.texture,g,wanted) end
+    local textureKey=path and (path..":"..wrapS..":"..wrapT)
+    local img=textureKey and textures[textureKey] or nil
     if path and not img then
-      img,err=imageFromRaw(g.texture)
-      if not img then errorText=tostring(err);sceneErrors[wanted]=errorText;return nil,errorText end
-      textures[path]=img
+      img,err=imageFromRaw(g.texture,wrapS,wrapT)
+      if not img then errorText=tostring(err);sceneErrors[wanted]=errorText;releaseScene({groups=groups,textures=textures});return nil,errorText end
+      textures[textureKey]=img
     end
     local mesh,meshErr
     local denseVertices
@@ -351,7 +366,7 @@ local function loadConfig(ctx,cfg,reason)
       local vertices=sourceGroup and sourceGroup.vertices or {}
       if type(vertices)~="table" or #vertices==0 then
         errorText=(cfg.label or wanted).." mesh "..i.." runtime sidecar failed and canonical vertices are unavailable: "..tostring(meshErr or "empty mesh")
-        sceneErrors[wanted]=errorText;return nil,errorText
+        sceneErrors[wanted]=errorText;releaseScene({groups=groups,textures=textures});return nil,errorText
       end
       for _,row in ipairs(vertices) do if type(row)=="table" then row[45]=nil end end
       denseVertices=vertices
@@ -361,7 +376,7 @@ local function loadConfig(ctx,cfg,reason)
         vertices=compact
       end
       local ok,built=pcall(love.graphics.newMesh,DENSE_MESH and FORMAT or FORMAT_COMPACT,vertices,"triangles",DENSE_MESH and "static" or "dynamic")
-      if not ok then errorText=(cfg.label or wanted).." mesh "..i..": "..tostring(built);sceneErrors[wanted]=errorText;return nil,errorText end
+      if not ok then errorText=(cfg.label or wanted).." mesh "..i..": "..tostring(built);sceneErrors[wanted]=errorText;releaseScene({groups=groups,textures=textures});return nil,errorText end
       mesh=built
       if DENSE_MESH and RuntimeMeshCache and RuntimeMeshCache.supported and RuntimeMeshCache.supported() then
         local wok=RuntimeMeshCache.writeRows(binPath,vertices,44)
@@ -373,21 +388,27 @@ local function loadConfig(ctx,cfg,reason)
     groups[#groups+1]={mesh=mesh,material=g.material,image=img,textured=img~=nil,
       diffuse={tonumber(d[1]) or 1,tonumber(d[2]) or 1,tonumber(d[3]) or 1},
       alpha=tonumber(g.alpha) or 1,xlu=g.xlu==true,noz=g.noz==true,
+      useDiffuseLighting=g.useDiffuseLighting~=false,
       renderFlags=tonumber(g.renderFlags) or 0,shadow=g.shadow==true,effect=g.effect==true,
       poseSourceRows=(not DENSE_MESH) and denseVertices or nil,posePair=nil}
   end
   local sok,serr=ensureShadow()
-  if not sok then errorText=(cfg.label or wanted).." shadow: "..tostring(serr);sceneErrors[wanted]=errorText;return nil,errorText end
+  if not sok then errorText=(cfg.label or wanted).." shadow: "..tostring(serr);sceneErrors[wanted]=errorText;releaseScene({groups=groups,textures=textures});return nil,errorText end
   if not fromRuntime and RuntimeMeshCache and RuntimeMeshCache.supported and RuntimeMeshCache.supported() and sourceSize then
     local all=true
     for i=1,#(cache.groups or {}) do
       local info=GeneratedAssets.info and GeneratedAssets.info(trainerRuntimeBinPath(wanted,i)) or nil
-      local size=info and tonumber(info.size)
-      if not size or size<176 or size%176~=0 then all=false;break end
+      if not info then all=false;break end
+      local size=tonumber(info.size)
+      if size and (size<176 or size%176~=0) then all=false;break end
     end
     if all then writeTrainerRuntimeMeta(wanted,cache,sourceSize) end
   end
-  local entry={groups=groups,bounds=cache.bounds,source=cache.source,textures=textures}
+  local entry={groups=groups,bounds=cache.bounds,source=cache.source,textures=textures,
+    jointPositions=cache.jointPositions,poseJointPositions=cache.poseJointPositions,
+    releaseJoint=tonumber(cache.releaseJoint)}
+  entry.drawGroups=TrainerMorph.materialOrder and TrainerMorph.materialOrder(groups) or groups
+  entry.nativeTrack=TrainerMorph.loadTracks(wanted,groups)
   sceneCache[wanted]=entry
   activateScene(cfg,reason,wanted,entry);trimSceneCache()
   log(ctx,"info","loaded %s source actor: %d material groups",cfg.label or wanted,#groups)
@@ -488,11 +509,15 @@ function T:shouldRender(ctx)
   return true
 end
 
+local normalReleasePoint
+local sendoutTarget
+local sendoutForward
+local arenaForward={0,1}
 local trigger,performanceId
 
 function T:begin(ctx)
   battleKey=battleOf(ctx)
-  age=0;actionKind=nil;actionAge=0;actionStrength=0;initialSendoutQueued=false;initialOpeningQueued=false;lastSendingOut=false;pendingFrustration=nil;resultSeen=nil;drawFrames=0;currentMotion=nil
+  age=0;actionKind=nil;actionAge=0;actionStrength=0;initialSendoutQueued=false;initialOpeningQueued=false;lastSendingOut=false;pendingFrustration=nil;pendingReaction=nil;resultSeen=nil;drawFrames=0;currentMotion=nil
   performanceState=TrainerPerformance and TrainerPerformance.resetState(performanceState,performanceId and performanceId() or "dakim") or nil
   local cfg,reason=trainerModelFor(ctx)
   activeNow=cfg~=nil
@@ -512,7 +537,7 @@ end
 function T:update(ctx,dt)
   local b=battleOf(ctx)
   if b~=battleKey then
-    battleKey=b;age=0;actionKind=nil;actionAge=0;actionStrength=0;initialSendoutQueued=false;initialOpeningQueued=false;lastSendingOut=false;pendingFrustration=nil;resultSeen=nil;activeNow=false;activationReason=nil;currentMotion=nil
+    battleKey=b;age=0;actionKind=nil;actionAge=0;actionStrength=0;initialSendoutQueued=false;initialOpeningQueued=false;lastSendingOut=false;pendingFrustration=nil;pendingReaction=nil;resultSeen=nil;activeNow=false;activationReason=nil;currentMotion=nil
     performanceState=TrainerPerformance and TrainerPerformance.resetState(performanceState,"dakim") or nil
   end
   local cfg,reason=trainerModelFor(ctx)
@@ -527,9 +552,9 @@ function T:update(ctx,dt)
       log(ctx,"error","Enemy Colosseum actor failed to load during update: %s",tostring(err or errorText))
     end
   elseif not should and activeNow then
-    activeNow=false;age=0;actionKind=nil;actionAge=0;actionStrength=0;initialOpeningQueued=false;pendingFrustration=nil;resultSeen=nil;activationReason=nil;currentMotion=nil
+    activeNow=false;age=0;actionKind=nil;actionAge=0;actionStrength=0;initialOpeningQueued=false;pendingFrustration=nil;pendingReaction=nil;resultSeen=nil;activationReason=nil;currentMotion=nil
   end
-  local step=TrainerPerformance and TrainerPerformance.realDt(ctx,dt) or (tonumber(dt) or 0)
+  local step=TrainerPerformance and TrainerPerformance.realDt(ctx,dt,animationClock) or (tonumber(dt) or 0)
   if activeNow then
     age=age+step
     -- Personality can establish on presentation time, but the actual send-out
@@ -559,11 +584,17 @@ function T:update(ctx,dt)
   if actionKind then actionAge=actionAge+step end
   if activeNow and pendingFrustration then
     pendingFrustration=pendingFrustration-step
-    if pendingFrustration<=0 then pendingFrustration=nil;trigger("frustration",1.0) end
+    if pendingFrustration<=0 then pendingFrustration=nil;pendingReaction=nil;trigger("frustration",1.0) end
   end
   if activeNow and TrainerPerformance then
     local id=performanceId();local duration=actionKind and TrainerPerformance.duration(id,actionKind) or nil
-    if actionKind and actionAge>(duration or 1.2) then actionKind=nil;actionStrength=0 end
+    if actionKind and actionAge>(duration or 1.2) then
+      if TrainerPerformance.terminal(actionKind) then actionAge=duration
+      else actionKind=nil;actionStrength=0 end
+    end
+    if not actionKind and pendingReaction then
+      local queued=pendingReaction;pendingReaction=nil;trigger(queued.kind,queued.strength)
+    end
     currentMotion,performanceState=TrainerPerformance.step(performanceState,id,age,actionKind,actionAge,actionStrength,"enemy",step)
   end
 end
@@ -588,9 +619,18 @@ local other=BattleSides.other
 performanceId=function()
   return tostring((currentConfig and currentConfig.id) or currentModel or "dakim"):lower()
 end
-trigger=function(kind,strength)
-  if TrainerPerformance and not TrainerPerformance.shouldTrigger({battle=battleKey},actionKind,actionAge,kind) then return end
+trigger=function(kind,strength,force)
+  if TrainerPerformance and TrainerPerformance.terminal(actionKind) then return false end
+  if not force and TrainerPerformance and not TrainerPerformance.shouldTrigger({battle=battleKey},actionKind,actionAge,kind,TrainerPerformance.duration(performanceId(),actionKind)) then
+    if kind~=actionKind and not (actionKind=="concern" and kind=="brace") then
+      pendingReaction=TrainerPerformance.queueReaction(pendingReaction,kind,strength)
+    end
+    return false
+  end
+  if TrainerPerformance and TrainerPerformance.terminal(kind) then pendingReaction=nil;pendingFrustration=nil end
+  normalReleasePoint=nil;sendoutTarget=nil;sendoutForward=nil
   actionKind=kind;actionAge=0;actionStrength=strength or 1
+  return true
 end
 
 function T:event(ctx,name,payload)
@@ -613,11 +653,8 @@ function T:event(ctx,name,payload)
     if target=="enemy" then
       local b=battleOf(ctx);local dmg=tonumber(payload.damage) or 0
       local maxhp=b and b.enemy and b.enemy.mon and b.enemy.mon.stats and tonumber(b.enemy.mon.stats.hp) or 1
-      local ratio=dmg/math.max(1,maxhp)
-      -- Tiny chip hits do not make the trainer flinch on every contact. Source
-      -- reactions are reserved for readable battle beats; large hits escalate.
-      if ratio>=.30 then trigger("concern",1.0)
-      elseif ratio>=.085 then trigger("brace",.70) end
+      local kind,strength=TrainerPerformance.damageReaction(dmg,maxhp)
+      if kind then trigger(kind,strength) end
     end
   elseif name=="battle.status_inflicted" then
     local target=payloadSide(ctx,payload,{"target","battler","side","targetSide"})
@@ -719,10 +756,11 @@ function T:draw(ctx,vp,pose)
   setShader(vp,model,pose,0,{1,1,1,1},smooth(p.progress/0.40),motion)
   -- Retain source HSD material/pass semantics. Opaque groups write depth; XLU
   -- and NO_ZUPDATE helper/effect surfaces blend without corrupting the world Z.
-  for _,grp in ipairs(s.groups) do
+  for _,grp in ipairs(s.drawGroups or s.groups) do
     local d=grp.diffuse or {1,1,1}
     shader:send("materialColor",{d[1] or 1,d[2] or 1,d[3] or 1,grp.alpha or 1})
     shader:send("useTexture",grp.textured and 1 or 0)
+    shader:send("unlit",grp.useDiffuseLighting==false and 1 or 0)
     if love.graphics.setDepthMode then love.graphics.setDepthMode("lequal",not (grp.noz or grp.xlu)) end
     love.graphics.draw(grp.mesh)
   end
@@ -730,11 +768,18 @@ function T:draw(ctx,vp,pose)
   love.graphics.setShader()
 end
 
+local function sendoutYaw()
+  local f=sendoutForward or arenaForward;local x,z=f[1] or 0,f[2] or 1
+  if math.abs(x)+math.abs(z)<1e-8 then return 0 end
+  if math.atan2 then return math.atan2(x,z) end
+  if z==0 then return x>0 and math.pi/2 or -math.pi/2 end
+  local a=math.atan(x/z);return z<0 and a+(x>=0 and math.pi or -math.pi) or a
+end
 local function ballPose()
   if actionKind~="sendout" then return nil end
   local id=performanceId();local d=TrainerPerformance and TrainerPerformance.duration(id,"sendout") or 1.48
   local phase=clamp(actionAge/math.max(.001,d),0,1)
-  if phase<.31 or phase>.79 then return nil end
+  if phase>.79 then return nil end
   local u=clamp((phase-.31)/.48,0,1)
   local pf=TrainerPerformance and TrainerPerformance.profile(id) or {lead=1}
   local lead=tonumber(pf.lead) or 1
@@ -747,15 +792,53 @@ local function ballPose()
   local releaseY=clamp(shoulderLocal*MODEL_SCALE-.08,3.55,5.35)
   local releaseX=clamp(lateralLocal*MODEL_SCALE*.92,.48,1.08)
   local start={FINAL_X+releaseX*lead,releaseY,FINAL_Z+0.46}
-  local target={BALL_TARGET_X,3.85,BALL_TARGET_Z}
+  -- Use the retained source hand and the same root transform as the body.
+  -- Older caches without joint metadata retain the scaled fallback above.
+  if phase<.31 or not normalReleasePoint then
+    local motion=idleMotion()
+    if phase>=.31 and TrainerPerformance then
+      motion=TrainerPerformance.idle(id,age,"sendout",.31*d,actionStrength,"enemy")
+    end
+    local idx=scene and scene.releaseJoint
+    local point=idx and scene.nativeTrack and TrainerMorph.trackJoint(scene.nativeTrack,idx,motion)
+    point=point or (idx and TrainerRig and TrainerRig.mixJointPoint(scene.jointPositions,scene.poseJointPositions,idx,motion))
+    if point then
+      local m=animatedModel(T:entryPose(),motion)
+      local x,y,z=point[1],point[2],point[3]
+      start={m[1]*x+m[2]*y+m[3]*z+m[4],m[5]*x+m[6]*y+m[7]*z+m[8],m[9]*x+m[10]*y+m[11]*z+m[12]}
+    end
+    if phase>=.31 then normalReleasePoint=start end
+  end
+  if phase<.31 then return {start[1],start[2],start[3],0,handAttached=true,kind="sendout",yaw=sendoutYaw()} end
+  start=normalReleasePoint or start
+  local target=sendoutTarget or {BALL_TARGET_X,3.85,BALL_TARGET_Z}
   return {start[1]+(target[1]-start[1])*u,
           start[2]+(target[2]-start[2])*u+math.sin(u*math.pi)*4.65,
-          start[3]+(target[3]-start[3])*u,u}
+          start[3]+(target[3]-start[3])*u,u,kind="sendout",yaw=sendoutYaw()}
 end
+function T:sendoutStatus()
+  if not activeNow or actionKind~="sendout" then return nil end
+  local duration=TrainerPerformance.duration(performanceId(),"sendout")
+  local phase=clamp(actionAge/math.max(.001,duration),0,1)
+  return {active=phase<1,phase=phase,ball=ballPose(),duration=duration,age=actionAge}
+end
+function T:beginSendout(target,forward)
+  if not activeNow then return nil end
+  if not trigger("sendout",1,true) then return nil end
+  sendoutTarget=target and {target[1],target[2],target[3]} or nil
+  sendoutForward=forward and {forward[1],forward[2]} or nil
+  initialOpeningQueued=true;pendingReaction=nil;pendingFrustration=nil
+  return TrainerPerformance.duration(performanceId(),"sendout")
+end
+function T:clearSendoutTarget() sendoutTarget=nil;sendoutForward=nil end
+
 function T:drawBall(ctx,vp,pose)
-  local bp=ballPose();if not bp or not ensureBall() then return end
-  local spin=bp[4]*math.pi*7
-  local model=Mat4.mul(Mat4.translate(bp[1],bp[2],bp[3]),Mat4.mul(Mat4.rotateY(spin),Mat4.mul(Mat4.rotateZ(spin*.55),Mat4.scale(.38,.38,.38))))
+  local bp=ballPose();if not bp then return end
+  local shared=V.PlayerTrainer
+  if shared and type(shared.drawSendoutBall)=="function" and shared:drawSendoutBall(ctx,vp,pose,bp) then return true end
+  if not ensureBall() then return end
+  local model=Mat4.mul(Mat4.translate(bp[1],bp[2],bp[3]),
+    Mat4.mul(Mat4.rotateY(bp.yaw or 0),Mat4.scale(.38,.38,.38)))
   love.graphics.setDepthMode("lequal",true);love.graphics.setBlendMode("alpha","alphamultiply")
   if love.graphics.setMeshCullMode then love.graphics.setMeshCullMode("none") end
   local function part(mesh,tint)
@@ -767,7 +850,7 @@ function T:drawBall(ctx,vp,pose)
 end
 
 function T:finish(ctx,reason)
-  battleKey=nil;age=0;actionKind=nil;actionAge=0;actionStrength=0;initialSendoutQueued=false;initialOpeningQueued=false;lastSendingOut=false;pendingFrustration=nil;resultSeen=nil;activeNow=false;activationReason=nil
+  battleKey=nil;age=0;actionKind=nil;actionAge=0;actionStrength=0;initialSendoutQueued=false;initialOpeningQueued=false;lastSendingOut=false;pendingFrustration=nil;pendingReaction=nil;resultSeen=nil;activeNow=false;activationReason=nil
 end
 
 
@@ -776,6 +859,11 @@ function T:setArenaProfile(def)
   local mon=def and def.pokemon and def.pokemon.enemy
   if t then FINAL_X=tonumber(t[1]) or FINAL_X;FINAL_Z=tonumber(t[2]) or FINAL_Z end
   if mon then BALL_TARGET_X=tonumber(mon[1]) or BALL_TARGET_X;BALL_TARGET_Z=tonumber(mon[2]) or BALL_TARGET_Z end
+  local opposing=def and def.pokemon and def.pokemon.player
+  if mon and opposing then
+    local dx,dz=(opposing[1] or 0)-(mon[1] or 0),(opposing[2] or 0)-(mon[2] or 0)
+    if math.abs(dx)+math.abs(dz)>1e-8 then arenaForward={dx,dz} else arenaForward={0,1} end
+  end
   local sc=def and def.trainerScale and tonumber(def.trainerScale.enemy)
   if sc then arenaModelScale=sc;applyModelScale() end
 end
@@ -785,7 +873,10 @@ function T:resetRuntime()
   local all=sceneCache;sceneCache={};sceneErrors={};sceneUseSerial=0
   for _,entry in pairs(all or {}) do releaseScene(entry) end
   prewarmQueue={};prewarmSeen={};prewarmNextAt=0
-  scene=nil;sceneKey=nil;shader=nil;shadowImage=nil;shadowMesh=nil;errorText=nil
+  scene=nil;sceneKey=nil
+  releaseLoveObject(shader);shader=nil
+  releaseLoveObject(shadowMesh);releaseLoveObject(shadowImage);shadowImage=nil;shadowMesh=nil;errorText=nil
+  releaseLoveObject(ballMeshRed);releaseLoveObject(ballMeshWhite);releaseLoveObject(ballMeshBlack);releaseLoveObject(ballTexture)
   currentConfig=nil;currentReason=nil
   ballMeshRed=nil;ballMeshWhite=nil;ballMeshBlack=nil;ballTexture=nil
   activeNow=false;age=0;drawFrames=0;actionKind=nil;actionAge=0;actionStrength=0;lastSendingOut=false

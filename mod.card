@@ -1,69 +1,12 @@
-## 1.8.4-capture-member-hsd.1 — retail member HSD capture resolution
-- Fixes the repeated 0/12 lockout by removing the assumption that the retail ball must live inside a Waza Type-2 payload.
-- Enumerates every renderable HSD root from each complete snatch_*.fdat FSYS member, including archives located beyond the normal 64 KiB fast-scan window.
-- Ranks complete-member HSD roots first using phase semantics, isotropic ball geometry, texture/material evidence and successful static source compilation; Type-2 payloads remain a secondary compatibility path.
-- Stores the selected retail geometry/materials/textures as a static capture asset so Android never depends on HSD morph-page playback for the ball.
-- Capture index revision 6 separates sourceComplete (12/12 genuine retail props) from ready (usable capture bank). Missing optional capture source is explicit fallback metadata and can no longer block arenas, trainers, MoveFX or audio.
+COLOSSEUM BATTLE ENVIRONMENTS v2.0
 
-## 1.8.3-capture-source-resolve.1 — retail capture source resolution
-- Fixes the 1.8.2 `0/12 retail balls source-locked` regression seen on real hardware.
-- Cross-phase fingerprint recurrence is now confidence evidence instead of a hard requirement.
-- Each ball is selected only from its own retail `snatch_*` WZX family, with `snatch_shake` prioritized because the physical ball must be present there.
-- Source readiness requires Type-2 parse + HSD decode + drawable static source compilation; byte-size heuristics stay removed.
-- The one proven retail prop is shared across throw/land/shake/miss world choreography.
-- Capture index revision 5 triggers a capture-only rebuild and preserves arenas/trainers/MoveFX/audio.
+Standalone Colosseum battle presentation for Gen1Recomp.
 
-## 1.8.1-capture-presentation.1 — catch choreography parity
-- Successful and failed captures now use the same capture camera path until the actual final outcome reveal; early BattleState.result / battle.ended knowledge can no longer telegraph success from the instant the ball is thrown.
-- Capture camera ownership now queues all non-capture/exit cuts until the wall-clock throw, impact, absorb, fall, settle, and shake sequence completes.
-- Reworks the throw into a source-hand release followed by constant-horizontal ballistic travel, a compact impact/recoil, gravity-driven drop, and a single damped landing settle instead of smoothstep floating/bobbing.
-- The throw camera is now a stable sideline tracking dolly rather than being attached directly to the moving projectile.
-- Successful catches retain a terminal enemy-suppression latch after the cinematic completes, preventing both CBE actors and native fallback sprites from reappearing during Pokédex/nickname dialogue.
-- Runtime/presentation-only patch; generated extractor/cache revision remains 15 and existing 1.8.0 source caches are reusable.
+• Source-derived Colosseum arenas, Pokémon models, trainers, camera presentation, MoveFX and battle audio.
+• Gen 1 + Gen 2 support with doubles and abilities integration.
+• Android GLES compatibility and white-screen recovery: failed arena frames do not hand Gen II back to the stock white-paper battlefield.
+• Safe retrying battle host, lightweight mobile shader fallback, color-only framebuffer fallback and isolated arena render-pass recovery.
+• Persistent runtime model caching and cache reuse remain supported. Existing compatible generated caches are not invalidated by the v2.0 repackage.
+• UI overhaul remains optional and is not embedded in this standalone package.
 
-## 1.8.0-capture-source-fix.1 — capture extraction resolution
-- Removes the 3-24 KiB capture model gate completely; source byte size is never a validity requirement.
-- Decodes every retail type-2 HSD candidate and ranks actual ball-like geometry plus recurrence across shake/throw/land/miss banks.
-- Uses the same decoded retail prop to repair phase banks that do not redundantly embed their own model.
-- Falls back to the exact static retail HSD prop if a source animation clip cannot be compiled.
-- Capture props are no longer allowed to block the entire generated CBE runtime; the existing deterministic 3D ball fallback is used only if no retail model can be decoded at all.
-- Retains detailed source/candidate diagnostics and bumps generated-runtime extractor revision to 15.
-
-## 1.8.0-capture-entry-probe.1 — retail capture type-2 probe
-- Confirms Android storage/import diagnostics from the previous test build.
-- Removes the hard 3-24 KiB gate from capture-ball selection.
-- Dumps every parsed WZX timeline row to `build/capture_timeline_entries.txt`.
-- Soft-ranks type-2 candidates around the historical ~7 KiB observation, then requires real HSD decode.
-- Writes per-candidate decode results to `build/capture_source.txt`.
-- Bumps extractor revision to 14 so this changed capture extraction path is rebuilt cleanly.
-
-## 1.8.0-android-storage-diagnostics.1 — Android / AYN Thor source-cache diagnostics
-- Preserves the 1.8.0 gameplay/presentation/cache contracts; this is a diagnostics-only test pass.
-- Verifies a nested `mod.cache` write/read/info/delete cycle before extraction and surfaces the exact failing cache path/error.
-- Verifies bounded `mod.imports` source reads and records native-vs-legacy launcher bridge/container metadata.
-- Capture extraction now preserves its second-return error, checks raw/index/diagnostic writes, and identifies the exact WZX archive/member/cache path that failed.
-- Writes `build/android_storage_diagnostic.txt` whenever the cache is writable; capture-specific detail remains in `build/capture_source.txt`.
-
-## 1.7.19-water-faint-sprite-parity.1 — Phenac fidelity + faint/sprite ownership
-- Regrades Water/Phenac Colosseum on both full and Android GLES shaders so authentic pale stone retains grey joints, wall shade, water recesses and balcony depth instead of clipping to white.
-- Removes Mt. Battle sky/cloud textures from Water's background; the extracted M1 source scene now owns all visible stadium architecture while only a neutral interior fallback sits behind genuine geometry gaps.
-- Gen 1 raw `battle.fainted` is buffered until the engine's visible faint-slide boundary, preventing a lethal selection from collapsing/removing the CBE actor before the HP bar finishes draining, including at 4x.
-- Gen 2 2D battlers now re-resolve Gen1Recomp's live `pokemon.sprite` seam before native fallback, preserving Battle Arts/custom front/back sprite packages whenever CBE Colosseum models are not the selected presentation.
-- Retains the 1.7.18 Gen 1 full-viewport fix and all 1.7.17 camera-safe/source-arena work.
-
-## 1.7.18-gen1-viewport-hotfix.1 — Gen 1 full-viewport compositor hotfix
-- Gen 1 CBE `worldOverride` is now scaled to the live playfield instead of inheriting the engine's physical-pixel 1/dpi assumption.
-- Fix is Gen 1-only; Gen 2 compositor remains untouched.
-- Includes all 1.7.17 arena fidelity/camera safety changes.
-
-## 1.7.17-arena-camera-fidelity.1 — Arena source parity + camera safety
-
-- Adds arena-specific camera-safe volumes so source/Waza cameras cannot escape beneath floors, behind venue shells, or into unreadable bird's-eye framing.
-- Validates attacker + target screen framing for attack, impact, reaction, faint, and switch shots; preserves the requested source axis when possible and falls back to a stable combat master only when necessary.
-- Refreshes Water, Orre, Realgam, and Mt. Battle from the user's GC6E01 HSD scenes under the current material/GX-wrap serializer while preserving the authored Wildlands cache path.
-- Rebuilds only arena extraction/runtime-mesh caches for existing 1.7.16 installs; trainer, MoveFX, capture, and audio caches remain reusable.
-- Tightens Wildlands terrain shaping for a less procedural, more source-adjacent Orre presentation.
-- Fixes the remaining Mobile Battle UI quarter-screen regression only on the Gen 1 worldOverride compositor boundary; Gen 2's known-good compositor is explicitly untouched.
-- Bumps compact arena runtime meshes to v2 so Android cannot silently reuse stale geometry after the source-parity refresh.
-
-1.7.16: HUD-safe attack camera, attack/impact axis lock, darker source-like Water grade, Android portable audio v5/48k source pan, and broader GPT1 selector ordinal resolution.
+Requires a user-provided Pokémon Colosseum (USA / GC6E01) source through Gen1Recomp's required-import system. No game disc data is included.

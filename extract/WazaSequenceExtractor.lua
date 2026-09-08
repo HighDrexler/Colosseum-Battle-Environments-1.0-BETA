@@ -1,4 +1,4 @@
-local W={revision=4}
+local W={revision=12}
 
 -- Lossless, loader-evidence-backed WazaSequence indexer for Pokemon Colosseum
 -- WZX members (GC6E01).
@@ -13,8 +13,9 @@ local W={revision=4}
 --   source type 2 -> model entry
 --   source type 3 -> particle entry
 --   source type 0 -> invalid in on-disc WazaSequence data
--- Retail entry-start/update dispatch now also proves source type 5 is the GameSound entry.
--- Types 1/4/6 remain conservatively named until their semantics are proven.
+-- Retail entry-start/update dispatch proves source type 1 sequencing controllers,
+-- type 4 procedural/effect descriptors, type 5 GameSound entries, and type 6
+-- owner/model controllers. All six on-disc entry kinds are retained and decoded.
 
 local KIND={
   [1]="type1",
@@ -28,6 +29,14 @@ local KIND={
 local function be32(s,p)
   local a,b,c,d=s:byte(p+1,p+4);if not d then return nil end
   return ((a*256+b)*256+c)*256+d
+end
+local function beFloat(s,p)
+  local bits=be32(s,p);if not bits then return nil end
+  local sign=1;if bits>=2147483648 then sign=-1;bits=bits-2147483648 end
+  local exp=math.floor(bits/8388608);local mant=bits-exp*8388608
+  if exp==255 then return mant==0 and sign*1e30 or 0 end
+  if exp==0 then return sign*(mant/8388608)*(2^-126) end
+  return sign*(1+mant/8388608)*(2^(exp-127))
 end
 local function signed32(v)
   return v and (v>=2147483648 and v-4294967296 or v) or nil
@@ -47,14 +56,92 @@ local function wordList(blob,off,count)
   return out
 end
 
+local TYPE6_OPS={
+  [0]="ambient_enable",[1]="ambient_clear",[2]="visibility_off",[3]="visibility_on",
+  [4]="remove_root_null",[5]="lighting_override_enable",[6]="field_effect_clear",
+  [7]="lighting_override_activate",[8]="lighting_override_clear",[9]="sequence_cleanup",
+}
+local TYPE4_FAMILIES={
+  [0]={name="surface",runtime="world",artifact=nil},
+  [1]={name="electron",runtime="world",artifact="texture"},
+  [2]={name="filter",runtime="framebuffer",artifact=nil},
+  [3]={name="lightning",runtime="world",artifact="texture"},
+  [4]={name="trace",runtime="world",artifact="texture"},
+  [5]={name="leaf",runtime="model",artifact="model"},
+  [6]={name="environment_model",runtime="model",artifact="model"},
+  [7]={name="sea_model",runtime="model",artifact="model"},
+  [8]={name="blur",runtime="framebuffer",artifact=nil},
+  [9]={name="aura",runtime="world",artifact=nil},
+  [10]={name="distortion",runtime="framebuffer",artifact=nil},
+  [11]={name="patchiru_model",runtime="model",artifact="model"},
+  [12]={name="billboard",runtime="world",artifact="texture"},
+}
+local function color32(v)
+  v=tonumber(v) or 0
+  return {v%256,math.floor(v/256)%256,math.floor(v/65536)%256,math.floor(v/16777216)%256}
+end
+-- Exact descriptor families consumed by GC6E01 fn_801364A8.  Embedded source
+-- ranges are preserved so MoveFX extraction can materialize every artifact.
+local function decodeType4(blob,e,limit)
+  local base=tonumber(e and e.payloadOffset);local n=#blob
+  if not base or base<0 or base+0x0C>n then return end
+  local p=base+0x0C;local stop=math.max(p,math.min(n,tonumber(limit) or n))
+  local typ=tonumber(e.effectType) or 0
+  local family=TYPE4_FAMILIES[typ]
+  local q={family=typ,familyName=family and family.name or "unknown",runtime=family and family.runtime or "unsupported",
+    requiredArtifact=family and family.artifact or nil,frames=tonumber(e.effectFrames) or 0,
+    headerWord=tonumber(e.effectHeaderWord) or 0,paramsOffset=p,artifacts={}}
+  local function u(o)return be32(blob,p+o)end
+  local function f(o)return beFloat(blob,p+o)end
+  local function vec(o)return {f(o) or 0,f(o+4) or 0,f(o+8) or 0}end
+  local function artifact(kind,off,size,meta)
+    off=tonumber(off);size=tonumber(size)
+    if not off or not size or size<=0 or off<0 or off+size>stop then return end
+    local a={kind=kind,offset=off,size=size,alignedSize=align32(size)}
+    if type(meta)=="table" then for k,v in pairs(meta)do a[k]=v end end
+    q.artifacts[#q.artifacts+1]=a
+  end
+  if typ==0 then
+    q.mode=u(0);q.count=u(4) or 0;q.layoutMode=u(8) or 0;q.flags=u(0x0C) or 0;q.keys={}
+    -- fn_80137780 shifts the key table four bytes earlier only when the
+    -- serialized layout selector at +08 is 1/2; +0C is the independent
+    -- RGB/alpha behavior flag word.
+    local off=((q.layoutMode==1 or q.layoutMode==2) and -4 or 0);local start=p+off+0x10
+    for i=0,math.min(q.count,4096)-1 do local a=start+i*0x10;if a+0x10>stop then break end
+      q.keys[#q.keys+1]={from=color32(be32(blob,a) or 0),to=color32(be32(blob,a+4) or 0),duration=be32(blob,a+8) or 0,raw=be32(blob,a+0x0C) or 0} end
+  elseif typ==1 then
+    q.start=vec(0);q.endv=vec(0x0C);q.controlA=vec(0x18);q.controlB=vec(0x24);q.width=f(0x30);q.scale=f(0x34);q.speed=f(0x38)
+    q.partA=u(0x3C);q.partB=u(0x40);q.color=color32(u(0x44) or 0);q.flags=u(0x48);artifact("texture",align32(p+0x54),u(0x4C) or 0,{wrap="source"})
+  elseif typ==2 then q.color=color32(u(0) or 0);q.a=f(4);q.b=f(8);q.i0=u(0x0C);q.i1=u(0x10);q.c=f(0x14)
+  elseif typ==3 then
+    q.colorA=color32(u(0) or 0);q.colorB=color32(u(4) or 0);q.part=u(8);q.start=vec(0x0C);q.endv=vec(0x18);q.values={}
+    for o=0x24,0x44,4 do q.values[#q.values+1]=f(o) or 0 end;q.mode=u(0x48);artifact("texture",align32(p+0x54),u(0x4C) or 0,{wrap="mirror"})
+  elseif typ==4 then q.color=color32(u(0) or 0);q.maxSegments=u(4);q.liveSegments=u(8);q.partA=u(0x0C);artifact("texture",align32(p+0x18),u(0x10) or 0,{wrap="clamp"})
+  elseif typ==5 then
+    q.values={};for o=0,0x24,4 do q.values[#q.values+1]=f(o) or 0 end;q.partA=u(0x28);q.partB=u(0x2C);q.param=u(0x30);artifact("model",align32(p+0x3C),u(0x34) or 0,{family=5})
+  elseif typ==6 then
+    q.start=vec(0);q.color=color32(u(0x0C) or 0);q.velocity=vec(0x10);q.countA=u(0x1C);q.countB=u(0x20);q.values={}
+    for o=0x24,0x34,4 do q.values[#q.values+1]=f(o) or 0 end;q.modelMode=u(0x3C);q.modelParam=u(0x40);artifact("model",align32(p+((q.modelMode==1) and -4 or 0)+0x44),u(0x38) or 0,{family=6})
+  elseif typ==7 then q.start=vec(0);q.color=color32(u(0x0C) or 0);q.velocity=vec(0x10);q.partA=u(0x1C);q.partB=u(0x20);q.a=f(0x24);q.b=f(0x28);artifact("model",align32(p+0x34),u(0x2C) or 0,{family=7})
+  elseif typ==8 then
+    q.a=u(0);q.b=u(4);q.count=u(8) or 0;q.mode=u(0x0C);q.keys={}
+    if q.mode==2 then for i=0,math.min(q.count,4096)-1 do local a=p+0x10+i*0x10;if a+0x10>stop then break end;q.keys[#q.keys+1]={from=beFloat(blob,a) or 0,to=beFloat(blob,a+4) or 0,duration=be32(blob,a+8) or 0,raw=be32(blob,a+0x0C) or 0} end elseif q.mode==1 then q.value=beFloat(blob,p+8) or 0 end
+  elseif typ==9 then
+    q.count=u(0) or 0;q.mode=u(4);q.param=u(8);q.keys={};local start=(q.mode==3) and (p+0x0C) or (p+8)
+    if q.mode==2 or q.mode==3 then for i=0,math.min(q.count,4096)-1 do local a=start+i*0x10;if a+0x10>stop then break end;q.keys[#q.keys+1]={from=beFloat(blob,a) or 0,to=beFloat(blob,a+4) or 0,duration=be32(blob,a+8) or 0,raw=be32(blob,a+0x0C) or 0} end end
+  elseif typ==10 then q.color=color32(u(0) or 0);q.flags={u(4) or 0,u(8) or 0,u(0x0C) or 0,u(0x10) or 0,u(0x14) or 0};q.values={f(0x18) or 0,f(0x1C) or 0,f(0x20) or 0}
+  elseif typ==11 then q.partA=u(8);q.partB=u(0x0C);q.mode=u(0x10);artifact("model",align32(p+0x18),u(0) or 0,{family=11})
+  elseif typ==12 then q.partA=u(0);q.partB=u(4);q.a=f(8);q.b=f(0x0C);q.mode=u(0x14);q.extra=(q.mode==2) and f(0x18) or nil;artifact("texture",align32(p+((q.mode==1) and 0x18 or 0x1C)),u(0x10) or 0,{wrap="source"}) end
+  e.effect=q;e.effectArtifacts=q.artifacts;e.effectFamilyName=q.familyName;e.effectRuntime=q.runtime
+  e.effectRequiredArtifact=q.requiredArtifact;e.effectSupported=family~=nil
+end
+
 local function commonSizeAt(blob,at)
-  -- Retail fn_801DC46C reads the serialized layout selector at source +0x68.
-  -- Mode 1 advances by 0x6C, mode 2 by 0x68, and the normal layout by 0x70.
-  -- CBE previously treated mode 2 as 0x70, shifting every type-specific payload
-  -- eight bytes late and making valid Waza rows look empty/corrupt.
+  -- GC6E01 serialized common header, verified against the source WZX corpus
+  -- and the 1.9.11 retail-layout audit. Mode 1 omits the final resource-link
+  -- word; every other mode keeps the normal 0x70-byte common record.
   local mode=be32(blob,at+0x68) or 0
   if mode==1 then return 0x6C end
-  if mode==2 then return 0x68 end
   return 0x70
 end
 
@@ -66,10 +153,7 @@ local function plausibleHeader(blob,at,expectedIdentifier)
   if expectedIdentifier~=nil and tonumber(id)~=tonumber(expectedIdentifier) then return false end
   local cs=commonSizeAt(blob,at)
   if not saneRange(at,cs,#blob) then return false end
-  -- These words are used by the sequence runtime as frame-domain/control
-  -- values.  Negative sentinels are valid; absurd random payload values are a
-  -- strong false-header signal.
-  for _,off in ipairs({0x0C,0x10,0x14}) do
+  for _,off in ipairs({0x14,0x18,0x1C}) do
     local v=signed32(be32(blob,at+off))
     if v==nil or v < -0x100000 or v > 0x100000 then return false end
   end
@@ -86,30 +170,26 @@ local function header(blob,at,index)
     identifier=be32(blob,at) or 0,
     entryType=typ,
     kind=KIND[typ] or ("type"..tostring(typ)),
-    -- Exact WazaSequenceNode source fields used by wazaSequenceEntryLink:
-    --   +08 linkedEntryKey, +0C source timing index, +10 target timing index,
-    --   +14 loader timing slot, +18 state/resource-link key, +1C flags,
-    --   +20 attachment, +24 part index, +28 position type, +2C timing[16].
-    -- Absolute start = linked.start + linked.timing[targetIndex]
-    --                  - this.timing[sourceIndex], or the same operation
-    -- against the active Pokemon/global Waza timing table when unlinked.
-    anchorEntry=be32(blob,at+0x08) or 0,
-    localPoint=be32(blob,at+0x0C) or 0,
-    anchorPoint=be32(blob,at+0x10) or 0,
-    timingIndex=be32(blob,at+0x14) or 0,
-    state=be32(blob,at+0x18) or 0,
-    flags=be32(blob,at+0x1C) or 0,
-    attachment=be32(blob,at+0x20) or 0,
-    partIndex=be32(blob,at+0x24) or 0,
-    positionType=be32(blob,at+0x28) or 0,
-    sourceIndex=be32(blob,at+0x0C) or 0,
-    targetIndex=be32(blob,at+0x10) or 0,
+    -- Serialized source layout. Runtime-node offsets are different and must
+    -- never be substituted here.
+    attachment=be32(blob,at+0x08) or 0,
+    positionType=be32(blob,at+0x0C) or 0,
+    anchorEntry=be32(blob,at+0x10) or 0,
+    linkedEntryKey=be32(blob,at+0x10) or 0,
+    localPoint=be32(blob,at+0x14) or 0,
+    sourceIndex=be32(blob,at+0x14) or 0,
+    anchorPoint=be32(blob,at+0x18) or 0,
+    targetIndex=be32(blob,at+0x18) or 0,
+    timingIndex=be32(blob,at+0x1C) or 0,
     timingPoints=(function()
-      local t={};for i=0,15 do t[#t+1]=signed32(be32(blob,at+0x2C+i*4)) or 0 end;return t
+      local t={};for i=0,15 do t[#t+1]=signed32(be32(blob,at+0x20+i*4)) or 0 end;return t
     end)(),
+    flags=be32(blob,at+0x60) or 0,
     flags60=be32(blob,at+0x60) or 0,
+    partIndex=be32(blob,at+0x64) or 0,
     flags64=be32(blob,at+0x64) or 0,
     commonMode=mode,
+    state=mode==2 and (be32(blob,at+0x6C) or 0) or 0,
     commonSize=commonSize,
     headerHex=hex(blob:sub(at+1,math.min(#blob,at+commonSize))),
   }
@@ -143,21 +223,19 @@ local function parseKnownEntry(blob,at,index)
     -- Retail loader: fixed 0x0C payload; subtype 3 appends count*8 bytes.
     if not saneRange(extra,0x0C,n) then return e,nil,"truncated type1 payload" end
     e.words=wordList(blob,extra,3)
-    e.subtype=be32(blob,extra) or 0
-    e.tableCount=be32(blob,extra+0x04) or 0
+    e.subtype=be32(blob,extra) or 0;e.controllerMode=e.subtype
+    e.controllerParam=be32(blob,extra+0x04) or 0;e.controllerParamFloat=beFloat(blob,extra+0x04);e.controllerAux=be32(blob,extra+0x08) or 0
+    e.tableCount=(e.subtype==3) and e.controllerParam or 0
     local tail=0
     if e.subtype==3 then
       if e.tableCount<0 or e.tableCount>65535 then return e,nil,"invalid type1 table count" end
-      tail=e.tableCount*8
-      e.tableOffset=extra+0x0C
-      e.tableSize=tail
+      tail=e.tableCount*8;e.tableOffset=extra+0x0C;e.tableSize=tail;e.controllerTable={}
       if not saneRange(e.tableOffset,tail,n) then return e,nil,"truncated type1 table" end
+      for i=0,e.tableCount-1 do e.controllerTable[#e.controllerTable+1]={a=be32(blob,e.tableOffset+i*8) or 0,b=be32(blob,e.tableOffset+i*8+4) or 0} end
     end
     finish=extra+0x0C+tail
 
   elseif e.entryType==2 then
-    -- Model-entry loader: source model size @ payload+0x1C and embedded HSD data
-    -- begins at align32(payload+0x24).
     if not saneRange(extra,0x24,n) then return e,nil,"truncated model payload" end
     e.modelWords=wordList(blob,extra,9)
     e.embeddedSize=be32(blob,extra+0x1C) or 0
@@ -170,29 +248,27 @@ local function parseKnownEntry(blob,at,index)
     finish=e.dataOffset+align32(e.embeddedSize)
 
   elseif e.entryType==3 then
-    -- Exact WazaParticleData layout used by _wazaSequenceParticleEntryLoad:
-    --   +00 selector, +04 animationMode, +08 resourceSize, +0C format.
-    -- The GPT1 payload begins at +10 (or +14 for format 3). If common `state`
-    -- is non-zero the row REUSES the particle resource loaded by that earlier
-    -- Waza entry and the retail loader does not consume/load a second GPT1.
-    if not saneRange(extra,0x10,n) then return e,nil,"truncated particle payload" end
-    e.particleWords=wordList(blob,extra,4)
+    local sizeOffset=0x08
+    local formatOffset=sizeOffset+0x04
+    local directOffset=formatOffset+0x04
+    if not saneRange(extra,directOffset,n) then return e,nil,"truncated particle payload" end
+    e.particleWords=wordList(blob,extra,directOffset/4)
     e.selector=be32(blob,extra) or 0
     e.animationMode=be32(blob,extra+0x04) or 0
-    e.particleDataSize=be32(blob,extra+0x08) or 0
-    e.particleFormat=be32(blob,extra+0x0C) or 0
+    e.particleDataSize=be32(blob,extra+sizeOffset) or 0
+    e.particleFormat=be32(blob,extra+formatOffset) or 0
     e.effectMode=e.particleFormat
     -- Compatibility alias for old caches/callers; runtime selection now uses
     -- `selector`, matching fn_801190DC(resource, selector, animationMode & 1).
     e.rootRef=e.selector
-    local prefix=(e.particleFormat==3) and 0x14 or 0x10
+    local prefix=directOffset+((e.particleFormat==3) and 4 or 0)
     if e.particleFormat==3 then
-      if not saneRange(extra,0x14,n) then return e,nil,"truncated particle format-3 payload" end
-      e.format3Word=be32(blob,extra+0x10) or 0
+      if not saneRange(extra,directOffset+4,n) then return e,nil,"truncated particle format-3 payload" end
+      e.format3Word=be32(blob,extra+directOffset) or 0
     end
     e.dataOffset=extra+prefix
-    e.sharedResource=(tonumber(e.state) or 0)~=0
-    if e.sharedResource then
+    if (tonumber(e.state) or 0)~=0 then
+      e.sharedResource=true
       e.dataSize=0
       finish=e.dataOffset
     else
@@ -229,9 +305,6 @@ local function parseKnownEntry(blob,at,index)
     e.words=wordList(blob,extra,size/4)
     -- Retail wazaSequenceEntryStart type-5 branch copies payload word 0 into
     -- runtime +0x78 and passes it directly to the GameSound start/status path.
-    -- Runtime +0x7C is payload word 1 and selects the special sound route when
-    -- bit 0 is set. Preserve the old generic aliases for cache compatibility,
-    -- but expose the proven semantics explicitly.
     e.soundId=be32(blob,extra) or 0
     e.soundMode=mode
     e.soundParam=(size>=0x0C) and (be32(blob,extra+0x08) or 0) or nil
@@ -246,6 +319,8 @@ local function parseKnownEntry(blob,at,index)
     e.words=wordList(blob,extra,2)
     e.subtype=be32(blob,extra) or 0
     e.value=be32(blob,extra+0x04) or 0
+    e.controllerOp=TYPE6_OPS[e.subtype] or "unknown_controller"
+    e.controllerSupported=TYPE6_OPS[e.subtype]~=nil
     finish=extra+0x08
   else
     return e,nil,"unsupported on-disc WazaSequence type"
@@ -274,6 +349,38 @@ function W.parse(blob,opts)
   local at=0xA0+align32(hsdSize)
   if at>n then return nil,"WazaSequence starts outside WZX" end
 
+  -- The pointer handed to retail wazaSequenceLoadData begins with a sequence
+  -- root record. fn_801DC5F0 consumes its kind/flags/mode and optional resource
+  -- before the numbered entry list. Older CBE parsers found entry 1 by resync
+  -- and silently threw this root away, losing source camera/visibility/resource
+  -- policy. Decode it conservatively, then locate the first numbered row.
+  -- The WZX sequence root is the file-leading common record.  The numbered
+  -- SequenceEntry list starts later at 0xA0 + aligned embedded root resource.
+  -- Treating entry 1 as the root (the 1.9.14 regression) reads typed entry
+  -- payload bytes as sequence kind/flags and collapses real attack motions to
+  -- slot 0.  Dig, for example, carries kind 3 at root +0x70 while entry 1's
+  -- model payload happens to contain zero at the old guessed location.
+  local rootOffset=0
+  local firstEntry=at
+  if count>1 and not plausibleHeader(blob,firstEntry,1) then
+    firstEntry=findExpectedHeader(blob,at,1,n-at)
+  end
+  if not firstEntry then return nil,"WazaSequence entry 1 unavailable" end
+  local root={offset=rootOffset,rawSize=math.max(0,firstEntry-rootOffset)}
+  local rootCommon=commonSizeAt(blob,rootOffset)
+  root.commonSize=rootCommon;root.commonMode=be32(blob,rootOffset+0x68) or 0
+  local rp=rootOffset+rootCommon
+  if rp+0x18<=firstEntry and saneRange(rp,0x18,n) then
+    root.kind=be32(blob,rp) or 0
+    root.declaredCount=be32(blob,rp+0x04) or 0
+    root.flags=be32(blob,rp+0x08) or 0
+    root.variant=be32(blob,rp+0x0C) or 0
+    root.mode=be32(blob,rp+0x10) or 0
+    root.embeddedSize=be32(blob,rp+0x14) or 0
+    root.payloadOffset=rp
+  end
+  at=firstEntry
+
   local out={
     revision=W.revision,
     phase=opts.phase,
@@ -282,6 +389,11 @@ function W.parse(blob,opts)
     declaredCount=count,
     hsdSize=hsdSize,
     sequenceOffset=at,
+    rootOffset=rootOffset,
+    root=root,
+    sequenceFlags=tonumber(root.flags) or 0,
+    sequenceKind=tonumber(root.kind) or 0,
+    cameraActive=true,
     entries={},
     complete=true,
     maxFrame=0,
@@ -341,6 +453,7 @@ function W.parse(blob,opts)
 
     if err then entry.parseWarning=err end
     finalizeRange(entry,nextAt,n)
+    if entry.entryType==4 then decodeType4(blob,entry,nextAt) end
     out.entries[#out.entries+1]=entry
     out.kindCounts[entry.kind]=(out.kindCounts[entry.kind] or 0)+1
     at=nextAt
@@ -357,15 +470,15 @@ end
 
 function W.roleForPhase(phase)
   phase=tostring(phase or "all"):lower()
-  if phase=="damage" or phase=="status" then return "damage" end
+  if phase:match("^damage") or phase=="status" then return "damage" end
   return "attack"
 end
 
 function W.status()
   return {revision=W.revision,source="GC6E01 WZX loader-evidence typed timeline index",
-    provenTypes={model=2,particle=3,effect=4,sound=5},opaqueTypes={1,6}}
+    provenTypes={controller=1,model=2,particle=3,effect=4,sound=5,ownerController=6},opaqueTypes={}}
 end
 
 W._internal={parseEntry=parseKnownEntry,plausibleHeader=plausibleHeader,findExpectedHeader=findExpectedHeader,
-  commonSizeAt=commonSizeAt,align32=align32}
+  commonSizeAt=commonSizeAt,align32=align32,type4Families=TYPE4_FAMILIES}
 return W

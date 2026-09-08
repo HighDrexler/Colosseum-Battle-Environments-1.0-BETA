@@ -1,6 +1,6 @@
 local V=...
 local HSD,FSYS,Dex,PKXMetadata=V.HSD,V.FSYS,V.ColosseumDex,V.PKXMetadata
-local P={revision=29}
+local P={revision=37}
 
 -- Colosseum Pokemon battle-model extractor.
 --
@@ -19,14 +19,13 @@ local P={revision=29}
 -- what plays back is Colosseum's own animation resampled, not a procedural
 -- approximation of it.
 --
--- Clip 0 in a GC6E01 character archive is the bind/T pose (this is the same
--- convention TrainerExtractor documented for the B1 trainer members). Clip 1 is
--- the first authored non-bind stance. We probe outward from there rather than
--- assuming, and record what we found in the diagnostic so the mapping can be
--- corrected from real data instead of guessed at again.
+-- The PKX idle slot is authoritative, including clip zero. A DAT clip index is
+-- not a semantic role: zero is a real battle idle for many species. Only older
+-- or unreadable metadata uses the bounded legacy clip probe below.
 
 local MORPH_SLOTS=12         -- dense complete authored poses carried beside the base frame
 local STRIDE=44              -- 8 base floats + 9 vec4 packs carrying 12 authored positions
+local checkpoint
 local MAX_CLIP_PROBE=8       -- how many clips to inspect when hunting the idle
 
 -- Maximum RMS displacement, as a fraction of model height, that a pose may move
@@ -67,7 +66,8 @@ end
 local function applyTransform(model,t)
   local nmin={1e30,1e30,1e30};local nmax={-1e30,-1e30,-1e30}
   for _,g in ipairs(model.groups or {}) do
-    for _,v in ipairs(g.vertices or {}) do
+    for vi,v in ipairs(g.vertices or {}) do
+      if vi%128==0 then checkpoint() end
       v[1]=(v[1]-t.cx)*t.s;v[2]=(v[2]-t.cy)*t.s;v[3]=(v[3]-t.cz)*t.s
       for k=1,3 do
         if v[k]<nmin[k] then nmin[k]=v[k] end
@@ -150,8 +150,8 @@ end
 -- For verified reaction slots, reject only impossible geometry.  Other actions
 -- keep the conservative displacement guard used for fail-open clip probing.
 local REACTION_SLOT={damage=true,damageHeavy=true,faint=true}
-local ACTION_DRIFT_MAX={idle=1.25,idleB=1.25,idleC=1.25,idleD=1.25,idleE=1.25,
-  statusA=1.75,statusB=1.75,specialC=2.25,
+local ACTION_DRIFT_MAX={idle=1.25,extra1=3.5,extra2=3.5,extra3=3.5,extra4=3.5,
+  specialA=2.25,specialB=2.25,specialC=2.25,
   physicalA=3.5,physicalB=3.5,physicalC=3.5,physicalD=3.5,physicalE=3.5,takeFlight=5.0}
 local function actionPoseUsable(template,sample,label)
   if not topologyMatches(template,sample) then return false,"topology mismatch" end
@@ -249,19 +249,27 @@ local DECODE={
   -- geometry produces the white box/plate seen in the 1.5.24 F5 capture.
   skipShadowMaterials=true,
 }
--- Set once at the top of P.extractSpecies from opts.skinFix and read by every
--- decode in that call. A single extraction runs synchronously top to bottom
--- with no concurrent species in flight, so a shared upvalue here is safe and
--- avoids threading a new parameter through every decodeBest call site that
--- exists purely to reach chooseIdleClip/attachFrames' internal re-decodes.
-local currentSkinFix=true
-local currentRenderPassFilter=true
+-- Each suspended extraction owns its options and immutable HSD decode session.
+-- The main-thread token preserves direct/synchronous callers and diagnostics.
+local MAIN={}
+local extractionContexts=setmetatable({}, {__mode="k"})
+local function contextKey() return coroutine.running() or MAIN end
+local function extractionContext()
+  return extractionContexts[contextKey()] or {skinFix=true,renderPassFilter=true}
+end
+checkpoint=function(label)
+  local c=extractionContext()
+  if c.checkpoint then c.checkpoint(label) end
+end
 local function decodeOpts(clip,frame,withTextures)
   local o={}
   for k,v in pairs(DECODE) do o[k]=v end
   o.textures=withTextures and true or false
-  o.skinFix=currentSkinFix
-  o.honorRenderPass=currentRenderPassFilter
+  o.skinFix=extractionContext().skinFix
+  o.nativeScaleCompensation=true
+  o.honorRenderPass=extractionContext().renderPassFilter
+  o.checkpoint=extractionContext().checkpoint
+  o.decodeSession=extractionContext().decodeSession
   o.filterPlaceholders=false
   if clip~=nil then o.nativePose={clip=clip,frame=frame or 0} end
   return o
@@ -282,12 +290,25 @@ local function decodeBest(blob,clip,frame,withTextures,trail,label,mode)
   mode=mode or "auto"
   local opts=decodeOpts(clip,frame,withTextures)
 
-  local scene=nil
-  if type(HSD.extractSceneModel)=="function" then
-    local ok,value=pcall(HSD.extractSceneModel,blob,opts)
-    if ok then scene=value end
+  checkpoint("Decoding source pose")
+  -- AUTO has always selected a valid single character root. Do not fully
+  -- decode the discarded scene-union path on every frame of every action.
+  -- Forced SCENE still wins; either primary path retains the original fallback.
+  local scene,single,singleErr
+  local function readScene()
+    if type(HSD.extractSceneModel)=="function" then
+      local ok,value=pcall(HSD.extractSceneModel,blob,opts)
+      if ok then scene=value end
+    end
   end
-  local single,singleErr=HSD.extractModel(blob,opts)
+  if mode=="scene" then
+    readScene()
+    if not scene then single,singleErr=HSD.extractModel(blob,opts) end
+  else
+    single,singleErr=HSD.extractModel(blob,opts)
+    if not single or (mode~="single" and (tonumber(single.vertexCount) or 0)<=0) then readScene() end
+  end
+  checkpoint()
   local sv=scene and tonumber(scene.vertexCount) or 0
   local nv=single and tonumber(single.vertexCount) or 0
 
@@ -481,7 +502,10 @@ local function attachFrames(blob,base,clip,transform,targetHeight,spacing,trail,
       local sv=usable and sample.groups[gi].vertices or nil
       for vi,v in ipairs(g.vertices) do
         local o=sv and sv[vi] or v
-        local at=6+slot*3            -- slots start after x,y,z,u,v,nx,ny,nz
+        -- The first eight scalars are position/UV/normal.  FramePack1 starts
+        -- at scalar 9, so frame 1 occupies 9..11 (not 10..12).  Keeping this
+        -- zero-gap layout is required by PokemonActors' nine vec4 unpacker.
+        local at=5+slot*3
         v[at+1]=o[1];v[at+2]=o[2];v[at+3]=o[3]
       end
     end
@@ -576,7 +600,7 @@ end
 -- share the exact same authored source frame, so runtime can switch pages with
 -- no pose discontinuity.
 local function denseReactionIntervals(label,duration,endFrame)
-  if label~="damage" and label~="damageHeavy" and label~="faint" then return MORPH_SLOTS end
+  if label=="idle" then return MORPH_SLOTS end
   local sourceIntervals=math.max(1,math.floor((tonumber(endFrame) or 0)+.5))
   if sourceIntervals<=1 then
     local seconds=math.max(.05,tonumber(duration) or 0)
@@ -586,7 +610,7 @@ local function denseReactionIntervals(label,duration,endFrame)
   -- more of the real HSD timeline, but never manufacture more samples than the
   -- source clip actually contains. Runtime still interpolates adjacent source
   -- poses, so this yields smooth motion without vertex-space overshoot.
-  return math.max(MORPH_SLOTS,math.min(72,sourceIntervals))
+  return math.max(MORPH_SLOTS,math.min(144,sourceIntervals))
 end
 
 local function buildActionPage(blob,template,clip,transform,spacing,startInterval,slotCount,trail,decodeMode,label)
@@ -623,7 +647,7 @@ local function buildActionPage(blob,template,clip,transform,spacing,startInterva
       local sv=ok and sample.groups[gi].vertices or nil
       for vi,v in ipairs(g.vertices or {}) do
         local o=sv and sv[vi] or v
-        local at=6+slot*3
+        local at=5+slot*3
         v[at+1]=o[1];v[at+2]=o[2];v[at+3]=o[3]
       end
     end
@@ -675,22 +699,31 @@ local function extractActionBanks(blob,template,transform,metadata,clipCount,tra
     return actions
   end
 
-  -- Runtime semantics consume six action classes: idle, physical, special,
-  -- status, damage and faint. Older extraction decoded every alternate
-  -- Physical/Idle/Status slot up front even though the runtime only ever uses
-  -- those alternates as fallbacks when the primary slot is absent or invalid.
-  -- For a large species that multiplied HSD decode work and cache size several
-  -- times over. Resolve the same fallback order here and cache only the first
-  -- usable source clip for each semantic class. Visible behavior is unchanged:
-  -- if Physical A fails we still try B/C/D/E, etc.; we just stop once the exact
-  -- bank the runtime would select has been proven.
+  -- Preserve the retail 17-slot Pokemon motion table. Most moves select
+  -- Physical-A or Special-A, but Colosseum's stateful move dispatch can select
+  -- the B-E variants and a few species use the Extra slots. Collapsing those
+  -- rows into six guessed semantic classes made the cache incapable of obeying
+  -- the source selector even when the PKX contained the requested animation.
+  -- Duplicate DAT clip indices remain cheap: ownerByClip emits aliases instead
+  -- of serialising the same sampled geometry more than once.
   local semanticOrder={
-    {"idle",     {"idle","idleB","idleC","idleD","idleE"}},
-    {"physicalA",{"physicalA","physicalB","physicalC","physicalD","physicalE"}},
-    {"specialC", {"specialC","statusA","statusB"}},
-    {"statusA",  {"statusA","statusB","specialC"}},
-    {"damage",   {"damage"}},
-    {"faint",    {"faint"}},
+    {"idle",{"idle"}},
+    {"specialA",{"specialA"}},
+    {"physicalA",{"physicalA"}},
+    {"physicalB",{"physicalB"}},
+    {"physicalC",{"physicalC"}},
+    {"physicalD",{"physicalD"}},
+    {"specialB",{"specialB"}},
+    {"physicalE",{"physicalE"}},
+    {"damage",{"damage"}},
+    {"damageHeavy",{"damageHeavy"}},
+    {"faint",{"faint"}},
+    {"extra1",{"extra1"}},
+    {"specialC",{"specialC"}},
+    {"extra2",{"extra2"}},
+    {"extra3",{"extra3"}},
+    {"extra4",{"extra4"}},
+    {"takeFlight",{"takeFlight"}},
   }
 
   local ownerByClip={}
@@ -698,6 +731,7 @@ local function extractActionBanks(blob,template,transform,metadata,clipCount,tra
 
   local function slotInfo(key)
     local slot=metadata.slots[key]
+    if slot and slot.active==false then return nil end
     local clip=slot and tonumber(slot.animationIndex) or nil
     local duration=slot and tonumber(slot.duration) or 0
     if not clip or clip<0 or (clipCount and clipCount>0 and clip>=clipCount) then return nil end
@@ -790,7 +824,7 @@ end
 local function normalizedVertexRow(v)
   local row={v[1],v[2],v[3],v[4] or 0,v[5] or 0,v[6] or 0,v[7] or 1,v[8] or 0}
   for slot=1,MORPH_SLOTS do
-    local at=6+slot*3
+    local at=5+slot*3
     row[#row+1]=v[at+1] or v[1]
     row[#row+1]=v[at+2] or v[2]
     row[#row+1]=v[at+3] or v[3]
@@ -802,18 +836,29 @@ end
 -- running table.concat once per vertex. A single Pokemon body is thousands of
 -- vertices and this runs for every species and every action page.
 local function packedVerticesLua(vertices)
-  local out,n={},0
-  local first=true
-  for _,v in ipairs(vertices or {}) do
+  -- Bound the scalar/string scratch table to 64 rows. The old table retained
+  -- ~88 entries PER vertex for the entire group, multiplying mobile peak heap.
+  -- The canonical %.6g bytes, separators and Lua quoting remain identical.
+  local chunks,parts={},{}
+  local n,rows=0,0
+  for vi,v in ipairs(vertices or {}) do
     local row=normalizedVertexRow(v)
-    if first then first=false else n=n+1;out[n]="\n" end
+    if vi>1 then n=n+1;parts[n]="\n" end
     for i=1,STRIDE do
-      if i>1 then n=n+1;out[n]="," end
-      n=n+1;out[n]=num(row[i])
+      if i>1 then n=n+1;parts[n]="," end
+      n=n+1;parts[n]=num(row[i])
+    end
+    rows=rows+1
+    if rows==64 then
+      chunks[#chunks+1]=table.concat(parts,"",1,n);n=0;rows=0
+      checkpoint("Writing source vertex cache")
     end
   end
-  return q(table.concat(out,"",1,n))
+  if n>0 then chunks[#chunks+1]=table.concat(parts,"",1,n) end
+  checkpoint()
+  return q(table.concat(chunks))
 end
+
 local unpackArgs=table.unpack or unpack
 -- Batched exactly like RuntimeMeshCache.packRows: one love.data.pack call and
 -- one intermediate string per 64 vertices instead of per vertex. Identical
@@ -841,6 +886,7 @@ local function runtimeVerticesBytes(vertices)
     if not ok or type(bytes)~="string" then return nil end
     chunkCount=chunkCount+1;chunks[chunkCount]=bytes
     i=i+take
+    checkpoint("Packing model cache")
   end
   return table.concat(chunks,"",1,chunkCount)
 end
@@ -853,7 +899,10 @@ local function appendPackedActionGroups(out,model)
   out[#out+1]="}"
 end
 
-local ACTION_ORDER={"idle","physicalA","specialC","statusA","damage","faint"}
+local ACTION_ORDER={
+  "idle","specialA","physicalA","physicalB","physicalC","physicalD","specialB","physicalE",
+  "damage","damageHeavy","faint","extra1","specialC","extra2","extra3","extra4","takeFlight",
+}
 
 local function actionPayloadLua(a)
   local out={"-- Generated native Pokemon action bank.\nreturn {clip="..tostring(a.clip or -1)
@@ -885,15 +934,36 @@ end
 
 local function metadataCacheLua(metadata)
   if type(metadata)~="table" then return nil end
-  local out={"-- Compact PKX runtime metadata generated from the user's GC6E01 disc.\nreturn {revision=1,bodyMap={"}
   local keys={"origin","mouth","chest","tail","eye_left","eye_right","hand_left","hand_right","additional_1","additional_2","additional_3","additional_4","foot_left","foot_right","center","additional_5"}
-  for _,key in ipairs(keys) do out[#out+1]="["..q(key).."]="..tostring(tonumber(metadata.bodyMap and metadata.bodyMap[key]) or -1).."," end
-  out[#out+1]="},slots={"
-  local slotKeys={"idle","statusA","physicalA","physicalB","physicalC","physicalD","statusB","physicalE","damage","damageHeavy","faint","idleB","specialC","idleC","idleD","idleE","takeFlight"}
+  local function appendBodyMap(out,map)
+    out[#out+1]="bodyMap={"
+    for _,key in ipairs(keys) do out[#out+1]="["..q(key).."]="..tostring(tonumber(map and map[key]) or -1).."," end
+    out[#out+1]="},"
+  end
+  local out={"-- Compact PKX runtime metadata generated from the user's GC6E01 disc.\nreturn {revision=4,"}
+  if V.ShinySupport then out[#out+1]=V.ShinySupport.filterField(metadata.shinyFilter) end
+  appendBodyMap(out,metadata.bodyMap)
+  out[#out+1]="slots={"
+  local slotKeys={"idle","specialA","physicalA","physicalB","physicalC","physicalD","specialB","physicalE","damage","damageHeavy","faint","extra1","specialC","extra2","extra3","extra4","takeFlight"}
   for _,key in ipairs(slotKeys) do
     local slot=metadata.slots and metadata.slots[key]
     if type(slot)=="table" then
-      out[#out+1]="["..q(key).."]={animationIndex="..tostring(tonumber(slot.animationIndex) or -1)..",duration="..num(slot.duration or 0).."},"
+      out[#out+1]="["..q(key).."]={index="..tostring(tonumber(slot.index) or -1)
+        ..",animationIndex="..tostring(tonumber(slot.animationIndex) or -1)
+        ..",animType="..tostring(tonumber(slot.animType) or 0)
+        ..",subAnimCount="..tostring(tonumber(slot.subAnimCount) or #(slot.subAnimations or {}))
+        ..",active="..tostring(slot.active==true)
+        ..",duration="..num(slot.duration or 0)..",timing={"
+      for i=1,4 do out[#out+1]=num(slot.timing and slot.timing[i] or 0).."," end
+      out[#out+1]="},"
+      appendBodyMap(out,slot.bodyMap)
+      out[#out+1]="subAnimations={"
+      for _,sub in ipairs(slot.subAnimations or {}) do
+        out[#out+1]="{motionType="..tostring(tonumber(sub.motionType) or 0)
+          ..",animationIndex="..tostring(tonumber(sub.animationIndex) or -1)
+          ..",active="..tostring(sub.active==true).."},"
+      end
+      out[#out+1]="}},"
     end
   end
   out[#out+1]="}}\n"
@@ -907,6 +977,7 @@ local function cacheLua(stem,dex,model,texturePaths,clip,clipCount,frameSpacing,
     "return {formatVersion=4,poseFormat=\"source-hsd-authored-pages-v4-split-actions\",\n",
     "dex=",tostring(dex),",stem=",q(stem),",source=",q(sourceName),",\n",
     "clip=",tostring(clip),",clipCount=",tostring(clipCount),
+    ",idleDuration=",num(model.__cbeIdleDuration or 0),
     ",frameSpacing=",tostring(frameSpacing),",morphFrames=",tostring(attached),
     ",morphSlots=",tostring(MORPH_SLOTS),",\n",
     "vertexCount=",tostring(model.vertexCount or 0),
@@ -990,8 +1061,8 @@ local function write(mod,path,data,generated)
   if generated then generated[#generated+1]=path end
 end
 
-function P.cachePath(dex) return ("cache/pokemon/%d/model_cache.lua"):format(tonumber(dex) or 0) end
-function P.revPath(dex) return ("cache/pokemon/%d/rev.txt"):format(tonumber(dex) or 0) end
+function P.cachePath(dex,variant) return Dex.cacheRoot(dex,variant).."/model_cache.lua" end
+function P.revPath(dex,variant) return Dex.cacheRoot(dex,variant).."/rev.txt" end
 
 -- Stamp identifying the extraction that produced a species cache. Species are
 -- extracted lazily and then reused forever, so WITHOUT this stamp an improved
@@ -1018,14 +1089,14 @@ end
 
 function P.isCached(mod,dex,opts)
   if not (mod.cache and mod.cache.info) then return false end
-  local info=mod.cache:info(P.cachePath(dex))
+  local info=mod.cache:info(P.cachePath(dex,opts and opts.variant))
   if not (type(info)=="table" and (info.type==nil or info.type=="file")) then return false end
   -- Cache validity includes every debug option that changes emitted geometry.
   -- Without this, an F4/F6/F10 A/B extraction survives a restart under a
   -- different on-screen toggle state. The global overlay can then say ON while
   -- the actual species cache says filter=OFF -- exactly what the 1.5.21 F5
   -- screenshots exposed.
-  local ok,raw=pcall(mod.cache.read,mod.cache,P.revPath(dex))
+  local ok,raw=pcall(mod.cache.read,mod.cache,P.revPath(dex,opts and opts.variant))
   return ok and raw==P.stamp(opts)
 end
 
@@ -1059,18 +1130,19 @@ function P.manifestPaths(mod)
   return out
 end
 
-local function recordManifest(mod,dex,stem,paths)
+local function recordManifest(mod,dex,stem,paths,variant)
+  local cacheKey=Dex.modelKey(dex,variant)
   local list=readManifest(mod)
   local replaced=false
   for i,entry in ipairs(list) do
-    if type(entry)=="table" and tonumber(entry.dex)==tonumber(dex) then
-      list[i]={dex=dex,stem=stem,paths=paths};replaced=true;break
+    if type(entry)=="table" and Dex.modelKey(entry.dex,entry.variant)==cacheKey then
+      list[i]={dex=dex,variant=variant,stem=stem,paths=paths};replaced=true;break
     end
   end
-  if not replaced then list[#list+1]={dex=dex,stem=stem,paths=paths} end
+  if not replaced then list[#list+1]={dex=dex,variant=variant,stem=stem,paths=paths} end
   local out={"-- Generated. Lazily extracted Colosseum Pokemon caches.\nreturn {\n"}
   for _,entry in ipairs(list) do
-    out[#out+1]=("{dex=%d,stem=%s,paths={"):format(tonumber(entry.dex) or 0,q(entry.stem))
+    out[#out+1]=("{dex=%d,variant=%s,stem=%s,paths={"):format(tonumber(entry.dex) or 0,q(entry.variant or "normal"),q(entry.stem))
     for _,path in ipairs(entry.paths or {}) do out[#out+1]=q(path).."," end
     out[#out+1]="}},\n"
   end
@@ -1081,13 +1153,21 @@ end
 -- Extract exactly one species. This is the lazy unit: the runtime calls it the
 -- first time a Pokemon is sent out, and never again for that species.
 -- targetHeight is in the same authored world units the arena/trainer caches use.
-function P.extractSpecies(mod,disc,dex,opts)
+local function extractSpeciesImpl(mod,disc,dex,opts)
   opts=opts or {}
+  local variant=Dex.variant(dex,opts.variant)
+  dex=Dex.number(dex)
+  if not dex then return nil,"invalid species" end
+  local cacheKey=Dex.modelKey(dex,variant)
+  local cacheRoot=Dex.cacheRoot(cacheKey)
   local targetHeight=tonumber(opts.targetHeight) or 16.0
-  local progress=opts.progress or function() end
+  local progress=function(label,current,total)
+    if opts.progress then opts.progress(label,current,total) end
+    checkpoint(label)
+  end
   local generated=opts.generated
-  currentSkinFix=opts.skinFix~=false
-  currentRenderPassFilter=opts.renderPassFilter~=false
+  local currentSkinFix=opts.skinFix~=false
+  local currentRenderPassFilter=opts.renderPassFilter~=false
 
   -- Flight recorder: written BEFORE any decode work, unconditionally, so that
   -- if this call never returns at all (a native/engine-level fault that a
@@ -1106,7 +1186,7 @@ function P.extractSpecies(mod,disc,dex,opts)
           tostring(opts.decodeMode or "auto"),tostring(os.time and os.time() or "?")))
   end)
 
-  local archiveName,stem=Dex.archive(dex,opts.variant,opts.unownForm)
+  local archiveName,stem=Dex.archive(dex,variant,opts.unownForm)
   if not archiveName then return nil,("dex %s has no Colosseum asset"):format(tostring(dex)) end
 
   local trail={("pkx %s dex=%s archive=%s"):format(safe(stem),tostring(dex),safe(archiveName))}
@@ -1128,6 +1208,7 @@ function P.extractSpecies(mod,disc,dex,opts)
   progress(("POKEMON %s DECOMPRESS"):format(stem:upper()),0,1)
   local okBlob,blob=pcall(arc.extract,arc,entry,{
     maxOutput=48*1024*1024,
+    checkpoint=opts.checkpoint or opts.progress,
     progress=function(done,total)
       local pct=(tonumber(total) or 0)>0 and math.floor((tonumber(done) or 0)*100/total) or 0
       progress(("POKEMON %s DECOMPRESS %d%%"):format(stem:upper(),pct),0,1)
@@ -1143,7 +1224,31 @@ function P.extractSpecies(mod,disc,dex,opts)
   trail[#trail+1]="decode mode: "..decodeMode
   trail[#trail+1]="skin fix: "..(currentSkinFix and "on (native IBM + owner-coordinate envelope matrices)" or "off (legacy raw-world envelope path)")
   trail[#trail+1]="source render-pass filter: "..(currentRenderPassFilter and "on (skip JOBJ geometry the Colosseum renderer never submits)" or "off (diagnostic legacy draw-all)")
-  local clip,clipCount,clipNote=chooseIdleClip(blob,targetHeight,trail,decodeMode)
+  local metadata=nil
+  if PKXMetadata and type(PKXMetadata.parse)=="function" then
+    local okMeta,value=pcall(PKXMetadata.parse,blob)
+    if okMeta and type(value)=="table" then metadata=value
+    else trail[#trail+1]="PKX metadata parse failed: "..safe(value) end
+  end
+  local idleSlot=metadata and metadata.slots and metadata.slots.idle
+  local sourceIdle=idleSlot and idleSlot.active~=false and tonumber(idleSlot.animationIndex)
+  local clip,clipCount,clipNote,sourceInfo
+  if sourceIdle and sourceIdle>=0 then
+    local ref=decodeBest(blob,sourceIdle,0,false,nil,nil,decodeMode)
+    if ref then
+      sourceInfo=HSD.nativeAnimationInfo(ref,sourceIdle)
+      clipCount=ref.stats and tonumber(ref.stats.nativeClipCount) or 0
+      if sourceInfo and (clipCount==0 or sourceIdle<clipCount) then
+        clip=sourceIdle
+        trail[#trail+1]=("PKX authoritative idle: clip %d / %.3fs / %.3f source frames")
+          :format(clip,tonumber(idleSlot.duration) or 0,tonumber(sourceInfo.endFrame) or 0)
+      end
+    end
+  end
+  local trustedIdle=clip~=nil
+  if not trustedIdle then
+    clip,clipCount,clipNote=chooseIdleClip(blob,targetHeight,trail,decodeMode)
+  end
   if clipNote then trail[#trail+1]="note: "..clipNote end
   clip=clip or 0
 
@@ -1179,7 +1284,7 @@ function P.extractSpecies(mod,disc,dex,opts)
   -- in raw source units makes every clip look catastrophically incoherent --
   -- which is exactly what an earlier ordering of this check did, rejecting even
   -- a gentle two-percent idle.
-  local bindRef=decodeBest(blob,0,0,true,nil,nil,decodeMode)
+  local bindRef=not trustedIdle and decodeBest(blob,0,0,true,nil,nil,decodeMode) or nil
   local bindVerts=bindRef and tonumber(bindRef.vertexCount) or 0
   local poseVerts=tonumber(base.vertexCount) or 0
   local finalDrift=nil
@@ -1204,25 +1309,22 @@ function P.extractSpecies(mod,disc,dex,opts)
   trail[#trail+1]=("decoded via %s: vertices=%d groups=%d")
     :format(tostring(decodePath),base.vertexCount or 0,#(base.groups or {}))
 
-  -- Frame spacing is a guess only in its magnitude, never in its source: every
-  -- sampled frame is still an authored HSD frame. If a clip turns out shorter
-  -- than MORPH_SLOTS*spacing, the tail frames clamp to the clip's last key,
-  -- which reads as a hold rather than as a glitch.
-  local metadata=nil
-  if PKXMetadata and type(PKXMetadata.parse)=="function" then
-    local okMeta,value=pcall(PKXMetadata.parse,blob)
-    if okMeta and type(value)=="table" then metadata=value
-    else trail[#trail+1]="PKX metadata parse failed: "..safe(value) end
-  end
+  -- Reuse the selected source idle for the resident menu/battle body too.
+  -- This avoids a guessed attack/withdrawal pose before the lazy idle bank loads.
   local actions=extractActionBanks(blob,base,transform,metadata,clipCount or 0,trail,decodeMode)
 
-  local spacing=math.max(1,math.floor(tonumber(opts.frameSpacing) or 4))
+  local spacing=trustedIdle and actionSpacing(idleSlot.duration,sourceInfo.endFrame)
+    or math.max(1,math.floor(tonumber(opts.frameSpacing) or 4))
+  base.__cbeIdleDuration=trustedIdle and tonumber(idleSlot.duration) or 0
+  if base.__cbeIdleDuration<=0 and trustedIdle then
+    base.__cbeIdleDuration=(tonumber(sourceInfo.endFrame) or 0)/30
+  end
   local attached=0
   if attachedOverride==0 then clip=0 end
-  if clip>0 then
+  if attachedOverride~=0 and (trustedIdle or clip>0) then
     progress(("POKEMON %s FRAMES"):format(stem:upper()),0,1)
-    attached=attachFrames(blob,base,clip,transform,targetHeight,spacing,trail,decodeMode)
-    trail[#trail+1]=("authored frames attached=%d/%d spacing=%d"):format(attached,MORPH_SLOTS,spacing)
+    attached=attachFrames(blob,base,clip,transform,targetHeight,spacing,trail,decodeMode,"idle")
+    trail[#trail+1]=("authored frames attached=%d/%d spacing=%.3f"):format(attached,MORPH_SLOTS,spacing)
   else
     trail[#trail+1]="static: no authored clip selected"
   end
@@ -1286,15 +1388,31 @@ function P.extractSpecies(mod,disc,dex,opts)
 
   base=mergeGroups(base)
   -- Action banks use the exact same source DOBJ/material grouping as the body.
-  -- Merge after sampling, then reject any bank that no longer matches the
-  -- proven base topology rather than risking a scrambled action mesh.
+  -- Merge AFTER sampling, then reject any bank that no longer matches the
+  -- proven base topology rather than risking a scrambled action mesh. Dense
+  -- actions are paged: every page must receive the same material merge as the
+  -- base body. Revision 33 only merged the legacy a.model form, leaving dense
+  -- pages at the pre-merge source group count (e.g. Charizard 17 action groups
+  -- vs 14 base groups). The lazy runtime then rejected every native action even
+  -- though its authored source frames were present.
   for key,a in pairs(actions or {}) do
+    local valid=true
     if a.model then
       a.model=mergeGroups(a.model)
-      if not topologyMatches(base,a.model) then
-        trail[#trail+1]=("native %s rejected after material merge: topology mismatch"):format(key)
-        actions[key]=nil
+      valid=topologyMatches(base,a.model)
+    elseif type(a.pages)=="table" and #a.pages>0 then
+      for pi,page in ipairs(a.pages) do
+        if not (page and page.model) then valid=false;break end
+        page.model=mergeGroups(page.model)
+        if not topologyMatches(base,page.model) then
+          trail[#trail+1]=("native %s page %d rejected after material merge: topology mismatch"):format(key,pi)
+          valid=false;break
+        end
       end
+    end
+    if not valid then
+      trail[#trail+1]=("native %s rejected after material merge: topology mismatch"):format(key)
+      actions[key]=nil
     end
   end
 
@@ -1304,7 +1422,7 @@ function P.extractSpecies(mod,disc,dex,opts)
       local sig=signature(g.texture)
       local tp=textureMap[sig]
       if not tp then
-        local path=("cache/pokemon/%d/tex_%02d.rgba"):format(dex,gi)
+        local path=(cacheRoot.."/tex_%02d.rgba"):format(gi)
         write(mod,path,g.texture.rgba,generated)
         tp={path=path,w=g.texture.w,h=g.texture.h}
         textureMap[sig]=tp
@@ -1324,8 +1442,8 @@ function P.extractSpecies(mod,disc,dex,opts)
   end
 
   local sourceName=archiveName.." :: "..tostring(entry.name)
-  local cachePath=P.cachePath(dex)
-  local diagPath=("cache/pokemon/%d/extract.txt"):format(dex)
+  local cachePath=P.cachePath(cacheKey)
+  local diagPath=cacheRoot.."/extract.txt"
 
   -- Keep large native action payloads out of model_cache.lua. Stats/Data and
   -- battle entry need the base body immediately; embedding every attack/hurt
@@ -1341,7 +1459,7 @@ function P.extractSpecies(mod,disc,dex,opts)
       if a.alias then
         actionRefs[key]={alias=a.alias,clip=a.clip,duration=a.duration}
       else
-        local path=("cache/pokemon/%d/actions/%s.lua"):format(dex,key)
+        local path=(cacheRoot.."/actions/%s.lua"):format(key)
         write(mod,path,actionPayloadLua(a),generated)
         actionRefs[key]={path=path,clip=a.clip,duration=a.duration}
         actionPaths[#actionPaths+1]=path
@@ -1349,7 +1467,7 @@ function P.extractSpecies(mod,disc,dex,opts)
     end
   end
 
-  local metadataPath=("cache/pokemon/%d/metadata_v1.lua"):format(dex)
+  local metadataPath=cacheRoot.."/metadata_v1.lua"
   local metadataLua=metadataCacheLua(metadata)
   if metadataLua then write(mod,metadataPath,metadataLua,generated) end
   write(mod,cachePath,cacheLua(stem,dex,base,texturePaths,clip,clipCount or 0,spacing,attached,sourceName,decodeMode,actionRefs),generated)
@@ -1365,7 +1483,7 @@ function P.extractSpecies(mod,disc,dex,opts)
   if runtimeOK then
     for gi,g in ipairs(base.groups or {}) do
       local bytes=runtimeVerticesBytes(g.vertices)
-      local path=("cache/pokemon/%d/runtime_mesh_v1/base_%02d.f32"):format(dex,gi)
+      local path=(cacheRoot.."/runtime_mesh_v1/base_%02d.f32"):format(gi)
       if not bytes then runtimeOK=false;break end
       local okWrite=write(mod,path,bytes,generated)
       if okWrite==false then runtimeOK=false;break end
@@ -1374,7 +1492,7 @@ function P.extractSpecies(mod,disc,dex,opts)
   end
   local stamp=P.stamp({skinFix=currentSkinFix,renderPassFilter=currentRenderPassFilter,decodeMode=decodeMode})
   if runtimeOK and #runtimeBins==#(base.groups or {}) and #runtimeBins>0 then
-    local runtimeMeta=("cache/pokemon/%d/runtime_mesh_v1/base.lua"):format(dex)
+    local runtimeMeta=cacheRoot.."/runtime_mesh_v1/base.lua"
     write(mod,runtimeMeta,cacheLua(stem,dex,base,texturePaths,clip,clipCount or 0,spacing,attached,sourceName,decodeMode,actionRefs,runtimeBins,stamp),generated)
     runtimePaths[#runtimePaths+1]=runtimeMeta
     trail[#trail+1]="runtime mesh sidecar: READY (direct float32 upload)"
@@ -1386,7 +1504,7 @@ function P.extractSpecies(mod,disc,dex,opts)
   -- Written LAST, after every other artifact for this species has landed. A
   -- crash mid-extract therefore leaves an unstamped cache, which isCached
   -- rejects -- so a half-written species rebuilds instead of rendering broken.
-  local revPath=P.revPath(dex)
+  local revPath=P.revPath(cacheKey)
   write(mod,revPath,stamp,generated)
 
   local written={cachePath,diagPath,revPath}
@@ -1397,7 +1515,7 @@ function P.extractSpecies(mod,disc,dex,opts)
   for _,tp in pairs(texturePaths) do
     if tp and not seenTex[tp.path] then seenTex[tp.path]=true;written[#written+1]=tp.path end
   end
-  recordManifest(mod,dex,stem,written)
+  recordManifest(mod,dex,stem,written,variant)
 
   -- Companion to the flight-recorder write at the top of this function: if
   -- _last_attempt.txt names this dex but this line never got appended, the
@@ -1440,4 +1558,23 @@ function P.prefetch(mod,disc,list,progress,generated)
   return {cached=done,failed=failed,total=#(list or {})}
 end
 
+-- Narrow pure helpers for regression tests; production callers use the
+-- extractor entry points above.
+P._test={normalizedVertexRow=normalizedVertexRow,denseActionIntervals=denseReactionIntervals}
+
+function P.extractSpecies(mod,disc,dex,opts)
+  opts=opts or {}
+  local key=contextKey();local previous=extractionContexts[key]
+  extractionContexts[key]={skinFix=opts.skinFix~=false,renderPassFilter=opts.renderPassFilter~=false,
+    checkpoint=opts.checkpoint or opts.progress,decodeSession={}}
+  local ok,result,why=pcall(extractSpeciesImpl,mod,disc,dex,opts)
+  extractionContexts[key]=previous
+  if not ok then error(result,0) end
+  return result,why
+end
+P._test=P._test or {}
+P._test.recordManifest=recordManifest
+P._test.decodeBest=decodeBest
+P._test.packedVerticesLua=packedVerticesLua
+P._test.normalizedVertexRow=normalizedVertexRow
 return P

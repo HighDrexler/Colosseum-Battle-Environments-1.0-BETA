@@ -1,5 +1,5 @@
 local mod=...
-local VERSION="1.8.4-capture-member-hsd.1"
+local VERSION="2.0"
 mod.exports.version=VERSION
 
 local function package(path,arg)
@@ -16,6 +16,7 @@ end
 local NativeLauncherCompat=package("lib/NativeLauncherCompat.lua")
 local launcherCompat=NativeLauncherCompat.install(mod)
 local BuildProgressUI=package("lib/BuildProgressUI.lua")
+local AudioFidelity=package("lib/AudioFidelity.lua")
 
 local function platformOS()
   if love and love.system and type(love.system.getOS)=="function" then
@@ -60,15 +61,17 @@ local function runBuild()
   local GameCubeDisc=package("extract/GameCubeDisc.lua")
   local FSYS=package("extract/FSYS.lua")
   local HSD=package("extract/HSD.lua",{GXTexture=GXTexture})
-  local ArenaBuilder=package("extract/ArenaBuilder.lua",{HSD=HSD,FSYS=FSYS})
+  local ArenaBuilder=package("extract/ArenaBuilder.lua",{HSD=HSD,FSYS=FSYS,
+    ArenaAudienceProfile=package("lib/ArenaAudienceProfile.lua"),ArenaCacheIdentity=package("lib/ArenaCacheIdentity.lua")})
   local TransitionBuilder=package("extract/TransitionBuilder.lua")
   local PortableMusyX=package("extract/PortableMusyX.lua")
-  local AudioProbe=package("extract/AudioProbe.lua",{FSYS=FSYS,PortableMusyX=PortableMusyX})
+  local AudioProbe=package("extract/AudioProbe.lua",{FSYS=FSYS,PortableMusyX=PortableMusyX,AudioFidelity=AudioFidelity})
   local WazaSfxBuilder=package("extract/WazaSfxBuilder.lua",{FSYS=FSYS,PortableMusyX=PortableMusyX})
   local TrainerExtractor=package("extract/TrainerExtractor.lua",{HSD=HSD,FSYS=FSYS})
   local ColosseumDex=package("lib/ColosseumDex.lua")
-  local PKXMetadata=package("extract/PKXMetadata.lua",{FSYS=FSYS,ColosseumDex=ColosseumDex})
-  local PokemonExtractor=package("extract/PokemonExtractor.lua",{HSD=HSD,FSYS=FSYS,ColosseumDex=ColosseumDex,PKXMetadata=PKXMetadata})
+  local ShinySupport=package("lib/ShinySupport.lua")
+  local PKXMetadata=package("extract/PKXMetadata.lua",{FSYS=FSYS,ColosseumDex=ColosseumDex,ShinySupport=ShinySupport})
+  local PokemonExtractor=package("extract/PokemonExtractor.lua",{HSD=HSD,FSYS=FSYS,ColosseumDex=ColosseumDex,PKXMetadata=PKXMetadata,ShinySupport=ShinySupport})
   local WazaSequenceExtractor=package("extract/WazaSequenceExtractor.lua")
   local MoveFXExtractor=package("extract/MoveFXExtractor.lua",{FSYS=FSYS,GXTexture=GXTexture,HSD=HSD,WazaSequenceExtractor=WazaSequenceExtractor})
   local FormatProbe=package("extract/FormatProbe.lua",{FSYS=FSYS,HSD=HSD,WazaSequenceExtractor=WazaSequenceExtractor})
@@ -76,7 +79,16 @@ local function runBuild()
   PokemonExtractorRef=PokemonExtractor
   PKXMetadataRef=PKXMetadata
   MoveFXExtractorRef=MoveFXExtractor
-  openColosseumDisc=function() return GameCubeDisc.open(mod) end
+  -- Hold only the validated FST index, never the full disc bytes. Re-opening
+  -- the same installation import for every species/metadata request reparsed
+  -- this immutable index repeatedly. A rebuild/reload creates a new closure.
+  local residentDisc=nil
+  openColosseumDisc=function()
+    if residentDisc then return residentDisc end
+    local disc,why=GameCubeDisc.open(mod)
+    if disc then residentDisc=disc end
+    return disc,why
+  end
   local BuildPipeline=package("extract/BuildPipeline.lua",{
     GameCubeDisc=GameCubeDisc,FSYS=FSYS,GXTexture=GXTexture,HSD=HSD,
     ArenaBuilder=ArenaBuilder,TrainerExtractor=TrainerExtractor,
@@ -85,6 +97,13 @@ local function runBuild()
     LauncherCompat=launcherCompat,BuildVersion=VERSION,PlatformOS=PLATFORM_OS,
   })
   BuildPipelineRef=BuildPipeline
+  local CueBuilder=package("extract/BattleAudioBuilder.lua",{FSYS=FSYS,PortableMusyX=PortableMusyX,
+    BattleAudioSpec=package("lib/BattleAudioSpec.lua"),AudioFidelity=AudioFidelity})
+  local FidelityBuilder=package("extract/AudioFidelityBuilder.lua",{FSYS=FSYS,PortableMusyX=PortableMusyX,
+    AudioProbe=AudioProbe,BattleAudioSpec=package("lib/BattleAudioSpec.lua"),BattleAudioBuilder=CueBuilder,AudioFidelity=AudioFidelity})
+  -- Recover interrupted pair/metadata writes before the normal cache gate can
+  -- inspect or acquire any WAV. A failed recovery is not advertised as ready.
+  FidelityBuilder.recover(mod)
   extractionStatus={state="RUNNING",visualReady=false,audioReady=false,message="Starting GC6E01 source build."}
   local okPipeline,result=pcall(BuildPipeline.run,mod,function(label,current,total)
     extractionStatus.state="RUNNING";extractionStatus.message=tostring(label);extractionStatus.current=current;extractionStatus.total=total
@@ -93,6 +112,28 @@ local function runBuild()
   end)
   if not okPipeline then error(result,0) end
   extractionStatus=result or extractionStatus
+  if extractionStatus.audioReady==true then
+    local okCues,cues=pcall(CueBuilder.run,mod,openColosseumDisc,function(label,current,total)
+      BuildProgressUI.update(label,current,total)
+    end)
+    extractionStatus.battleAudio=okCues and cues or {ready=false,error=tostring(cues)}
+    if not(okCues and cues.ready) and mod.log and mod.log.warn then
+      pcall(mod.log.warn,mod.log,"CBE battle cue preparation incomplete; unavailable cues retain native audio. Existing caches preserved.")
+    end
+  end
+  if extractionStatus.audioReady==true and AudioFidelity.pending(mod) then
+    local okFidelity,result=pcall(FidelityBuilder.run,mod,openColosseumDisc,function(label,current,total)
+      BuildProgressUI.update(label,current,total)
+    end)
+    extractionStatus.audioFidelity=okFidelity and result or {ready=false,error=tostring(result)}
+    -- Optional quality work never discards the known-playable soundtrack. If
+    -- storage also prevented rollback, do not let runtime acquire partial data.
+    if not okFidelity then FidelityBuilder.recover(mod) end
+    if okFidelity and result.recoveryRequired then error(result.error,0) end
+    if not(okFidelity and result.ready) and mod.log and mod.log.warn then
+      pcall(mod.log.warn,mod.log,"Audio fidelity update incomplete; committed tracks retained. See build/audio_fidelity_v1/status.txt")
+    end
+  end
   BuildProgressUI.finish(extractionStatus.state,extractionStatus.message)
   if extractionStatus.state=="FAILED" and mod.log and mod.log.error then pcall(mod.log.error,mod.log,"CBE source build failed: %s",tostring(extractionStatus.message))
   elseif mod.log and mod.log.info then pcall(mod.log.info,mod.log,"CBE source build: %s",tostring(extractionStatus.state)) end
@@ -104,10 +145,12 @@ if not okBuild then
   if mod.cache then pcall(mod.cache.write,mod.cache,"build/error.txt",tostring(buildErr).."\n") end
 end
 
--- Visual cache is the hard runtime boundary. Colosseum music is optional: an
--- unsupported converter or failed audio cache must never withhold the arena,
--- actors, trainers, MoveFX, transitions or information-model surfaces.
-while sourceImported and extractionStatus.visualReady~=true do
+-- Source presentation is one contract. A CBE runtime may not advertise itself
+-- as ready while its GC6E01 soundtrack cache is absent or incomplete: doing so
+-- silently swaps Colosseum music for host-game audio and makes fidelity depend
+-- on platform/cache history. Visual caches survive an audio failure, but CBE
+-- remains behind the startup retry gate until both halves are complete.
+while sourceImported and (extractionStatus.visualReady~=true or extractionStatus.audioReady~=true) do
   local action=BuildProgressUI.failureGate(extractionStatus.state,extractionStatus.message,extractionStatus.trainerFirstError,extractionStatus.trainerSourceError)
   if action=="retry" then
     local okRetry,retryErr=pcall(runBuild)
@@ -122,7 +165,7 @@ while sourceImported and extractionStatus.visualReady~=true do
   end
 end
 
-local runtimeAllowed=extractionStatus.visualReady==true
+local runtimeAllowed=extractionStatus.visualReady==true and extractionStatus.audioReady==true
 
 local function module(name,arg)
   return package("lib/"..name..".lua",arg)
@@ -137,7 +180,10 @@ end
 local Mat4=module("Mat4");namespace.Mat4=Mat4
 local GeneratedAssets=loadModule("GeneratedAssets")
 local RuntimeMeshCache=loadModule("RuntimeMeshCache")
+loadModule("WorkBudget")
+loadModule("FrameWork")
 namespace.MoveFXExtractor=MoveFXExtractorRef
+loadModule("WazaPhasePolicy")
 local MoveFXVM=loadModule("MoveFXVM")
 local WazaSequenceRuntime=loadModule("WazaSequenceRuntime")
 local GenerationCompat=loadModule("GenerationCompat")
@@ -146,6 +192,8 @@ local TrainerRig=loadModule("TrainerRig")
 local TrainerMorph=loadModule("TrainerMorph")
 local TrainerPerformance=loadModule("TrainerPerformance")
 local BattleSides=loadModule("BattleSides")
+local FreeLookCamera=loadModule("FreeLookCamera")
+local BattleAutoProgress=loadModule("BattleAutoProgress")
 local BattleDirector=loadModule("BattleDirector")
 local ModLookup=loadModule("ModLookup")
 local TrainerRoster=loadModule("TrainerRoster")
@@ -154,28 +202,61 @@ local PlayerTrainer=loadModule("PlayerTrainer")
 local NativeTrainerSprites=loadModule("NativeTrainerSprites")
 local MoveFXOwnership=loadModule("MoveFXOwnership")
 local ArenaCatalog=loadModule("ArenaCatalog")
+local ArenaAudienceProfile=loadModule("ArenaAudienceProfile")
+local ArenaCacheIdentity=loadModule("ArenaCacheIdentity")
 local BattleArtBridge=loadModule("BattleArtBridge")
+loadModule("ShinySupport")
+loadModule("ModelIdentity")
 local CurrentSpriteModels=loadModule("CurrentSpriteModels")
 loadModule("ColosseumDex")
 local PokemonActors=loadModule("PokemonActors")
+local RelicPresentation=loadModule("RelicPresentation")
 local Arena=loadModule("Arena")
 local Camera=loadModule("Camera")
 local Music=loadModule("Music")
+loadModule("BattleAudioSpec")
+local BattleAudio=loadModule("BattleAudio")
 local WazaAudioRuntime=loadModule("WazaAudioRuntime")
 local WazaHandlers=loadModule("WazaHandlers")
 local BattleMenuUI=loadModule("BattleMenuUI")
 local CacheManager=loadModule("CacheManager")
 local BattleSettings=loadModule("BattleSettings")
+loadModule("AbilityData")
+local Abilities=loadModule("Abilities")
+loadModule("AbilityWeather")
+local AbilityEffectsGen1=loadModule("AbilityEffectsGen1")
+local AbilityEffectsGen2=loadModule("AbilityEffectsGen2")
+local AbilityLifecycle=loadModule("AbilityLifecycle")
 local Transition=loadModule("Transition")
 local StandaloneHost=loadModule("StandaloneHost")
 local StadiumBridge=loadModule("StadiumBridge")
+local ResidentPrewarm=loadModule("ResidentPrewarm")
 local BattleRuntime=loadModule("BattleRuntime")
+namespace.DoublesCore=module("doubles/Core",namespace)
+namespace.DoublesItems=module("doubles/Items",namespace)
+namespace.DoublesNativeAdapter=module("doubles/NativeAdapter",namespace)
+namespace.DoublesMovePresentation=module("doubles/MovePresentation",namespace)
+namespace.ReleasePresentation=module("doubles/ReleasePresentation",namespace)
+namespace.DoublesCamera=module("doubles/CameraDirector",namespace)
+namespace.DoublesPresenter=module("doubles/Presenter",namespace)
+namespace.DoublesRuntime=module("doubles/Runtime",namespace)
+namespace.BossIntro=module("BossIntro",namespace)
+loadModule("QuickCachePlanner")
+loadModule("CacheScreen")
+local BattleCache=loadModule("BattleCache")
 
 local function installRuntime(force)
   StadiumBridge.install()
   Music.install(mod)
   Music.attachGame(mod.game)
-  BattleSettings.install(mod,Trainer,Music,ArenaCatalog,BattleMenuUI,CacheManager,TrainerRoster,GenerationCompat)
+  BattleAudio.install(mod)
+  BattleSettings.install(mod,Trainer,Music,ArenaCatalog,BattleMenuUI,CacheManager,TrainerRoster,GenerationCompat,AudioFidelity)
+  -- Never install both kernels through the launcher facade: Gen I denies
+  -- Gen II structs, while Gold's Gen I names may be presentation proxies.
+  local abilityGeneration=GenerationCompat.current()
+  if abilityGeneration==2 then AbilityEffectsGen2.installGlobal()
+  else AbilityEffectsGen1.installGlobal() end
+  AbilityLifecycle.install(mod,abilityGeneration)
   if ArenaCatalog.sync then ArenaCatalog.sync(mod.game) end
   Transition.install(mod)
   StandaloneHost.install(force)
@@ -209,9 +290,14 @@ local function installRuntime(force)
   MoveFXOwnership.install()
   if WazaHandlers and type(WazaHandlers.install)=="function" then WazaHandlers.install() end
   BattleRuntime.install()
+  namespace.DoublesRuntime.install()
+  BattleAutoProgress.install()
+  namespace.BossIntro.install()
+  BattleCache.install()
 end
 
 if runtimeAllowed then
+  FreeLookCamera.install()
   NativeTrainerSprites.install()
   installRuntime(false)
   if mod.events and type(mod.events.on)=="function" then
@@ -225,96 +311,35 @@ if runtimeAllowed then
       local game=type(payload)=="table" and payload.game or nil
       if game then
         Music.attachGame(game)
+        BattleAudio.attachGame(game)
         if ArenaCatalog.sync then ArenaCatalog.sync(game) end
-        -- PERFORMANCE CACHE POLICY (1.7.10): all heavyweight materialization
-        -- happens at an explicit readiness seam, never in ordinary input.step.
-        -- On Android, AUTO holds exactly the two arenas it can resolve to
-        -- (Water trainer battles + Wildlands wild battles). Arena.lua also
-        -- writes compact float32 runtime mesh sidecars, so later sessions and
-        -- LRU reloads bypass the giant human-readable vertex Lua caches.
-        local warmCtx={game=game,battle=nil,phase="game-ready-prewarm",progress=1,services={cbeStandalone=true,androidResidentWarm=IS_ANDROID}}
-        local selected=ArenaCatalog and type(ArenaCatalog.selected)=="function" and ArenaCatalog.selected(game) or "auto"
-        if IS_ANDROID and Arena then
-          if selected=="auto" and type(Arena.prewarmAutoPair)=="function" then
-            pcall(Arena.prewarmAutoPair,Arena,warmCtx)
-          elseif selected=="random" and ArenaCatalog and type(ArenaCatalog.primeRandom)=="function" then
-            local okPrime,def=pcall(ArenaCatalog.primeRandom,game)
-            if okPrime and type(def)=="table" and type(Arena.prewarmDefinition)=="function" then
-              pcall(Arena.prewarmDefinition,Arena,warmCtx,def.id)
-            elseif type(Arena.prewarmResident)=="function" then
-              pcall(Arena.prewarmResident,Arena,warmCtx)
-            end
-          elseif type(Arena.prewarmDefinition)=="function" then
-            pcall(Arena.prewarmDefinition,Arena,warmCtx,selected)
-          elseif type(Arena.prewarmResident)=="function" then
-            pcall(Arena.prewarmResident,Arena,warmCtx)
-          end
-        elseif Arena and type(Arena.prewarm)=="function" then
-          pcall(Arena.prewarm,Arena,warmCtx)
+        if BattleRuntime.attachFrame then BattleRuntime.attachFrame(game) end
+        -- PERFORMANCE CACHE POLICY (1.9.16): game.ready only queues work.
+        -- Arena/trainer/Pokemon uploads, framebuffer allocation, shader compile,
+        -- and MoveFX cache promotion share one paced stable-overworld scheduler.
+        -- This prevents multiple cache hits from becoming one giant GPU/disk/GC
+        -- wall at save load while still making the resident cache progressively
+        -- hotter before the user reaches the next battle or model-heavy UI.
+        if ResidentPrewarm and type(ResidentPrewarm.queueStartup)=="function" then
+          pcall(ResidentPrewarm.queueStartup,game)
         end
 
-        -- Allocate the bounded Android battle framebuffer once at game-ready.
-        -- Arena geometry was already resident in 1.7.9, but the first battle
-        -- could still pay a color/depth canvas allocation + driver setup on its
-        -- first CBE render. The mobile surface is capped by Arena.mobileCanvasSize
-        -- (~720p), so this is a modest fixed VRAM cost rather than a full native-
-        -- resolution phone framebuffer. Resize/orientation changes still rebuild
-        -- it lazily through ensureCanvas().
-        if IS_ANDROID and Arena and type(Arena.prewarmFramebuffer)=="function" then
-          pcall(Arena.prewarmFramebuffer,Arena)
-        end
-
-        -- Prime the player's authored trainer actor once at game-ready.
-        if PlayerTrainer and type(PlayerTrainer.prewarm)=="function" then pcall(PlayerTrainer.prewarm,PlayerTrainer,warmCtx) end
-
-        -- TrainerRoster's game-ready plan is intentionally tiny (configured
-        -- rival + common/forced enemy). Drain it here rather than pacing it
-        -- through overworld input, where an upload can coincide with an
-        -- encounter and prevent the transition from drawing.
-        if IS_ANDROID and Trainer and type(Trainer.queuePrewarm)=="function" then
-          pcall(Trainer.queuePrewarm,Trainer,game)
-          if type(Trainer.drainPrewarm)=="function" then pcall(Trainer.drainPrewarm,Trainer,game,2)
-          elseif type(Trainer.pumpPrewarm)=="function" then pcall(Trainer.pumpPrewarm,Trainer,game) end
-        end
-        if CurrentSpriteModels and type(CurrentSpriteModels.prewarm)=="function" then
-          pcall(CurrentSpriteModels.prewarm,CurrentSpriteModels)
-        end
-        if WazaHandlers and type(WazaHandlers.prewarm)=="function" then
-          pcall(WazaHandlers.prewarm)
-        end
-
-        -- Materialize ALL already-extracted party base bodies now, but do not
-        -- start any new Pokemon extraction and do not upload native action
-        -- banks. Runtime binary sidecars make this bounded and much cheaper
-        -- than the old full prewarmParty path.
-        if IS_ANDROID and PokemonActors and type(PokemonActors.prewarmPartyBase)=="function" then
-          pcall(PokemonActors.prewarmPartyBase,game)
-        elseif PokemonActors and type(PokemonActors.prewarmParty)=="function" then
-          pcall(PokemonActors.prewarmParty,game)
-        end
-
-        if MoveFXExtractorRef and type(MoveFXExtractorRef.queueParty)=="function" then
-          -- 1.7.11's generated cache already contains every Gen-I/II WZX bank,
-          -- so resolving all six party movesets here is cache-only work: no
-          -- GameCube image access and no GPU upload. This removes first-use
-          -- effect metadata stalls later in battle while models/audio themselves
-          -- remain bounded/lazy. Older/incomplete caches still only QUEUE misses.
-          pcall(MoveFXExtractorRef.queueParty,game,6)
-          if type(MoveFXExtractorRef.pumpPrefetch)=="function" then pcall(MoveFXExtractorRef.pumpPrefetch,IS_ANDROID and 2 or 4) end
-        end
         if IS_ANDROID and mod.log and mod.log.info then
-          pcall(mod.log.info,mod.log,"CBE Android performance-polish policy active: state-change guard + resident working sets + runtime mesh sidecars + preallocated mobile framebuffer")
+          pcall(mod.log.info,mod.log,"CBE Android performance-polish policy active: state-change guard + single paced resident-warm queue + runtime mesh sidecars + deferred mobile framebuffer")
         end
       end
     end)
   end
 elseif mod.log and mod.log.warn then
-  pcall(mod.log.warn,mod.log,"CBE runtime withheld because generated visual cache is not ready (%s)",tostring(cacheGateOutcome or extractionStatus.state))
+  pcall(mod.log.warn,mod.log,"CBE runtime withheld because required generated visual/audio cache is not ready (%s)",tostring(cacheGateOutcome or extractionStatus.state))
 end
 
 -- Regenerate build/format_probe.txt on demand. The probe is otherwise written
 -- once, on the first build that has it; this re-runs it without touching any
 -- generated cache, so the WZX/CAM report can be refreshed at will.
+mod.exports.battleAudioStatus=function() return BattleAudio.status() end
+mod.exports.audioFidelityStatus=function() return AudioFidelity.status(mod) end
+
 mod.exports.probeFormats=function()
   if not BuildPipelineRef then return false,"build pipeline unavailable (source not imported?)" end
   local ok,result,note=pcall(BuildPipelineRef.ensureFormatProbe,mod,nil,true)
@@ -364,7 +389,7 @@ end
 mod.exports.status=function()
   local stadium=StadiumBridge.status()
   return {version=VERSION,registered=stadium.registered,stadiumDelegated=stadium.delegated,arenaProviderId=stadium.arenaProviderId,cameraProviderId=stadium.cameraProviderId,stadium=stadium,
-    runtime=BattleRuntime.status(),battleDirector=BattleDirector:status(),trainerRig=TrainerRig:status(),trainerPerformance=TrainerPerformance.status(),trainerRoster=TrainerRoster:status(),arena=Arena:status(),arenaCatalog=ArenaCatalog.status(mod.game,nil),trainer=Trainer:status(),playerTrainer=PlayerTrainer:status(),camera=Camera:status(),music=Music.status(),settings=BattleSettings.status(mod.game),cache=CacheManager.status(),extraction=extractionStatus,launcherImport=launcherCompat,battleMenuUI=BattleMenuUI.status(),transition=Transition.status(),nativeTrainerSprites=NativeTrainerSprites.status(),moveFxOwnership=MoveFXOwnership.status(),moveFxExtractor=MoveFXExtractorRef and MoveFXExtractorRef.status and MoveFXExtractorRef.status() or nil,moveFxVM={version=MoveFXVM.version,source=MoveFXVM.source},wazaSequenceRuntime=WazaSequenceRuntime and WazaSequenceRuntime.status and WazaSequenceRuntime:status() or nil,wazaHandlers=WazaHandlers and WazaHandlers.status and WazaHandlers.status() or nil,wazaAudio=WazaAudioRuntime and WazaAudioRuntime.status and WazaAudioRuntime:status() or nil,standaloneHost=StandaloneHost.status(),battleArtBridge=BattleArtBridge.status(),currentSpriteModels=CurrentSpriteModels.status(),pokemonActors=PokemonActors.status(),cacheGate={runtimeAllowed=runtimeAllowed,outcome=cacheGateOutcome}}
+    runtime=BattleRuntime.status(),doubles=namespace.DoublesRuntime.service.status(),battleDirector=BattleDirector:status(),trainerRig=TrainerRig:status(),trainerPerformance=TrainerPerformance.status(),trainerRoster=TrainerRoster:status(),arena=Arena:status(),arenaCatalog=ArenaCatalog.status(mod.game,nil),trainer=Trainer:status(),playerTrainer=PlayerTrainer:status(),camera=Camera:status(),music=Music.status(),settings=BattleSettings.status(mod.game),cache=CacheManager.status(),extraction=extractionStatus,launcherImport=launcherCompat,battleMenuUI=BattleMenuUI.status(),transition=Transition.status(),nativeTrainerSprites=NativeTrainerSprites.status(),moveFxOwnership=MoveFXOwnership.status(),moveFxExtractor=MoveFXExtractorRef and MoveFXExtractorRef.status and MoveFXExtractorRef.status() or nil,moveFxVM={version=MoveFXVM.version,source=MoveFXVM.source},wazaSequenceRuntime=WazaSequenceRuntime and WazaSequenceRuntime.status and WazaSequenceRuntime:status() or nil,wazaHandlers=WazaHandlers and WazaHandlers.status and WazaHandlers.status() or nil,wazaAudio=WazaAudioRuntime and WazaAudioRuntime.status and WazaAudioRuntime:status() or nil,standaloneHost=StandaloneHost.status(),battleArtBridge=BattleArtBridge.status(),currentSpriteModels=CurrentSpriteModels.status(),pokemonActors=PokemonActors.status(),residentPrewarm=ResidentPrewarm and ResidentPrewarm.status and ResidentPrewarm.status() or nil,cacheGate={runtimeAllowed=runtimeAllowed,outcome=cacheGateOutcome}}
 end
 mod.exports.battleCompatibility={
   version=1,
@@ -391,15 +416,45 @@ local function cbeInformationContext(request)
     apiVersion=1,game=game,battle=nil,
     sides={player={battler=battler},enemy={battler=nil}},
     phase="information",progress=1,groundY=0,
-    services={cbeStandalone=true,informationSurface=true},
+    services={cbeStandalone=true,informationSurface=true,informationAnimation=true},
   }
   if not enabled then return nil,"cbe-pokemon-models-disabled",context end
   return context,nil
 end
 
+-- Species-level (Pokedex dossier) and per-mon (Summary, in or out of
+-- battle) ability resolution, usable whether or not a battle is active.
+-- Read-only assignment. Runtime copies such as Trace are battle-local, and
+-- inspecting Summary/PC/Pokedex never writes ability fields into saved Pokemon.
+mod.exports.abilities={
+  version=1,
+  enabled=function() return Abilities.enabled(mod.game) end,
+  speciesLabel=function(dex) return Abilities.speciesLabel(dex) end,
+  nameFor=function(id) return Abilities.displayName(id) end,
+  resolve=function(mon,def)
+    if not mon then return nil end
+    return Abilities.ensure(mon, Abilities.dexOf(mon,def))
+  end,
+}
+
+mod.exports.battleCache={version=4,status=function()return BattleCache.status()end,
+  -- Legacy prepare remains the explicit exhaustive API; new callers can select
+  -- a startup-only pass or open the user's choice screen without baking.
+  prepare=function(game)return BattleCache.openMenu(game or mod.game)end,
+  prepareStartup=function(game)return BattleCache.requestStartup(game or mod.game)end,
+  prepareQuick=function(game)return BattleCache.openQuick(game or mod.game)end,
+  prepareFull=function(game)return BattleCache.openFull(game or mod.game)end,
+  openMenu=function(game)return BattleCache.openMenu(game or mod.game)end}
 mod.exports.informationModels={
-  version=3,
+  version=7,
+  selected=function(_,request)
+    return BattleCache.enabled(request and request.game or mod.game)
+  end,
   resolve=function(_,request)
+    if not runtimeAllowed then return nil,"cbe-runtime-unavailable" end
+    return CurrentSpriteModels.informationActorProvider(request)
+  end,
+  resolveSelected=function(_,request)
     if not runtimeAllowed then return nil,"cbe-runtime-unavailable" end
     return CurrentSpriteModels.informationActorProvider(request)
   end,
@@ -425,10 +480,66 @@ mod.exports.informationModels={
       apiVersion=1,game=game,battle=nil,
       sides={player={battler=battler},enemy={battler=nil}},
       phase="information",progress=1,groundY=0,
-      services={cbeStandalone=true,informationSurface=true,showroom=true},
+      services={cbeStandalone=true,informationSurface=true,informationAnimation=true,showroom=true},
     }
     return PokemonActors.service,"cbe:colosseum-pokemon",context,mod.id
+  end,
+  -- UI/CBE cooperative performance seam. These calls do no rendering and do
+  -- not mutate gameplay. touchViewer temporarily prevents unrelated resident
+  -- jobs from colliding with a model-heavy menu. requestResident queues the
+  -- exact selected model/variant, including a first-use source-backed shiny,
+  -- in cooperative slices while the viewer is open. Unstarted, superseded
+  -- PC/Pokedex requests are pruned; active source work finishes safely.
+  touchViewer=function(_,seconds,reason)
+    if not runtimeAllowed or not (ResidentPrewarm and type(ResidentPrewarm.touchViewer)=="function") then return false end
+    return ResidentPrewarm.touchViewer(seconds,reason)
+  end,
+  requestResident=function(_,request)
+    if not runtimeAllowed then return false,"cbe-runtime-unavailable" end
+    request=type(request)=="table" and request or {}
+    local game=request.game or mod.game
+    local mon=request.mon or request.pokemon
+    local battler=request.battler
+    if type(battler)~="table" and type(mon)=="table" then battler=mon end
+    if not (ResidentPrewarm and type(ResidentPrewarm.queueInformation)=="function") then
+      return false,"resident-prewarm-unavailable"
+    end
+    return ResidentPrewarm.queueInformation(game,battler,request.kind)
+  end,
+  workStatus=function(_,request)
+    request=request or {}
+    return PokemonActors.informationWorkStatus(request.game or mod.game,request.mon or request.battler)
+  end,
+  warmStatus=function(_,request)
+    request=type(request)=="table" and request or {}
+    local game=request.game or mod.game
+    local mon=request.mon or request.pokemon
+    local battler=request.battler
+    if type(battler)~="table" and type(mon)=="table" then battler=mon end
+    if PokemonActors and type(PokemonActors.informationWarmStatus)=="function" then
+      return PokemonActors.informationWarmStatus(game,battler)
+    end
+    return nil
+  end,
+  -- Explicit information-viewer animation gate. UI 2.3.4+ uses this instead
+  -- of mutating the actor table directly. This is showroom-only state and never
+  -- changes live battle animation timing or source action selection.
+  setAnimation=function(_,actor,enabled)
+    if type(actor)~="table" then return false end
+    actor.informationAnimation=enabled==true
+    if enabled then
+      actor._informationIdleNextCheck=nil
+    end
+    return true
   end,
 }
 
 mod.exports.controls={mouseOrbit="LMB DRAG",mouseDolly="RMB DRAG",mouseLens="SHIFT+RMB DRAG",mousePan="MMB DRAG",toggle="F8",orbitLeft="J",orbitRight="L",raise="I",lower="K",zoomIn="U",zoomOut="O",lensNarrow="N",lensWide="M",reset="HOME"}
+
+-- Additive active-free-look description. Legacy controls export is retained
+-- for old consumers; these mappings belong to FreeLookCamera rather than the
+-- disabled legacy orbit handler. No new combat keys are registered here.
+mod.exports.freeLookControls={version=2,setting="FREE LOOK CAMERA",mouseOrbit="RMB DRAG",
+  mouseDolly="WHEEL / SHIFT+RMB DRAG",mousePan="MMB DRAG",touchOrbit="ONE-FINGER DRAG",
+  touchDolly="PINCH",touchPan="TWO-FINGER DRAG",reset="HOME",doublesPersistent=true,
+  ownership="additive-to-live-cinematic",gestureRegion="CENTRAL ARENA"}

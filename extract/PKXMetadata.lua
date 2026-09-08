@@ -1,6 +1,6 @@
 local V=...
 local FSYS,Dex=V.FSYS,V.ColosseumDex
-local P={version=1}
+local P={version=4}
 
 -- Additive reader for the Colosseum PKX wrapper. This deliberately does not
 -- participate in HSD model/root/material extraction. It reads only the battle
@@ -15,10 +15,10 @@ local BODY_KEYS={
 }
 
 local SLOT_KEYS={
-  [0]="idle",[1]="statusA",[2]="physicalA",[3]="physicalB",
-  [4]="physicalC",[5]="physicalD",[6]="statusB",[7]="physicalE",
-  [8]="damage",[9]="damageHeavy",[10]="faint",[11]="idleB",
-  [12]="specialC",[13]="idleC",[14]="idleD",[15]="idleE",[16]="takeFlight",
+  [0]="idle",[1]="specialA",[2]="physicalA",[3]="physicalB",
+  [4]="physicalC",[5]="physicalD",[6]="specialB",[7]="physicalE",
+  [8]="damage",[9]="damageHeavy",[10]="faint",[11]="extra1",
+  [12]="specialC",[13]="extra2",[14]="extra3",[15]="extra4",[16]="takeFlight",
 }
 
 local function u16(s,o)
@@ -58,8 +58,9 @@ local function parseSlot(blob,offset,index)
       motionType=motion,animationIndex=animation,active=motion==0,
     }
   end
+  slot.active=false
   for _,sub in ipairs(slot.subAnimations) do
-    if sub.active then slot.animationIndex=sub.animationIndex;break end
+    if sub.active then slot.active=true;slot.animationIndex=sub.animationIndex;break end
   end
   if slot.animationIndex==nil and slot.subAnimations[1] then
     slot.animationIndex=slot.subAnimations[1].animationIndex
@@ -90,6 +91,7 @@ function P.parse(blob)
     animationSlotCount=count,metadataOffset=metadataOffset,
     particleOrientation=s32(blob,0x0C) or 0,
     slots={},slotsByIndex={},bodyMap={},bodyKeys=BODY_KEYS,
+    shinyFilter=V.ShinySupport and V.ShinySupport.parseFilter(blob,metadataOffset+count*0xD0) or nil,
   }
   for i=0,count-1 do
     local slot=parseSlot(blob,metadataOffset+i*0xD0,i)
@@ -100,7 +102,7 @@ function P.parse(blob)
   return out
 end
 
-function P.inspectSpecies(disc,dex,variant,unownForm)
+function P.inspectSpecies(disc,dex,variant,unownForm,opts)
   if not (disc and FSYS and Dex) then return nil,"PKX metadata source unavailable" end
   local archiveName,stem=Dex.archive(dex,variant,unownForm)
   if not archiveName then return nil,stem end
@@ -111,7 +113,7 @@ function P.inspectSpecies(disc,dex,variant,unownForm)
   local entries=arc:modelEntries()
   local entry=entries[1] or arc:list()[1]
   if not entry then return nil,"PKX archive has no member" end
-  local okBlob,blob=pcall(arc.extract,arc,entry,{maxOutput=48*1024*1024})
+  local okBlob,blob=pcall(arc.extract,arc,entry,{maxOutput=48*1024*1024,progress=opts and opts.progress})
   if not okBlob or type(blob)~="string" then return nil,"PKX extract failed: "..tostring(blob) end
   local metadata,err=P.parse(blob)
   if metadata then

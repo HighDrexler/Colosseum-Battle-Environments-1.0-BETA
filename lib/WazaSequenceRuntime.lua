@@ -1,8 +1,8 @@
 local V=...
 local MoveFXVM=V and V.MoveFXVM
 local W={
-  version=6,
-  source="GC6E01 exact-node-offset dependency-timed 60 Hz Waza lifecycle scheduler",
+  version=9,
+  source="GC6E01 retail-node-layout dependency-timed 60 Hz Waza lifecycle scheduler",
   handlers={},active={},serial=0,trace={},errors={},last=nil,
 }
 
@@ -13,7 +13,7 @@ local MAX_ERRORS=64
 
 local function roleForPhase(phase)
   phase=tostring(phase or "all"):lower()
-  if phase=="damage" or phase=="status" then return "damage" end
+  if phase:match("^damage") or phase=="status" then return "damage" end
   return "attack"
 end
 
@@ -27,6 +27,7 @@ local function pushError(row)
 end
 
 local function phaseEntries(spec,role)
+  if V and V.WazaPhasePolicy then spec=V.WazaPhasePolicy.select(spec) end
   local out={}
   local runtimePhase=0
   for _,phase in ipairs(type(spec)=="table" and (spec.wazaPhases or {}) or {}) do
@@ -38,10 +39,9 @@ local function phaseEntries(spec,role)
         for k,v in pairs(entry) do copy[k]=v end
         copy.phase=copy.phase or phase.name
         copy.rawPath=copy.rawPath or phase.rawPath
-        -- WZX entry identifiers are local to each source phase. Curated moves
-        -- can legitimately layer attack + sp1 (Ember is one), so timing anchors
-        -- must be namespaced for the scheduler while the original identifier is
-        -- preserved for GPT1/model handler matching and diagnostics.
+        -- WZX entry identifiers are local to each selected source phase. Keep
+        -- scheduler anchors namespaced and preserve the original identifier
+        -- for GPT1/model handler matching and diagnostics.
         local sourceId=tonumber(copy.identifier) or tonumber(copy.index) or (#out+1)
         local sourceAnchor=math.floor(tonumber(copy.anchorEntry) or 0)
         copy.runtimeIdentifier=namespace+sourceId
@@ -88,50 +88,72 @@ local function globalPoint(points,index)
   index=pointIndex(index)
   if index==nil then return nil end
   local v=type(points)=="table" and tonumber(points[index+1]) or nil
+  if v==nil and index==0 then return 0 end
   if not v or v < -0x100000 or v > 0x100000 then return nil end
   return math.floor(v+.0)
 end
 
 -- Retail loadTotalSequence/wazaSequence timing model, reconstructed from
 -- GC6E01 main.dol. Each source row chooses a local timing point and either a
--- prior SequenceEntry+point or the active Pokemon/Waza global timing point.
+-- another SequenceEntry+point or the active Pokemon/Waza global timing point.
 -- Colosseum then shifts the entire sequence if any row would begin negative.
 local function resolveEntryStarts(entries,globalTimingPoints)
-  local byId={}; local rows={}; local unresolved=0; local minStart=math.huge; local maxStart=0
+  local byId={}; local rows={}; local unresolved=0; local details={};local minStart=math.huge; local maxStart=0
   for _,entry in ipairs(entries or {}) do
     local id=tonumber(entry.runtimeIdentifier) or tonumber(entry.identifier) or tonumber(entry.index) or (#rows+1)
     local anchor=math.floor(tonumber(entry.runtimeAnchorEntry) or tonumber(entry.anchorEntry) or 0)
     local localIdx=pointIndex(entry.localPoint)
     local anchorIdx=pointIndex(entry.anchorPoint)
     local localValue=entryPoint(entry,localIdx) or 0
-    local start,source,fallback
+    local row={entry=entry,id=id,anchor=anchor,localIdx=localIdx,anchorIdx=anchorIdx,localValue=localValue,
+      localPoint=localIdx,anchorPoint=anchorIdx,anchorEntry=anchor}
+    rows[#rows+1]=row
+    if byId[id] then
+      row.timingFallback="duplicate-entry-identifier"
+    else byId[id]=row end
+  end
 
-    if anchor>0 and byId[anchor] then
-      local ref=byId[anchor]
-      local refPoint=entryPoint(ref.entry,anchorIdx)
-      if refPoint==nil then refPoint=0;fallback="missing-anchor-entry-point" end
-      start=(ref.startFrame or 0)+refPoint-localValue
-      source="entry"
-    else
-      local gp=globalPoint(globalTimingPoints,anchorIdx)
+  -- Resolve the complete dependency graph instead of assuming an anchor always
+  -- appears earlier in serialized order. Forward links occur in valid authored
+  -- sequences; treating them as a missing anchor shifts the visible impact.
+  local function resolve(row)
+    if row.resolved then return true end
+    if row.resolving then return false,"cyclic-anchor-entry" end
+    row.resolving=true
+    local start,source,fallback
+    if row.timingFallback then fallback=row.timingFallback end
+    if not fallback and row.anchor>0 then
+      local ref=byId[row.anchor]
+      if ref and ref~=row then
+        local ok,why=resolve(ref)
+        local refPoint=entryPoint(ref.entry,row.anchorIdx)
+        if ok and refPoint~=nil then
+          start=(ref.startFrame or 0)+refPoint-row.localValue;source="entry"
+        else fallback=why or (refPoint==nil and "missing-anchor-entry-point" or "unresolved-anchor-entry") end
+      else fallback=(ref==row) and "cyclic-anchor-entry" or "missing-anchor-entry" end
+    end
+    if start==nil then
+      local gp=globalPoint(globalTimingPoints,row.anchorIdx)
       if gp==nil then
         -- Point zero is the Waza origin by definition. Other absent points are
         -- retained as an explicit fail-open timing fallback, never disguised as
         -- exact retail timing. Current PKX metadata supplies points 0..3.
-        gp=0
-        fallback=(anchor>0 and "missing-anchor-entry" or "missing-global-point")
+        gp=0;fallback=fallback or "missing-global-point"
       end
-      start=gp-localValue
-      source="global"
+      start=gp-row.localValue;source="global"
     end
+    row.startFrame=math.floor((tonumber(start) or 0)+.0);row.timingSource=source
+    row.timingFallback=fallback;row.resolving=nil;row.resolved=true
+    return fallback==nil,fallback
+  end
 
-    start=math.floor((tonumber(start) or 0)+.0)
-    local row={entry=entry,id=id,startFrame=start,timingSource=source,timingFallback=fallback,
-      localPoint=localIdx,anchorPoint=anchorIdx,anchorEntry=anchor,localValue=localValue}
-    rows[#rows+1]=row;byId[id]=row
-    if fallback then unresolved=unresolved+1 end
-    if start<minStart then minStart=start end
-    if start>maxStart then maxStart=start end
+  for _,row in ipairs(rows) do
+    resolve(row)
+    if row.timingFallback then
+      unresolved=unresolved+1;details[#details+1]={id=row.id,anchor=row.anchor,reason=row.timingFallback}
+    end
+    if row.startFrame<minStart then minStart=row.startFrame end
+    if row.startFrame>maxStart then maxStart=row.startFrame end
   end
 
   if minStart==math.huge then minStart=0 end
@@ -145,7 +167,7 @@ local function resolveEntryStarts(entries,globalTimingPoints)
     row.entry.timingFallback=row.timingFallback
     if row.startFrame>maxStart then maxStart=row.startFrame end
   end
-  return rows,{shift=shift,unresolved=unresolved,maxStart=maxStart,minUnshifted=minStart}
+  return rows,{shift=shift,unresolved=unresolved,unresolvedDetails=details,maxStart=maxStart,minUnshifted=minStart}
 end
 
 function W:registerHandler(kind,id,handler)
@@ -168,26 +190,57 @@ end
 
 function W:hasTimeline(spec,role)
   role=tostring(role or "attack")
-  return #phaseEntries(spec,role)>0
+  if #phaseEntries(spec,role)==0 then return false end
+  -- A parsed table is not a presentable timeline. Callers use this answer to
+  -- select Pokémon body motion and to suppress the native visual layer, so an
+  -- incomplete role must never masquerade as owned merely because rows exist.
+  local owns=self:canOwn(spec,role)
+  return owns==true
+end
+
+local function entryExecutable(spec,entry,role)
+  if type(entry)~="table" then return false,"missing entry" end
+  if entry.parseWarning then return false,"entry parse warning" end
+  if particleEntry(entry) then
+    local ok=MoveFXVM and type(MoveFXVM.hasEntry)=="function" and MoveFXVM.hasEntry(spec,entry,role)
+    return ok==true,"particle bank/generator unavailable"
+  end
+  if entry.kind=="model" then return type(entry.modelAsset)=="table" and entry.modelAsset.cache~=nil,"type-2 model unavailable" end
+  if entry.kind=="sound" then return true end
+  if entry.kind=="type1" then local n=tonumber(entry.subtype);return n~=nil and n>=0 and n<=3,"type-1 controller unsupported" end
+  if entry.kind=="type6" then return entry.controllerSupported==true,"type-6 controller unsupported" end
+  if entry.kind=="type4" then
+    if entry.effectSupported~=true or tonumber(entry.effectType)==nil or tonumber(entry.effectType)<0 or tonumber(entry.effectType)>12 then return false,"type-4 family unsupported" end
+    if entry.effectRequiredArtifact=="texture" and not (type(entry.effectTextureAsset)=="table" and entry.effectTextureAsset.path) then return false,"type-4 required source texture unavailable" end
+    if entry.effectRequiresModel and not (type(entry.effectModelAsset)=="table" and entry.effectModelAsset.cache) then return false,"type-4 embedded model unavailable" end
+    for _,artifact in ipairs(entry.effectAssets or entry.effectArtifacts or {}) do
+      if artifact.error or artifact.textureError or artifact.modelError then return false,"type-4 source artifact incomplete" end
+    end
+    return entry.effectRuntimeReady~=false,"type-4 runtime unavailable"
+  end
+  return false,"unknown Waza entry kind"
 end
 
 function W:canOwn(spec,role)
+  if V and V.WazaPhasePolicy then spec=V.WazaPhasePolicy.select(spec) end
   local roles=role and {tostring(role)} or {"attack","damage"}
+  local any=false
   for _,r in ipairs(roles) do
-    for _,entry in ipairs(phaseEntries(spec,r)) do
-      -- Particle ownership remains strict: the referenced GPT1 root must be
-      -- executable by the source bytecode VM. Type-2 effect models are now an
-      -- equally authoritative Waza presentation path once their HSD cache was
-      -- compiled successfully. This lets model-only / model-led source moves
-      -- suppress the native Game Boy visual layer without requiring a fake
-      -- particle root solely to pass the ownership gate.
-      if particleEntry(entry) and MoveFXVM and type(MoveFXVM.hasEntry)=="function"
-          and MoveFXVM.hasEntry(spec,entry,r) then return true end
-      if type(entry)=="table" and entry.kind=="model"
-          and type(entry.modelAsset)=="table" and entry.modelAsset.cache then return true end
+    local entries=phaseEntries(spec,r)
+    if #entries>0 then
+      any=true
+      for _,phase in ipairs(type(spec)=="table" and (spec.wazaPhases or {}) or {}) do
+        if roleForPhase(phase.name)==r and (phase.complete~=true or phase.parseError) then
+          return false,"incomplete Waza phase: "..tostring(phase.name or "?")
+        end
+      end
+      -- Ownership is now all-or-nothing for a source role.  A single decoded
+      -- particle is not enough to suppress the native layer if a companion
+      -- model/controller/TraceFX row would be silently dropped.
+      for _,entry in ipairs(entries) do local ok,why=entryExecutable(spec,entry,r);if not ok then return false,why end end
     end
   end
-  return false
+  return any
 end
 
 local function handlerRecords(entry)
@@ -281,14 +334,20 @@ local function fireDue(ctx,inst,frame)
       if any and not keep then closeState(ctx,inst,state,"entry-update-complete",false) end
     end
   end
+  if inst.stopRequested and not inst.done then
+    finishInstance(ctx or inst.ctx,inst,inst.stopReason or "source-controller-stop",false)
+  end
   return allStarted
 end
 
 function W:start(ctx,side,spec,opts)
+  if V and V.WazaPhasePolicy then spec=V.WazaPhasePolicy.select(spec) end
   opts=type(opts)=="table" and opts or {}
   local role=tostring(opts.role or "attack")
   local entries=phaseEntries(spec,role)
   if #entries==0 then return nil,"no WazaSequence entries for role" end
+  local owns,ownershipError=self:canOwn(spec,role)
+  if not owns and not opts.allowPartial then return nil,ownershipError or "Waza role is not fully executable" end
 
   if role=="attack" then
     for i=#self.active,1,-1 do
@@ -305,17 +364,24 @@ function W:start(ctx,side,spec,opts)
   end
 
   local resolved,timing=resolveEntryStarts(entries,opts.globalTimingPoints)
+  if (tonumber(timing.unresolved) or 0)>0 and not opts.allowPartial then
+    local err={kind="timing",role=role,moveId=opts.moveId,error="unresolved source timing dependency",details=timing.unresolvedDetails}
+    pushError(err)
+    return nil,err.error
+  end
   self.serial=self.serial+1
   local inst={
     serial=self.serial,ctx=ctx,side=side,target=opts.target or (side=="player" and "enemy" or "player"),
     role=role,spec=spec,moveId=opts.moveId,move=opts.move,age=0,frame=0,accumulator=0,
-    entries={},done=false,cancelled=false,startedAt=opts.startedAt,
+    entries={},done=false,cancelled=false,stopRequested=false,stopReason=nil,startedAt=opts.startedAt,
     presentationSerial=opts.presentationSerial,parentAttackSerial=opts.parentAttackSerial,
-    globalTimingPoints=opts.globalTimingPoints,timing=timing,
+    globalTimingPoints=opts.globalTimingPoints,timing=timing,partial=not owns,skipped={},
   }
   for _,row in ipairs(resolved) do
-    inst.entries[#inst.entries+1]={entry=row.entry,startFrame=row.startFrame,unshiftedStartFrame=row.unshiftedStartFrame,
+    if opts.allowPartial and not entryExecutable(spec,row.entry,role) then inst.skipped[#inst.skipped+1]=row.entry
+    else inst.entries[#inst.entries+1]={entry=row.entry,startFrame=row.startFrame,unshiftedStartFrame=row.unshiftedStartFrame,
       timingFallback=row.timingFallback,started=false,finished=false,closed=false,claimed=false}
+    end
   end
 
   local globalMax=0
@@ -326,7 +392,7 @@ function W:start(ctx,side,spec,opts)
   inst.sourceEndFrame=math.max(1,timing.maxStart+1,globalMax+1,presentationFrames)
   self.active[#self.active+1]=inst;self.last=inst
   pushTrace({serial=inst.serial,frame=0,role=role,event="sequence-start",timingShift=timing.shift,
-    unresolvedTiming=timing.unresolved,sourceEndFrame=inst.sourceEndFrame})
+    unresolvedTiming=timing.unresolved,unresolvedDetails=timing.unresolvedDetails,sourceEndFrame=inst.sourceEndFrame})
   fireDue(ctx,inst,0)
   return inst
 end
@@ -339,9 +405,10 @@ function W:update(ctx,dt)
     else
       inst.age=inst.age+step;inst.accumulator=inst.accumulator+step
       local steps=0
-      while inst.accumulator>=FRAME_DT and steps<MAX_STEPS_PER_UPDATE do
+      while inst.accumulator+1e-10>=FRAME_DT and steps<MAX_STEPS_PER_UPDATE do
         inst.accumulator=inst.accumulator-FRAME_DT;steps=steps+1;inst.frame=inst.frame+1
         fireDue(ctx or inst.ctx,inst,inst.frame)
+        if inst.done then break end
       end
       if steps>=MAX_STEPS_PER_UPDATE and inst.accumulator>FRAME_DT*MAX_STEPS_PER_UPDATE then
         inst.accumulator=FRAME_DT*MAX_STEPS_PER_UPDATE
@@ -368,6 +435,12 @@ function W:finish(ctx,reason)
   return true
 end
 
+
+function W:requestStop(inst,reason)
+  if type(inst)~="table" or inst.done then return false end
+  inst.stopRequested=true;inst.stopReason=reason or "source-controller-stop";return true
+end
+
 function W:status()
   local active={}
   for _,inst in ipairs(self.active) do
@@ -377,8 +450,9 @@ function W:status()
   end
   return {version=self.version,source=self.source,active=active,handlerKinds=(function()
     local out={};for k,v in pairs(self.handlers) do out[k]=#v end;return out end)(),trace=self.trace,errors=self.errors,
-    timingModel="retail anchorEntry + timingPoint dependency graph; negative-start normalization"}
+    timingModel="retail anchorEntry + timingPoint dependency graph; negative-start normalization",ownership="full-role executable-chain"}
 end
 
-W._test={phaseEntries=phaseEntries,resolveEntryStarts=resolveEntryStarts,entryPoint=entryPoint,globalPoint=globalPoint}
+W.resolveEntryStarts=resolveEntryStarts
+W._test={phaseEntries=phaseEntries,resolveEntryStarts=resolveEntryStarts,entryPoint=entryPoint,globalPoint=globalPoint,entryExecutable=entryExecutable}
 return W

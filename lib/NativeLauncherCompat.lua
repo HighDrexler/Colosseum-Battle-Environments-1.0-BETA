@@ -29,6 +29,8 @@ local COMMON_PREFIXES={0,512,0x8000}
 local REQUIRED_FSYS={
   "people_archive.fsys","fight_common.fsys","M1_water_colo.fsys",
   "D2_crater_colo.fsys","T1_ancient_colo.fsys","D4_casino_colo.fsys",
+  "M3_shrine_1F_bf.fsys","M3_cave_1F_1_bf.fsys","S1_out_bf.fsys",
+  "M2_earth_colo.fsys","M4_bottom_colo.fsys",
 }
 
 local function safeCachePath(path)

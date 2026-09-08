@@ -14,6 +14,7 @@ if not okFfi then ffi=nil end
 local floor,ceil,min,max,abs=math.floor,math.ceil,math.min,math.max,math.abs
 local pow=math.pow or function(a,b)return a^b end
 local sqrt=math.sqrt
+local sin,PI=math.sin,math.pi
 
 -- Amuse applies a deliberately nonlinear volume law before routing each voice.
 -- Keeping this table identical to Amuse is much more important than adding an
@@ -142,36 +143,47 @@ local function parseSfxProject(proj)
   local o=pageOff+1
   assert(o+3<=#proj,"portable MusyX SFX: page table missing")
   local count=u16be(proj,o);o=o+4
-  local entries={}
+  local entries={};local ids={};local firstId=nil
   for i=1,count do
     assert(o+9<=#proj and o+9<=groupEnd,"portable MusyX SFX: truncated SFX entry "..i)
     local id=u16be(proj,o)
-    entries[id]={id=id,obj=u16be(proj,o+2),priority=proj:byte(o+4),maxVoices=proj:byte(o+5),
+    entries[id]={id=id,sourceId=id,obj=u16be(proj,o+2),priority=proj:byte(o+4),maxVoices=proj:byte(o+5),
       velocity=proj:byte(o+6),pan=proj:byte(o+7),key=proj:byte(o+8)}
+    ids[#ids+1]=id
+    if not firstId or id<firstId then firstId=id end
     o=o+10
   end
-  return {groupId=groupId,entries=entries,count=count}
+  return {groupId=groupId,entries=entries,count=count,firstId=firstId}
 end
 
 local function parsePool(pool)
   assert(type(pool)=="string" and #pool>=20,"portable MusyX: POOL missing/truncated")
-  local smOff=u32be(pool,1)+1
-  local tableOff=u32be(pool,5)+1
-  local keymapOff=u32be(pool,9)+1
-  local layerOff=u32be(pool,13)+1
-  local function objects(first,last)
-    local out={};local o=first
-    while o+7<=last and u32be(pool,o)~=4294967295 do
+  -- A zero POOL section offset means ABSENT, not file offset zero. Retail
+  -- snd_se and snd_se_battle have no keymaps/layers. Treating +1 as a real
+  -- section parsed the POOL header and macros as layer counts (billions of
+  -- iterations on some banks), and discarded the real envelope tables.
+  local offsets={u32be(pool,1),u32be(pool,5),u32be(pool,9),u32be(pool,13)}
+  local function objects(index)
+    local offset=offsets[index]
+    if offset==0 then return {} end
+    assert(offset>=16 and offset+4<=#pool,"portable MusyX: invalid POOL section")
+    local last=#pool
+    for _,other in ipairs(offsets) do
+      if other>offset and other<last then last=other end
+    end
+    local out={};local o=offset+1
+    while o+3<=last and u32be(pool,o)~=4294967295 do
+      assert(o+7<=last,"portable MusyX: truncated POOL object")
       local size=u32be(pool,o);local id=u16be(pool,o+4)
-      assert(size>=8 and o+size-1<=#pool,"portable MusyX: malformed POOL object")
+      assert(size>=8 and o+size-1<=last,"portable MusyX: malformed POOL object")
       out[id]=pool:sub(o+8,o+size-1);o=o+size
     end
     return out
   end
-  local macros=objects(smOff,tableOff-1)
-  local rawTables=objects(tableOff,keymapOff-1)
-  local rawKeymaps=objects(keymapOff,layerOff-1)
-  local rawLayers=objects(layerOff,#pool)
+  local macros=objects(1)
+  local rawTables=objects(2)
+  local rawKeymaps=objects(3)
+  local rawLayers=objects(4)
   local tables={}
   for id,data in pairs(rawTables) do
     if #data==8 then
@@ -180,7 +192,7 @@ local function parsePool(pool)
         sustain=clamp(sustain/4096,0,1),release=release/1000}
     elseif #data==20 then
       local attack=s32le(data,1);local decay=s32le(data,5);local sustain=u16le(data,9);local release=u16le(data,11)
-      local velToAttack=s32le(data,13);local keyToDecay=s32le(data,17)
+      local velToAttack=u32le(data,13);local keyToDecay=u32le(data,17)
       local function tc(v)return v==-2147483648 and 0 or pow(2,v/(1200*65536)) end
       tables[id]={kind="dls",attack=tc(attack),decay=tc(decay),sustain=clamp(sustain/4096,0,1),release=release/1000,
         velToAttack=velToAttack,keyToDecay=keyToDecay}
@@ -202,6 +214,7 @@ local function parsePool(pool)
   local layers={}
   for id,data in pairs(rawLayers) do
     local count=#data>=4 and u32be(data,1) or 0;local arr={}
+    assert(count<=math.floor(math.max(0,#data-4)/12),"portable MusyX: truncated POOL layer")
     for i=0,count-1 do
       local o=5+i*12
       if o+8<=#data then
@@ -223,15 +236,68 @@ local function parseSdir(sdir)
     local e={id=id,offset=u32be(sdir,o+4),pitch=sdir:byte(o+12),rate=u16be(sdir,o+14),
       format=floor(rawCount/16777216),count=rawCount%16777216,loopStart=u32be(sdir,o+20),loopLength=u32be(sdir,o+24),adpcm=u32be(sdir,o+28)}
     e.looped=e.loopLength>0 and e.loopStart~=4294967295
+    if e.looped then
+      assert(e.loopStart<e.count and e.loopStart+e.loopLength<=e.count,
+        "portable MusyX: loop outside sample "..id)
+    end
     out[id]=e
   end
   return out
+end
+
+local function decodeCurveUnsigned(data,pos)
+  local a=data:byte(pos);assert(a,"portable MusyX: truncated continuous-controller delta")
+  if a>=128 then
+    local b=data:byte(pos+1);assert(b,"portable MusyX: truncated continuous-controller delta")
+    return (a%128)*256+b,pos+2
+  end
+  return a,pos+1
+end
+local function decodeCurveSigned(data,pos)
+  local a=data:byte(pos);assert(a,"portable MusyX: truncated continuous-controller value")
+  if a>=128 then
+    local b=data:byte(pos+1);assert(b,"portable MusyX: truncated continuous-controller value")
+    local v=(a%128)*256+b
+    -- MusyX SongState::DecodeSignedValue stores a 15-bit signed value and
+    -- sign-extends bit 14 into bit 15. The previous v6 path subtracted 65536,
+    -- doubling the negative range and badly corrupting Miror B.'s authored
+    -- continuous pitch stream. 0x4000 therefore means -0x4000, not -0xc000.
+    if v>=16384 then v=v-32768 end
+    return v,pos+2
+  end
+  -- The packed one-byte form is also unusual: bit 6 extends upward, not as a
+  -- normal 7-bit sign. Source bytes 0x40..0x7f decode to 0xc0..0xff.
+  if a>=64 then return a+128,pos+1 end
+  return a,pos+1
+end
+local function decodeCurveDelta(data,pos)
+  local ticks=0
+  while true do
+    local a,b=data:byte(pos,pos+1)
+    if a==128 and b==0 then return nil,nil,pos,true end
+    local dt;dt,pos=decodeCurveUnsigned(data,pos);ticks=ticks+dt
+    local dv;dv,pos=decodeCurveSigned(data,pos)
+    if dv~=0 then return ticks,dv,pos,false end
+  end
 end
 
 local function parseSong(seq)
   assert(type(seq)=="string" and #seq>=64,"portable MusyX: SNG missing/truncated")
   local trackIdxOff=u32be(seq,1);local regionIdxOff=u32be(seq,5);local chanMapOff=u32be(seq,9);local tempoOff=u32be(seq,13)
   local initialRaw=u32be(seq,17);local initialTempo=initialRaw%2147483648
+  -- MusyX stores the authored loop-start tick in the SNG header. When the high
+  -- bit of initialTempo is set there is one loop-start tick per MIDI channel;
+  -- otherwise loopStartTicks[0] is shared by every track. Do not rely on a
+  -- hand-maintained PCM frame table for the production cache.
+  local perChannelLoop=(initialRaw>=2147483648)
+  local headerLoopStarts={}
+  if perChannelLoop then
+    assert(#seq>=84,"portable MusyX: extended SNG loop header truncated")
+    for ch=0,15 do headerLoopStarts[ch]=u32be(seq,21+ch*4) end
+  else
+    local shared=u32be(seq,21)
+    for ch=0,15 do headerLoopStarts[ch]=shared end
+  end
   local trackIdx={};local maxRegion=-1
   for i=0,63 do trackIdx[i]=u32be(seq,trackIdxOff+1+i*4) end
   local chanMap={};for i=0,63 do chanMap[i]=seq:byte(chanMapOff+1+i) or 0 end
@@ -278,6 +344,29 @@ local function parseSong(seq)
       if reg.regionIndex<0 then break end
       local ro=regionOffsets[reg.regionIndex]
       if ro then
+        -- Retail SongState keeps two independent, continuous per-track streams
+        -- in the 12-byte region header.  They drive pitch wheel and modulation
+        -- before ordinary MIDI commands.  The old portable renderer discarded
+        -- both streams, which flattens authored bends/vibrato and is especially
+        -- audible on sustained orchestral voices.
+        local pitchOff=u32be(seq,ro+5)
+        local modOff=u32be(seq,ro+9)
+        local function addContinuous(kind,off)
+          if not off or off<=0 or off+1>#seq then return end
+          local pos=off+1;local tick=reg.startTick;local value=0;local guard=0
+          while pos+1<=#seq and guard<65536 do
+            guard=guard+1
+            local dt,dv,nextPos,done=decodeCurveDelta(seq,pos)
+            if done or dt==nil then break end
+            pos=nextPos;tick=tick+dt;value=value+dv
+            if kind=="pitch" then
+              add({tick=tick,kind="pitch",ch=ch,value=clamp(value/8191,-1,1)})
+            else
+              add({tick=tick,kind="ctrl",ch=ch,ctrl=1,value=clamp(floor(value/127),0,127)})
+            end
+          end
+        end
+        addContinuous("pitch",pitchOff);addContinuous("mod",modOff)
         local o=ro+13 -- 12-byte region header
         local tick=reg.startTick
         while o+1<=#seq do
@@ -314,7 +403,17 @@ local function parseSong(seq)
     -- if an unusual source song uses independent channel periods.
     for tick,count in pairs(loopEndCounts) do if count==loopTrackCount then loopEndTick=tick;break end end
   end
-  return {initialTempo=initialTempo,tempos=tempos,events=events,loopEndTick=loopEndTick,loopTrackCount=loopTrackCount}
+  local activeChannels,loopStartSet={},{}
+  for _,track in ipairs(tracks) do activeChannels[track.channel]=true end
+  for ch in pairs(activeChannels) do
+    local tick=headerLoopStarts[ch]
+    if tick~=nil then loopStartSet[tick]=(loopStartSet[tick] or 0)+1 end
+  end
+  local loopStartTick,loopStartVariants=nil,0
+  for tick in pairs(loopStartSet) do loopStartVariants=loopStartVariants+1;loopStartTick=tick end
+  if loopStartVariants~=1 then loopStartTick=nil end
+  return {initialTempo=initialTempo,tempos=tempos,events=events,loopStartTick=loopStartTick,
+    loopStartVariants=loopStartVariants,perChannelLoop=perChannelLoop,loopEndTick=loopEndTick,loopTrackCount=loopTrackCount}
 end
 
 local function tickSeconds(song,tick)
@@ -326,6 +425,19 @@ local function tickSeconds(song,tick)
   end
   if tick>curTick then sec=sec+(tick-curTick)/(tempo*384/60) end
   return sec
+end
+local function tempoAtTick(song,tick)
+  local tempo=song.initialTempo
+  for _,change in ipairs(song.tempos) do
+    if change.tick>tick then break end
+    tempo=change.tempo
+  end
+  return tempo
+end
+local function macroSeconds(song,tick,msSwitch,value)
+  local q=msSwitch and 1000 or (tempoAtTick(song,tick)*384/60)
+  if q<=0 then return 0 end
+  return (tonumber(value) or 0)/q
 end
 
 local function resolveObject(pool,obj,key,seen,out,transpose,volume,pan)
@@ -357,38 +469,88 @@ end
 local function compileMacro(pool,id)
   pool.compiled=pool.compiled or {};local hit=pool.compiled[id];if hit then return hit end
   local data=pool.macros[id];if not data then return nil end
-  local spec={id=id,noteAdd=0,waitKeyOff=true,waitSampleEnd=true,fadeIn=0,volumeScale=nil,dlsVol=false}
-  local postKeyOff=false
+  local spec={id=id,pitchOps={},waitKeyOff=true,waitSampleEnd=true,volumeScale=nil,dlsVol=false,
+    sampleMode=0,sampleOffset=0,initialEnvelope=nil,postKeyoffEnvelope=nil,commandCount=0}
+  local afterWait=false;local waitForKeyoff=false
   for o=1,#data-7,8 do
-    local c=reverseWords8(data:sub(o,o+7));local op=c:byte(1)
+    local c=reverseWords8(data:sub(o,o+7));local op=c:byte(1);spec.commandCount=spec.commandCount+1
     if op==0 then break
+    elseif op==0x04 or op==0x07 then
+      -- WaitTicks / WaitMs.  0xffff is the normal sustain gate used by
+      -- instrument macros; the key-off/sample-end flags decide what wakes it.
+      local keyOff=c:byte(2)~=0;local sampleEnd=c:byte(4)~=0
+      local n=(op==0x04) and u16le(c,7) or u16le(c,7)
+      if n==65535 then
+        afterWait=true;waitForKeyoff=keyOff
+        spec.waitKeyOff=keyOff;spec.waitSampleEnd=sampleEnd
+      elseif not afterWait and spec.sampleId==nil then
+        -- A finite wait before StartSample is audible articulation timing. v6
+        -- parsed the command but discarded it, pulling attacks/transients early.
+        spec.preStartWait=spec.preStartWait or {}
+        spec.preStartWait[#spec.preStartWait+1]={msSwitch=(op==0x07),value=n}
+      end
     elseif op==0x0c then spec.adsrId=u16le(c,2);spec.adsrDls=c:byte(4)~=0
     elseif op==0x0d then spec.volumeScale={scale=s8(c,2),add=s8(c,3),tableId=u16le(c,4),original=c:byte(6)~=0}
     elseif op==0x0f then
-      local msSwitch=c:byte(6)~=0;local n=u16le(c,7)
-      spec.postEnvelope={scale=s8(c,2),add=s8(c,3),tableId=u16le(c,4),msSwitch=msSwitch,value=n}
-    elseif op==0x10 then spec.sampleId=u16le(c,2)
+      local env={kind="envelope",scale=s8(c,2),add=s8(c,3),tableId=u16le(c,4),msSwitch=c:byte(6)~=0,value=u16le(c,7)}
+      if afterWait and waitForKeyoff then spec.postKeyoffEnvelope=env elseif not afterWait then spec.initialEnvelope=env end
+    elseif op==0x10 then
+      -- Amuse StartSample carries a velocity-scaled sample offset in addition
+      -- to the sample id.  Ignoring these fields changes the authored attack
+      -- transient/instrument articulation on macros that use a non-zero offset.
+      spec.sampleId=u16le(c,2);spec.sampleMode=s8(c,4);spec.sampleOffset=u32le(c,5)
     elseif op==0x14 then
-      local msSwitch=c:byte(6)~=0;local n=u16le(c,7)
-      spec.fadeIn={scale=s8(c,2),add=s8(c,3),tableId=u16le(c,4),msSwitch=msSwitch,value=n}
+      local env={kind="fadein",scale=s8(c,2),add=s8(c,3),tableId=u16le(c,4),msSwitch=c:byte(6)~=0,value=u16le(c,7)}
+      if afterWait and waitForKeyoff then spec.postKeyoffEnvelope=env elseif not afterWait then spec.initialEnvelope=env end
     elseif op==0x16 then
       spec.adsrCtrl={attack=c:byte(2),decay=c:byte(3),sustain=c:byte(4),release=c:byte(5)}
-    elseif op==0x18 then spec.noteAdd=spec.noteAdd+s8(c,2)
-    elseif op==0x19 then spec.noteSet=s8(c,2)
+    elseif op==0x18 then
+      -- CmdAddNote changes cents, not merely semitones.
+      spec.pitchOps[#spec.pitchOps+1]={kind="add",semitones=s8(c,2),detune=s8(c,3),afterWait=afterWait}
+    elseif op==0x19 then
+      spec.pitchOps[#spec.pitchOps+1]={kind="set",key=s8(c,2),detune=s8(c,3),afterWait=afterWait}
     elseif op==0x1c then
       local msSwitch=c:byte(6)~=0;local n=u16le(c,7)
       spec.vibrato={level=s8(c,2)*100+s8(c,3),modwheel=c:byte(4)~=0,msSwitch=msSwitch,value=n}
     elseif op==0x21 then spec.volumeScaleDls={scale=(function()local v=u16le(c,2);return v>=32768 and v-65536 or v end)(),original=c:byte(4)~=0}
     elseif op==0x58 then spec.dlsVol=c:byte(2)~=0
     elseif op==0x59 then spec.keygroup={group=c:byte(2),killNow=c:byte(3)~=0}
-    elseif op==0x07 then
-      local keyOff=c:byte(2)~=0;local sampleEnd=c:byte(4)~=0;local n=u16le(c,7)
-      if n==65535 and not postKeyOff then spec.waitKeyOff=keyOff;spec.waitSampleEnd=sampleEnd;postKeyOff=true end
     end
   end
   local adsr=pool.tables[spec.adsrId]
   if adsr and (adsr.kind=="adsr" or adsr.kind=="dls") then spec.adsr=adsr else spec.adsr=nil end
   pool.compiled[id]=spec;return spec
+end
+
+local function pitchAtSampleStart(baseKey,spec)
+  local cents=clamp(tonumber(baseKey) or 0,0,127)*100
+  for _,op in ipairs((spec and spec.pitchOps) or {}) do
+    if not op.afterWait then
+      if op.kind=="set" then cents=(tonumber(op.key) or 0)*100+(tonumber(op.detune) or 0)
+      else cents=cents+(tonumber(op.semitones) or 0)*100+(tonumber(op.detune) or 0) end
+    end
+  end
+  return cents
+end
+
+local function scaledSampleOffset(spec,velocity)
+  local offset=max(0,floor(tonumber(spec and spec.sampleOffset) or 0))
+  local mode=tonumber(spec and spec.sampleMode) or 0;local vel=clamp(floor(tonumber(velocity) or 0),0,127)
+  if mode==1 then offset=floor(offset*(127-vel)/127)
+  elseif mode==2 then offset=floor(offset*vel/127) end
+  return offset
+end
+
+local function macroScaledValue(pool,cmd,velocity)
+  if type(cmd)~="table" then return 1,nil end
+  local eval=clamp(floor((tonumber(velocity) or 0)*(tonumber(cmd.scale) or 0)/127+(tonumber(cmd.add) or 0)),0,127)
+  -- CmdEnvelope/CmdFadeIn do NOT run the evaluation through the Curve.  Amuse
+  -- passes the raw 0..127 value to Voice (which clamps it to [0,1]); the Curve
+  -- shapes interpolation progress over time.  Treating the Curve as a second
+  -- target-volume lookup changes instrument articulation.
+  local curve=pool.tables[tonumber(cmd.tableId) or -1]
+  if not (curve and curve.kind=="curve" and #curve.data>=128) then curve=nil end
+  return clamp(eval,0,1),curve
 end
 
 local function decodeDsp(sdir,samp,entry,cache)
@@ -430,7 +592,9 @@ local function decodeDsp(sdir,samp,entry,cache)
   cache[entry.id]=hit;return hit
 end
 
-local function pcmAt(sample,index)
+-- The fast path intentionally remains byte-for-byte equivalent to v1.0.5.
+-- Fidelity is a cache-build option, never a live mixer/resampling operation.
+local function pcmAtLinear(sample,index)
   local i=floor(index);if i<0 or i>=sample.count then return 0 end
   local q=index-i
   if ffi then
@@ -445,6 +609,86 @@ local function pcmAt(sample,index)
   return a+(b-a)*q
 end
 
+-- Eight-tap Lanczos-4, 256 precomputed phases. Both dimensions are dense,
+-- positive Lua-array indices. Normalize each phase for unity DC gain. No sin(),
+-- coefficient construction or temporary closure is used per output sample.
+-- This is an interpolation improvement, NOT a complete rate-dependent
+-- anti-aliasing filter or a bit-perfect recreation of the console DSP.
+local LANCZOS_A,LANCZOS_PHASES=4,256
+local LANCZOS_TABLE={}
+for phase=0,LANCZOS_PHASES-1 do
+  local weights,sum={},0
+  local q=phase/LANCZOS_PHASES
+  for k=1-LANCZOS_A,LANCZOS_A do
+    local x=k-q;local w=0
+    if x==0 then w=1
+    elseif x>-LANCZOS_A and x<LANCZOS_A then
+      local px=PI*x;w=(sin(px)/px)*(sin(px/LANCZOS_A)/(px/LANCZOS_A))
+    end
+    weights[k+LANCZOS_A]=w;sum=sum+w
+  end
+  for j=1,2*LANCZOS_A do weights[j]=weights[j]/sum end
+  LANCZOS_TABLE[phase+1]=weights
+end
+
+-- A looped instrument has an attack BEFORE loopStart. Do not replace that
+-- prefix (or the first traversal's left history) with the sustain-loop tail.
+-- Only voices that actually crossed loopEnd wrap left-hand taps. Right-hand
+-- lookahead at loopEnd always wraps. Modulo handles even one-sample loops.
+local function loopAwareTapIndex(sample,idx,hasLooped)
+  local lo,hi=sample.loopStart,sample.loopEnd
+  if sample.looped and lo and hi and lo>=0 and hi>lo and hi<=sample.count then
+    if idx>=hi or (hasLooped and idx<lo) then return lo+((idx-lo)%(hi-lo)) end
+  end
+  if idx<0 then return 0 end
+  if idx>=sample.count then return sample.count-1 end
+  return idx
+end
+local function pcmByteAt(sample,idx)
+  local o=idx*2+1;local lo,hi=sample.pcm:byte(o,o+1)
+  if not hi then return 0 end
+  local v=lo+hi*256;if v>=32768 then v=v-65536 end
+  return v
+end
+local function pcmAtLanczos(sample,index,hasLooped)
+  local i=floor(index);if i<0 or i>=sample.count then return 0 end
+  local q=index-i
+  if q<=0 then
+    if ffi then return tonumber(sample.pcm[i]) end
+    return pcmByteAt(sample,i)
+  end
+  local phase=floor(q*LANCZOS_PHASES)
+  if phase>=LANCZOS_PHASES then phase=LANCZOS_PHASES-1 end
+  local weights=LANCZOS_TABLE[phase+1]
+  local first,last=i-(LANCZOS_A-1),i+LANCZOS_A
+  local safe=first>=0 and last<sample.count
+  if safe and sample.looped and sample.loopStart and sample.loopEnd
+      and sample.loopStart>=0 and sample.loopEnd>sample.loopStart and sample.loopEnd<=sample.count then
+    safe=last<sample.loopEnd and (not hasLooped or first>=sample.loopStart)
+  end
+  local acc=0
+  if ffi then
+    if safe then
+      for k=1-LANCZOS_A,LANCZOS_A do acc=acc+tonumber(sample.pcm[i+k])*weights[k+LANCZOS_A] end
+    else
+      for k=1-LANCZOS_A,LANCZOS_A do
+        local idx=loopAwareTapIndex(sample,i+k,hasLooped)
+        acc=acc+tonumber(sample.pcm[idx])*weights[k+LANCZOS_A]
+      end
+    end
+  elseif safe then
+    for k=1-LANCZOS_A,LANCZOS_A do acc=acc+pcmByteAt(sample,i+k)*weights[k+LANCZOS_A] end
+  else
+    for k=1-LANCZOS_A,LANCZOS_A do
+      acc=acc+pcmByteAt(sample,loopAwareTapIndex(sample,i+k,hasLooped))*weights[k+LANCZOS_A]
+    end
+  end
+  return acc
+end
+local function qualityName(opts)
+  return type(opts)=="table" and opts.quality=="fast" and "fast" or "high"
+end
+
 local function adsrTimes(adsr,ctrl,ctrlSpec,key,vel)
   if ctrlSpec then
     return midiTime(ctrl[ctrlSpec.attack] or 0),midiTime(ctrl[ctrlSpec.decay] or 0),
@@ -453,8 +697,8 @@ local function adsrTimes(adsr,ctrl,ctrlSpec,key,vel)
   if not adsr then return 0,0,1,0 end
   if adsr.kind=="dls" then
     local a=adsr.attack or 0;local d=adsr.decay or 0
-    if adsr.velToAttack and adsr.velToAttack~=-2147483648 then a=a+(vel or 0)*(adsr.velToAttack/65536/1000)/128 end
-    if adsr.keyToDecay and adsr.keyToDecay~=-2147483648 then d=d+(key or 0)*(adsr.keyToDecay/65536/1000)/128 end
+    if adsr.velToAttack and adsr.velToAttack~=2147483648 then a=a+(vel or 0)*(adsr.velToAttack/65536/1000)/128 end
+    if adsr.keyToDecay and adsr.keyToDecay~=2147483648 then d=d+(key or 0)*(adsr.keyToDecay/65536/1000)/128 end
     return max(0,a),max(0,d),adsr.sustain or 1,adsr.release or 0
   end
   return adsr.attack or 0,adsr.decay or 0,adsr.sustain or 1,adsr.release or 0
@@ -479,46 +723,93 @@ local function adsrAtVoice(v,t)
   end
   return adsrPreValues(a,d,s,t)
 end
+local function envelopeCurveT(env,q)
+  q=clamp(q,0,1)
+  local curve=env and env.curve
+  if curve and curve.kind=="curve" and #curve.data>=128 then return (curve.data[clamp(floor(q*127),0,127)+1] or 0)/127 end
+  return q
+end
+local function envelopeAtVoice(v,t)
+  local env=v.initialEnvelope
+  local value=1
+  if env and env.duration and env.duration>0 then
+    local q=envelopeCurveT(env,t/env.duration)
+    local from=(env.kind=="fadein") and 0 or 1
+    value=from*(1-q)+(env.target or 1)*q
+  elseif env then value=(env.kind=="fadein") and (env.target or 1) or (env.target or 1) end
+  if v.keyoff and t>=v.keyoff and v.postKeyoffEnvelope then
+    local post=v.postKeyoffEnvelope
+    if v._postEnvelopeStart==nil then v._postEnvelopeStart=value end
+    if post.duration and post.duration>0 then
+      local q=envelopeCurveT(post,(t-v.keyoff)/post.duration)
+      value=v._postEnvelopeStart*(1-q)+(post.target or 1)*q
+    else value=post.target or value end
+  end
+  return clamp(value,0,1)
+end
 
 local function noteVoices(project,pool,sdirEntries,song,setupId,outputRate)
   local setup=project.setups[setupId];assert(setup,"portable MusyX: setup "..tostring(setupId).." missing")
   local chan={}
-  local relevant={[1]=true,[7]=true,[10]=true,[20]=true,[22]=true,[23]=true,[24]=true,[91]=true,[93]=true}
+  local relevant={[1]=true,[7]=true,[10]=true,[20]=true,[22]=true,[23]=true,[24]=true,[64]=true,[91]=true,[93]=true}
   for ch=0,15 do
     local src=setup[ch] or {program=0,volume=127,pan=64,reverb=0,chorus=0}
+    -- Amuse keeps MIDI CC7/CC10 neutral at 127/64. MIDI-setup volume/pan
+    -- are separate ChannelState properties applied *after* the PageObject is
+    -- loaded. Treating setup values as controller values double-applied them
+    -- and also exposed the wrong values to SoundMacro controller selectors.
     local ctrl={[1]=0,[7]=127,[10]=64,[91]=src.reverb or 0,[93]=src.chorus or 0}
-    chan[ch]={program=src.program,volume=src.volume,pan=src.pan,reverb=src.reverb or 0,chorus=src.chorus or 0,ctrl=ctrl,automation={}}
-    ctrl[7]=src.volume or 127;ctrl[10]=src.pan or 64
+    chan[ch]={program=src.program,volume=src.volume,pan=src.pan,reverb=src.reverb or 0,chorus=src.chorus or 0,
+      pitchWheel=0,pitchRangeCents=200,rpnMsb=127,rpnLsb=127,ctrl=ctrl,automation={}}
   end
-  local voices={};local lastSec=0
+  local voices={};local lastSec=0;local noteOwners={}
+  -- A MIDI note owns its whole page/layer graph. Sample transposition is NOT a
+  -- note identity: percussion often maps many different keys to sample pitch 60.
   local function pushAuto(st,sec,ctrl,value)
     st.ctrl[ctrl]=value
-    if relevant[ctrl] then st.automation[#st.automation+1]={sec=sec,ctrl=ctrl,value=value} end
-    if ctrl==7 then st.volume=value elseif ctrl==10 then st.pan=value elseif ctrl==91 then st.reverb=value elseif ctrl==93 then st.chorus=value end
-  end
-  local function bootstrapAdsr(st,spec,sec)
-    local a=spec and spec.adsrCtrl;if not a then return end
-    if (st.ctrl[a.sustain] or 0)==0 then
-      pushAuto(st,sec,a.attack,10);pushAuto(st,sec,a.sustain,127);pushAuto(st,sec,a.release,10)
+    if ctrl==101 then st.rpnMsb=value
+    elseif ctrl==100 then st.rpnLsb=value
+    elseif ctrl==6 and st.rpnMsb==0 and st.rpnLsb==0 then
+      st.pitchRangeCents=math.max(0,tonumber(value) or 2)*100
+      st.automation[#st.automation+1]={sec=sec,ctrl=129,value=st.pitchRangeCents}
+    elseif ctrl==38 and st.rpnMsb==0 and st.rpnLsb==0 then
+      local semis=math.floor((tonumber(st.pitchRangeCents) or 200)/100)
+      st.pitchRangeCents=semis*100+math.min(99,math.max(0,tonumber(value) or 0))
+      st.automation[#st.automation+1]={sec=sec,ctrl=129,value=st.pitchRangeCents}
     end
+    if relevant[ctrl] or ctrl==128 then st.automation[#st.automation+1]={sec=sec,ctrl=ctrl,value=value} end
+    if ctrl==7 then st.volume=value elseif ctrl==10 then st.pan=value elseif ctrl==91 then st.reverb=value elseif ctrl==93 then st.chorus=value
+    elseif ctrl==128 then st.pitchWheel=value end
   end
-  for _,ev in ipairs(song.events) do
+  for eventId,ev in ipairs(song.events) do
     local st=chan[ev.ch] or chan[0];local evSec=tickSeconds(song,ev.tick)
     if ev.kind=="program" then st.program=ev.program
+    elseif ev.kind=="pitch" then pushAuto(st,evSec,128,ev.value)
     elseif ev.kind=="ctrl" then pushAuto(st,evSec,ev.ctrl,ev.value)
     elseif ev.kind=="note" and ev.velocity>0 then
+      noteOwners[ev.ch]=noteOwners[ev.ch] or {}
+      local owner={id=eventId,key=ev.key,sec=evSec}
+      local previous=noteOwners[ev.ch][ev.key]
+      if previous then previous.retriggerSec=evSec end
+      noteOwners[ev.ch][ev.key]=owner
       local page=((ev.ch==9) and project.drum or project.normal)[st.program]
       if page then
         local mappings=resolveObject(pool,page.obj,ev.key)
-        local startSec=evSec;local offSec=tickSeconds(song,ev.tick+ev.length)
-        if startSec>lastSec then lastSec=startSec end
+        local noteStartSec=evSec;local offSec=tickSeconds(song,ev.tick+ev.length)
+        if noteStartSec>lastSec then lastSec=noteStartSec end
         for _,map in ipairs(mappings) do
           local spec=compileMacro(pool,map.macro)
           local entry=spec and spec.sampleId and sdirEntries[spec.sampleId]
           if entry then
-            bootstrapAdsr(st,spec,startSec)
-            local key=(spec.noteSet~=nil) and spec.noteSet or (ev.key+map.transpose+(spec.noteAdd or 0));key=clamp(key,0,127)
-            local pitchCents=key*100
+            local preDelay=0
+            for _,wait in ipairs(spec.preStartWait or {}) do
+              preDelay=preDelay+macroSeconds(song,ev.tick,wait.msSwitch,wait.value)
+            end
+            local startSec=noteStartSec+preDelay
+            if startSec>lastSec then lastSec=startSec end
+            local macroKey=clamp(ev.key+(map.transpose or 0),0,127)
+            local pitchCents=pitchAtSampleStart(macroKey,spec)
+            local key=clamp(floor(pitchCents/100+0.5),0,127)
             local basePitch=(entry.pitch==0 and 60 or entry.pitch)*100
             local ratio=pow(2,(pitchCents-basePitch)/1200)
             local macroVol=1
@@ -530,34 +821,53 @@ local function noteVoices(project,pool,sdirEntries,song,setupId,outputRate)
             elseif spec.volumeScaleDls then
               local vs=spec.volumeScaleDls;macroVol=ev.velocity*vs.scale/4096/127
             end
-            local keyoff=nil;if spec.waitKeyOff then keyoff=max(0,offSec-startSec) end
+            -- Sequencer::Track always sends keyOff when the authored note length
+            -- expires.  SoundMacro WAIT flags decide macro control flow; they do
+            -- not suppress the voice/ADSR key-off itself.
+            local keyoff=max(0,offSec-startSec)
             local ctrl={};for k,v in pairs(st.ctrl) do ctrl[k]=v end
-            local fadeIn=0
-            if type(spec.fadeIn)=="table" then
-              local q=spec.fadeIn.msSwitch and 1000 or (song.initialTempo*384/60)
-              fadeIn=(spec.fadeIn.value or 0)/q
-            end
             local vib=nil
             if spec.vibrato then
-              local q=spec.vibrato.msSwitch and 1000 or (song.initialTempo*384/60)
-              vib={level=spec.vibrato.level,modwheel=spec.vibrato.modwheel,period=(spec.vibrato.value or 0)/q}
+              vib={level=spec.vibrato.level,modwheel=spec.vibrato.modwheel,period=macroSeconds(song,ev.tick,spec.vibrato.msSwitch,spec.vibrato.value)}
             end
-            local objectVolume=clamp(map.volume or 1,0,1)
-            local channelVolume=clamp((st.volume or 127)/127,0,1)
-            local resolvedVolume=objectVolume*channelVolume
-            voices[#voices+1]={startSec=startSec,startFrame=floor(startSec*outputRate+0.5),keyoff=keyoff,
-              sampleId=spec.sampleId,baseStep=entry.rate*ratio/outputRate,velocity=ev.velocity,macroVolume=macroVol,dlsVol=spec.dlsVol,
-              objectVolume=objectVolume,initialUserVol=resolvedVolume,targetUserVol=resolvedVolume,userVol=resolvedVolume,
-              pan=((map.pan~=nil and tonumber(map.pan)~= -128) and clamp(tonumber(map.pan) or 64,0,127) or (st.pan or 64)),reverb=st.reverb or 0,chorus=st.chorus or 0,adsr=spec.adsr,adsrCtrl=spec.adsrCtrl,ctrl=ctrl,
-              fadeIn=fadeIn,waitSampleEnd=spec.waitSampleEnd,vibrato=vib,key=key,keygroup=spec.keygroup,
+            local initialEnvelope=nil
+            if type(spec.initialEnvelope)=="table" then
+              local target,curve=macroScaledValue(pool,spec.initialEnvelope,ev.velocity)
+              initialEnvelope={kind=spec.initialEnvelope.kind,target=target,curve=curve,duration=macroSeconds(song,ev.tick,spec.initialEnvelope.msSwitch,spec.initialEnvelope.value)}
+            end
+            local postKeyoffEnvelope=nil
+            if type(spec.postKeyoffEnvelope)=="table" then
+              local target,curve=macroScaledValue(pool,spec.postKeyoffEnvelope,ev.velocity)
+              postKeyoffEnvelope={kind=spec.postKeyoffEnvelope.kind,target=target,curve=curve,duration=macroSeconds(song,ev.tick,spec.postKeyoffEnvelope.msSwitch,spec.postKeyoffEnvelope.value)}
+            end
+            -- Sequencer::ChannelState::keyOn applies setup/channel volume and pan
+            -- after loadPageObject(), recursively overriding layer/keymap user
+            -- volume/pan on the root and child voices. Mirroring that order is
+            -- essential to the authored instrument balance.
+            local resolvedVolume=clamp((st.volume or 127)/127,0,1)
+            voices[#voices+1]={noteOwner=owner,midiKey=ev.key,noteEventId=eventId,startSec=startSec,startFrame=floor(startSec*outputRate+0.5),nominalKeyoff=keyoff,keyoff=nil,channel=ev.ch,
+              sampleId=spec.sampleId,sampleOffset=scaledSampleOffset(spec,ev.velocity),baseStep=entry.rate*ratio/outputRate,velocity=ev.velocity,macroVolume=macroVol,dlsVol=spec.dlsVol,
+              objectVolume=1,initialUserVol=resolvedVolume,targetUserVol=resolvedVolume,userVol=resolvedVolume,
+              pan=clamp(tonumber(st.pan) or 64,0,127),pitchWheel=tonumber(st.pitchWheel) or 0,pitchRangeCents=tonumber(st.pitchRangeCents) or 200,reverb=st.reverb or 0,chorus=st.chorus or 0,
+              adsr=spec.adsr,adsrCtrl=spec.adsrCtrl,ctrl=ctrl,
+              initialEnvelope=initialEnvelope,postKeyoffEnvelope=postKeyoffEnvelope,waitSampleEnd=spec.waitSampleEnd,vibrato=vib,key=key,keygroup=spec.keygroup,
               automation=st.automation,autoIndex=#st.automation+1}
           end
         end
       end
     end
   end
-  for _,v in ipairs(voices) do refreshVoiceAdsr(v);v.userSlewStep=1/max(1,outputRate*0.005);v.reverbGain=lookupVolume(clamp((v.reverb or 0)/127,0,1),v.dlsVol) end
-  table.sort(voices,function(a,b)if a.startFrame~=b.startFrame then return a.startFrame<b.startFrame end return (a.sampleId or 0)<(b.sampleId or 0) end)
+  for _,v in ipairs(voices) do
+    if v.noteOwner and v.noteOwner.retriggerSec then
+      v.retriggerKeyoff=max(0,v.noteOwner.retriggerSec-v.startSec)
+    end
+    v.noteOwner=nil
+    refreshVoiceAdsr(v);v.userSlewStep=1/max(1,outputRate*0.005);v.reverbGain=lookupVolume(clamp((v.reverb or 0)/127,0,1),v.dlsVol) end
+  table.sort(voices,function(a,b)
+    if a.startFrame~=b.startFrame then return a.startFrame<b.startFrame end
+    if a.noteEventId~=b.noteEventId then return (a.noteEventId or 0)<(b.noteEventId or 0) end
+    return (a.sampleId or 0)<(b.sampleId or 0)
+  end)
   return voices,lastSec
 end
 
@@ -577,9 +887,9 @@ local function sfxVoices(project,pool,sdirEntries,sfxId,outputRate)
     local spec=compileMacro(pool,map.macro)
     local sampleEntry=spec and spec.sampleId and sdirEntries[spec.sampleId]
     if sampleEntry then
-      local resolvedKey=(spec.noteSet~=nil) and spec.noteSet or (key+(map.transpose or 0)+(spec.noteAdd or 0))
-      resolvedKey=clamp(resolvedKey,0,127)
-      local pitchCents=resolvedKey*100
+      local macroKey=clamp(key+(map.transpose or 0),0,127)
+      local pitchCents=pitchAtSampleStart(macroKey,spec)
+      local resolvedKey=clamp(floor(pitchCents/100+0.5),0,127)
       local basePitch=(sampleEntry.pitch==0 and 60 or sampleEntry.pitch)*100
       local ratio=pow(2,(pitchCents-basePitch)/1200)
       local macroVol=1
@@ -591,19 +901,22 @@ local function sfxVoices(project,pool,sdirEntries,sfxId,outputRate)
       elseif spec.volumeScaleDls then
         macroVol=velocity*spec.volumeScaleDls.scale/4096/127
       end
-      local ctrl={[1]=0,[7]=127,[10]=tonumber(entry.pan) or 64,[91]=0,[93]=0}
-      local fadeIn=0
-      if type(spec.fadeIn)=="table" then fadeIn=(spec.fadeIn.value or 0)/1000 end
+      local ctrl={[1]=0,[7]=127,[10]=64,[91]=0,[93]=0}
+      local initialEnvelope=nil
+      if type(spec.initialEnvelope)=="table" then
+        local target,curve=macroScaledValue(pool,spec.initialEnvelope,velocity)
+        initialEnvelope={kind=spec.initialEnvelope.kind,target=target,curve=curve,duration=(spec.initialEnvelope.msSwitch and (spec.initialEnvelope.value or 0)/1000 or 0)}
+      end
       local vib=nil
       if spec.vibrato then
         vib={level=spec.vibrato.level,modwheel=spec.vibrato.modwheel,period=(spec.vibrato.value or 0)/1000}
       end
       local baseUser=clamp(tonumber(map.volume) or 1,0,1)
-      local voice={startSec=0,startFrame=0,keyoff=nil,sampleId=spec.sampleId,
+      local voice={startSec=0,startFrame=0,keyoff=nil,sampleId=spec.sampleId,sampleOffset=scaledSampleOffset(spec,velocity),
         baseStep=sampleEntry.rate*ratio/outputRate,velocity=velocity,macroVolume=macroVol,dlsVol=spec.dlsVol,
         objectVolume=baseUser,initialUserVol=baseUser,targetUserVol=baseUser,userVol=baseUser,
-        pan=tonumber(entry.pan) or 64,reverb=0,chorus=0,adsr=spec.adsr,adsrCtrl=spec.adsrCtrl,ctrl=ctrl,
-        fadeIn=fadeIn,waitSampleEnd=spec.waitSampleEnd,vibrato=vib,key=resolvedKey,keygroup=spec.keygroup,
+        pan=tonumber(entry.pan) or 64,pitchWheel=0,reverb=0,chorus=0,adsr=spec.adsr,adsrCtrl=spec.adsrCtrl,ctrl=ctrl,
+        initialEnvelope=initialEnvelope,waitSampleEnd=spec.waitSampleEnd,vibrato=vib,key=resolvedKey,keygroup=spec.keygroup,
         automation={},autoIndex=1}
       refreshVoiceAdsr(voice);voice.userSlewStep=1/max(1,outputRate*0.005);voice.reverbGain=0
       voices[#voices+1]=voice
@@ -647,17 +960,24 @@ local function reverbSample(rv,c,input)
   return rv.wet*allpass+rv.dry*input
 end
 local function updatePan(v)
-  local front=clamp(((v.pan or 64)-64)/63,-1,1)
+  -- Exact Sequencer ChannelState mapping: CC10/setup panning is pan/64 - 1.
+  -- Voice then applies the -3 dB square-root stereo law.
+  local front=clamp((tonumber(v.pan) or 64)/64-1,-1,1)
   v.left=sqrt(-front*0.5+0.5);v.right=sqrt(front*0.5+0.5)
 end
 local function applyAutomation(v,absSec)
   local list=v.automation or {};local i=v.autoIndex or 1
   while i<=#list and (list[i].sec or 0)<=absSec+1e-9 do
     local e=list[i];v.ctrl[e.ctrl]=e.value
-    if e.ctrl==7 then v.targetUserVol=(tonumber(v.objectVolume) or 1)*clamp(e.value/127,0,1)
+    if e.ctrl==7 then v.targetUserVol=clamp(e.value/127,0,1)
     elseif e.ctrl==10 then v.pan=e.value;updatePan(v)
     elseif e.ctrl==91 then v.reverb=e.value;v.reverbGain=lookupVolume(clamp(e.value/127,0,1),v.dlsVol)
-    elseif e.ctrl==1 and v.vibrato then v.mod=e.value end
+    elseif e.ctrl==1 and v.vibrato then v.mod=e.value
+    elseif e.ctrl==128 then v.pitchWheel=clamp(tonumber(e.value) or 0,-1,1)
+    elseif e.ctrl==129 then v.pitchRangeCents=math.max(0,tonumber(e.value) or 200)
+    elseif e.ctrl==64 and e.value<64 and v._pendingSustainKeyoff then
+      v.keyoff=math.max(0,absSec-(tonumber(v.startSec) or 0));v._pendingSustainKeyoff=nil
+    end
     if v.adsrCtrl and (e.ctrl==v.adsrCtrl.attack or e.ctrl==v.adsrCtrl.decay or e.ctrl==v.adsrCtrl.sustain or e.ctrl==v.adsrCtrl.release) then refreshVoiceAdsr(v) end
     i=i+1
   end
@@ -665,14 +985,16 @@ local function applyAutomation(v,absSec)
 end
 local function renderPcm(project,pool,sdir,samp,song,setupId,outputRate,minFrames,progress,sampleCache,preparedVoices,opts)
   opts=type(opts)=="table" and opts or {}
+  local pcmAt=qualityName(opts)=="fast" and pcmAtLinear or pcmAtLanczos
   local voices,lastSec
   if type(preparedVoices)=="table" then voices=preparedVoices;lastSec=tonumber(opts.lastSec) or 0
   else voices,lastSec=noteVoices(project,pool,sdir,song,setupId,outputRate) end
-  sampleCache=sampleCache or {};local block=512;local active={};local nextVoice=1;local parts={};local frame=0
+  sampleCache=sampleCache or {};local block=math.max(1,math.floor(tonumber(opts.blockFrames) or 512));local active={};local nextVoice=1;local parts={};local frame=0
   local maxTail=tonumber(opts.maxTail) or 6
   local releaseFloor=tonumber(opts.releaseFloor) or 1
   local totalFrames=max(minFrames or 0,floor((lastSec+maxTail)*outputRate+0.5))
   if totalFrames<outputRate then totalFrames=outputRate end
+  local outputGain=tonumber(opts.outputGain) or 1
   local peak=0;local clipped=0;local rv=newReverb(outputRate)
   while frame<totalFrames do
     local n=min(block,totalFrames-frame)
@@ -684,13 +1006,23 @@ local function renderPcm(project,pool,sdir,samp,song,setupId,outputRate,minFrame
         -- Keygroups are global in Amuse. The Colosseum battle bank uses killNow
         -- for its three keygroup voices, so a new one hard-stops an older peer.
         if v.keygroup and v.keygroup.group and v.keygroup.group~=0 then
-          local kept={}
           for _,old in ipairs(active) do
-            if old.keygroup and old.keygroup.group==v.keygroup.group and v.keygroup.killNow then old._killed=true else kept[#kept+1]=old end
+            if old.keygroup and old.keygroup.group==v.keygroup.group and v.keygroup.killNow then
+              -- A voice beginning later in this 512-frame block must not erase
+              -- the older voice's audio BEFORE the actual choke sample.
+              old.killFrame=min(old.killFrame or v.startFrame,v.startFrame)
+            end
           end
-          active=kept
         end
-        local entry=sdir[v.sampleId];v.sample=decodeDsp(sdir._raw,samp,entry,sampleCache);v.pos=0;v.localStart=v.startFrame-frame
+        -- Retrigger requests are attached to the original MIDI note in
+        -- noteVoices, not inferred from already-transposed sample voices here.
+        local entry=sdir[v.sampleId];v.sample=decodeDsp(sdir._raw,samp,entry,sampleCache)
+        local pos=max(0,tonumber(v.sampleOffset) or 0)
+        v._sampleLooped=v.sample.looped and pos>=v.sample.loopEnd or false
+        if v.sample.looped and v.sample.loopEnd>v.sample.loopStart and pos>v.sample.loopStart then
+          pos=v.sample.loopStart+((pos-v.sample.loopStart)%(v.sample.loopEnd-v.sample.loopStart))
+        elseif not v.sample.looped then pos=min(pos,v.sample.count) end
+        v.pos=pos;v.localStart=v.startFrame-frame
         updatePan(v);v.mod=v.ctrl[1] or 0;active[#active+1]=v
       end
       nextVoice=nextVoice+1
@@ -703,24 +1035,30 @@ local function renderPcm(project,pool,sdir,samp,song,setupId,outputRate,minFrame
       for i=startI,n-1 do
         if not alive then break end
         local globalFrame=frame+i;local t=(globalFrame-v.startFrame)/outputRate;local absSec=globalFrame/outputRate
+        if v.killFrame and globalFrame>=v.killFrame then alive=false;break end
         applyAutomation(v,absSec)
+        local request=v.nominalKeyoff
+        if v.retriggerKeyoff~=nil then request=min(request or v.retriggerKeyoff,v.retriggerKeyoff) end
+        if v.keyoff==nil and request~=nil and t>=request then
+          if (tonumber(v.ctrl and v.ctrl[64]) or 0)>=64 then v._pendingSustainKeyoff=true
+          else v.keyoff=request end
+        end
         if v.targetUserVol~=v.userVol then
           local step=v.userSlewStep
           if v.targetUserVol<v.userVol then v.userVol=max(v.targetUserVol,v.userVol-step) else v.userVol=min(v.targetUserVol,v.userVol+step) end
         end
         local env=adsrAtVoice(v,t)
-        local envelopeVol=1
-        if v.fadeIn and v.fadeIn>0 and t<v.fadeIn then envelopeVol=clamp(t/v.fadeIn,0,1) end
+        local envelopeVol=envelopeAtVoice(v,t)
         if env<=0 and v.keyoff then alive=false;break end
         local idx=v.pos
         if idx>=sample.count then
           if sample.looped and sample.loopEnd>sample.loopStart then
-            local span=sample.loopEnd-sample.loopStart;idx=sample.loopStart+((idx-sample.loopStart)%span);v.pos=idx
+            local span=sample.loopEnd-sample.loopStart;idx=sample.loopStart+((idx-sample.loopStart)%span);v.pos=idx;v._sampleLooped=true
           else alive=false;break end
         elseif sample.looped and idx>=sample.loopEnd and sample.loopEnd>sample.loopStart then
-          local span=sample.loopEnd-sample.loopStart;idx=sample.loopStart+((idx-sample.loopStart)%span);v.pos=idx
+          local span=sample.loopEnd-sample.loopStart;idx=sample.loopStart+((idx-sample.loopStart)%span);v.pos=idx;v._sampleLooped=true
         end
-        local sv=pcmAt(sample,idx)/32768
+        local sv=pcmAt(sample,idx,v._sampleLooped)/32768
         local level=clamp(v.userVol*(v.macroVolume or 1)*envelopeVol*env*(v.velocity/127),0,1)
         local gain=lookupVolume(level,v.dlsVol)
         local dry=sv*gain;local reverbGain=v.reverbGain or 0
@@ -740,7 +1078,9 @@ local function renderPcm(project,pool,sdir,samp,song,setupId,outputRate,minFrame
             vibCents=(v.vibrato.level or 0)*tri*scale
           end
         end
-        if vibCents~=0 then v.pos=v.pos+v.baseStep*pow(2,vibCents/1200) else v.pos=v.pos+v.baseStep end
+        local wheelCents=(tonumber(v.pitchWheel) or 0)*(tonumber(v.pitchRangeCents) or 200)
+        local pitchMod=vibCents+wheelCents
+        if pitchMod~=0 then v.pos=v.pos+v.baseStep*pow(2,pitchMod/1200) else v.pos=v.pos+v.baseStep end
       end
       if alive then survivors[#survivors+1]=v end
     end
@@ -750,7 +1090,7 @@ local function renderPcm(project,pool,sdir,samp,song,setupId,outputRate,minFrame
       local mi=i*2
       local dl=ffi and tonumber(mix[mi]) or mix[mi+1] or 0;local dr=ffi and tonumber(mix[mi+1]) or mix[mi+2] or 0
       local rvl=ffi and tonumber(rev[mi]) or rev[mi+1] or 0;local rvr=ffi and tonumber(rev[mi+1]) or rev[mi+2] or 0
-      local ol=dl+reverbSample(rv,rv.left,rvl);local orr=dr+reverbSample(rv,rv.right,rvr)
+      local ol=(dl+reverbSample(rv,rv.left,rvl))*outputGain;local orr=(dr+reverbSample(rv,rv.right,rvr))*outputGain
       local x=ol;if abs(x)>peak then peak=abs(x) end;if abs(x)>1 then clipped=clipped+1 end
       if x>1 then x=1 elseif x< -1 then x=-1 end
       local q=x>=0 and floor(x*32767+0.5) or ceil(x*32768-0.5);q=q%65536;bytes[#bytes+1]=string.char(q%256,floor(q/256))
@@ -784,7 +1124,8 @@ function P.hasSfx(ctx,id)
     and ctx.project.entries[math.floor(tonumber(id) or -1)]~=nil
 end
 
-function P.renderSfx(ctx,sfxId,outputRate,progress)
+function P.renderSfx(ctx,sfxId,outputRate,progress,opts)
+  opts=type(opts)=="table" and opts or {}
   assert(type(ctx)=="table" and type(ctx.project)=="table","portable MusyX SFX: context missing")
   outputRate=tonumber(outputRate) or 32000
   sfxId=math.floor(tonumber(sfxId) or -1);assert(sfxId>=0,"portable MusyX SFX: invalid GameSound id")
@@ -793,22 +1134,63 @@ function P.renderSfx(ctx,sfxId,outputRate,progress)
   -- Retail battle SEs are one-shots. Most naturally retire at sample/macro end;
   -- four seconds is only a safety ceiling for malformed or deliberately-looped
   -- source macros and prevents one bad ID from exploding the generated cache.
-  local pcm,peak,count,clipped=renderPcm(nil,ctx.pool,ctx.sdir,ctx.samp,nil,nil,outputRate,0,progress,ctx.sampleCache,voices,{maxTail=4,releaseFloor=.08,lastSec=0})
+  local pcm,peak,count,clipped=renderPcm(nil,ctx.pool,ctx.sdir,ctx.samp,nil,nil,outputRate,0,progress,ctx.sampleCache,voices,{maxTail=4,releaseFloor=.08,lastSec=0,quality=opts.quality})
   local wav=wav16(pcm,outputRate,2);assert(validWav(wav),"portable MusyX SFX: generated invalid WAV")
-  return wav,{frames=#pcm/4,peak=peak,voices=count,rate=outputRate,clipped=clipped,sfxId=sfxId,entry=entry}
+  return wav,{frames=#pcm/4,peak=peak,voices=count,rate=outputRate,clipped=clipped,sfxId=sfxId,entry=entry,quality=qualityName(opts),resampler=qualityName(opts)=="fast" and "linear-v9" or "lanczos4-256-v1"}
 end
 
-function P.renderSong(ctx,sequence,setupId,loopFrame48,outputRate,progress)
+-- Small deterministic parser seam used by the source-chain tests. Runtime code
+-- continues to consume only the public prepare/has/render functions.
+P._test=P._test or {}
+P._test.parsePool=parsePool
+P._test.parseSfxProject=parseSfxProject
+P._test.parseSong=parseSong
+P._test.tickSeconds=tickSeconds
+P._test.pcmAtLinear=pcmAtLinear
+P._test.pcmAtLanczos=pcmAtLanczos
+P._test.loopAwareTapIndex=loopAwareTapIndex
+P._test.lanczosWeights=LANCZOS_TABLE
+P._test.parseSdir=parseSdir
+P._test.decodeDsp=decodeDsp
+P._test.qualityName=qualityName
+P._test.ffi=ffi
+P._test.noteVoices=noteVoices
+P._test.renderPcm=renderPcm
+P._test.compileMacro=compileMacro
+
+function P.renderSong(ctx,sequence,setupId,loopSpec,outputRate,progress,opts)
+  opts=type(opts)=="table" and opts or {}
   outputRate=tonumber(outputRate) or 22050
   local song=parseSong(sequence)
-  local loopOut=loopFrame48 and floor(loopFrame48*outputRate/48000+0.5) or nil
+  local loopOut=nil
+  if loopSpec then
+    if loopSpec==true or loopSpec=="source" then
+      assert(tonumber(song.loopStartTick) and song.loopStartTick>0,
+        "portable MusyX: source song has no single authoritative loop-start tick")
+      loopOut=floor(tickSeconds(song,song.loopStartTick)*outputRate+0.5)
+    else
+      -- Compatibility seam for reference-only callers that still supply the
+      -- historical 48 kHz split frame. Production renderAll uses source=true.
+      loopOut=floor((assert(tonumber(loopSpec),"portable MusyX: invalid loop specification"))*outputRate/48000+0.5)
+    end
+  end
   local loopEndOut=nil
   if loopOut and song.loopEndTick then
     loopEndOut=floor(tickSeconds(song,song.loopEndTick)*outputRate+0.5)
     if loopEndOut<=loopOut then loopEndOut=nil end
   end
   local minFrames=loopOut and (loopEndOut or (loopOut+outputRate*6)) or outputRate*2
-  local pcm,peak,voices,clipped=renderPcm(ctx.project,ctx.pool,ctx.sdir,ctx.samp,song,setupId,outputRate,minFrames,progress,ctx.sampleCache)
+  local pcm,peak,voices,clipped=renderPcm(ctx.project,ctx.pool,ctx.sdir,ctx.samp,song,setupId,outputRate,minFrames,progress,ctx.sampleCache,nil,{quality=opts.quality})
+  local sourcePeak,outputGain=peak,1
+  if peak>1 then
+    -- Restored layers must not be hard-clipped at the 16-bit WAV boundary.
+    -- Re-render from the voice graph with ONE constant headroom gain for the
+    -- entire song (intro AND loop). No compression, EQ, or transient limiting;
+    -- never try to normalize the already-clipped first-pass PCM.
+    outputGain=.98/peak;pcm=nil
+    pcm,peak,voices,clipped=renderPcm(ctx.project,ctx.pool,ctx.sdir,ctx.samp,song,setupId,outputRate,minFrames,progress,ctx.sampleCache,nil,
+      {quality=opts.quality,outputGain=outputGain})
+  end
   local frames=#pcm/4
   if loopOut then
     assert(loopOut>0 and loopOut<frames,("portable MusyX: scaled loop frame %d outside render %d"):format(loopOut,frames))
@@ -818,21 +1200,23 @@ function P.renderSong(ctx,sequence,setupId,loopFrame48,outputRate,progress)
     local intro=wav16(pcm:sub(1,cut),outputRate,2)
     local loop=wav16(pcm:sub(cut+1,loopEndFrame*4),outputRate,2)
     assert(validWav(intro) and validWav(loop),"portable MusyX: generated invalid theme WAV")
-    return intro,loop,{frames=frames,loopEndFrame=loopEndFrame,sourceLoopEndTick=song.loopEndTick,peak=peak,voices=voices,rate=outputRate,clipped=clipped}
+    return intro,loop,{frames=frames,loopStartFrame=loopOut,sourceLoopStartTick=song.loopStartTick,
+      loopEndFrame=loopEndFrame,sourceLoopEndTick=song.loopEndTick,sourcePeak=sourcePeak,outputGain=outputGain,voiceRenderer="midi-note-ownership-v2",peak=peak,voices=voices,rate=outputRate,clipped=clipped,quality=qualityName(opts),resampler=qualityName(opts)=="fast" and "linear-v9" or "lanczos4-256-v1"}
   end
   local wav=wav16(pcm,outputRate,2);assert(validWav(wav),"portable MusyX: generated invalid WAV")
-  return wav,nil,{frames=frames,peak=peak,voices=voices,rate=outputRate,clipped=clipped}
+  return wav,nil,{frames=frames,sourcePeak=sourcePeak,outputGain=outputGain,voiceRenderer="midi-note-ownership-v2",peak=peak,voices=voices,rate=outputRate,clipped=clipped,quality=qualityName(opts),resampler=qualityName(opts)=="fast" and "linear-v9" or "lanczos4-256-v1"}
 end
 
 function P.renderAll(payload,send)
   send=send or function()end
   local rate=tonumber(payload.sampleRate) or 22050
+  local renderOpts={quality=payload.quality}
   local ctx=P.prepare(payload)
   local complete=0
   for i,song in ipairs(payload.songs or {}) do
     local source=tostring(song.source or ("song "..i));send({kind="source",source=source})
-    local intro,loop,stats=P.renderSong(ctx,assert(song.sequence,source..": sequence missing"),assert(tonumber(song.setup),source..": setup missing"),assert(tonumber(song.loopFrame),source..": loop frame missing"),rate,
-      function(frame,total) send({kind="heartbeat",source=source,frame=frame,total=total}) end)
+    local intro,loop,stats=P.renderSong(ctx,assert(song.sequence,source..": sequence missing"),assert(tonumber(song.setup),source..": setup missing"),true,rate,
+      function(frame,total) send({kind="heartbeat",source=source,frame=frame,total=total}) end,renderOpts)
     assert(stats.peak>0.00001,source..": portable synthesis produced silence")
     send({kind="asset",source=source.." intro",path=song.introPath,bytes=intro,stats=stats});complete=complete+1
     send({kind="asset",source=source.." loop",path=song.loopPath,bytes=loop,stats=stats});complete=complete+1
@@ -841,12 +1225,12 @@ function P.renderAll(payload,send)
   for i,shot in ipairs(payload.oneShots or {}) do
     local source=tostring(shot.source or ("one-shot "..i));send({kind="source",source=source})
     local wav,_,stats=P.renderSong(ctx,assert(shot.sequence,source..": sequence missing"),assert(tonumber(shot.setup),source..": setup missing"),nil,rate,
-      function(frame,total) send({kind="heartbeat",source=source,frame=frame,total=total}) end)
+      function(frame,total) send({kind="heartbeat",source=source,frame=frame,total=total}) end,renderOpts)
     assert(stats.peak>0.00001,source..": portable synthesis produced silence")
     send({kind="asset",source=source,path=shot.outputPath,bytes=wav,stats=stats});complete=complete+1
     wav=nil;if collectgarbage then pcall(collectgarbage,"step",300) end
   end
-  return {complete=complete,rate=rate,renderer="portable Lua MusyX battle fidelity v4 / source pan+volume / 48 kHz"}
+  return {complete=complete,rate=rate,quality=qualityName(renderOpts),renderer="Lua MusyX / "..qualityName(renderOpts).." / 48 kHz source timing"}
 end
 
 P.validWav=validWav

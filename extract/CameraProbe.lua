@@ -156,6 +156,10 @@ local DEFAULT_ARCHIVES={
   "camera_shake_data.fsys",
   "D4_casino_colo.fsys",    -- cam_casino_colo_intro + cam_ending_houou_*
   "D2_crater_colo.fsys",
+  "M2_earth_colo.fsys",     -- Pyrite Colosseum
+  "M4_bottom_colo.fsys",    -- Deep Colosseum
+  "M3_cave_1F_1_bf.fsys",   -- Relic Cave battle field
+  "S1_out_bf.fsys",         -- opening Outskirts battle field
 }
 
 function C.run(mod,disc,progress,generated,opts)

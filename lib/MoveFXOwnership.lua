@@ -62,17 +62,35 @@ local function specReady(spec)
   if WazaSequence and type(WazaSequence.canOwn)=="function" then
     local ok,owns=pcall(WazaSequence.canOwn,WazaSequence,spec)
     if ok and owns then return true end
+    -- A current source timeline is all-or-nothing. The fallback below exists
+    -- only for legacy GPT1-only caches; applying it to a partially decoded Waza
+    -- role is what let Bite suppress presentation with no executable chain.
+    if type(spec.wazaPhases)=="table" and #spec.wazaPhases>0 then return false end
   end
   if not (type(spec.textures)=="table" and #spec.textures>0
       and type(spec.generatorPrograms)=="table" and #spec.generatorPrograms>0
       and MoveFXVM and type(MoveFXVM.hasRole)=="function") then return false end
   return MoveFXVM.hasRole(spec,"attack") or MoveFXVM.hasRole(spec,"damage")
 end
-local function readySpec(id,move)
+local function selectedSpec(spec,ctx,payload)
+  if not (V and V.WazaPhasePolicy) then return spec end
+  local side=type(payload)=="table" and payload.side
+  if V.BattleSides and V.BattleSides.payload then
+    local ok,value=pcall(V.BattleSides.payload,ctx,payload,{"user","side"})
+    if ok and value then side=value end
+  end
+  local models=V.CurrentSpriteModels
+  local rec=models and models.stadiumActors and models.stadiumActors[side]
+  local actor=rec and rec.actor
+  return V.WazaPhasePolicy.select(spec,{dex=actor and actor.dex,
+    stage=type(payload)=="table" and payload.charging==true and "charge" or "attack"})
+end
+local function readySpec(id,move,ctx,payload)
   if not MoveFX then return nil,"move FX extractor unavailable" end
   local lastErr="source WZX unavailable"
   if type(MoveFX.peek)=="function" then
     local ok,spec,err=pcall(MoveFX.peek,id,move)
+    if ok then spec=selectedSpec(spec,ctx,payload) end
     if ok and specReady(spec) then return spec end
     lastErr=tostring(err or spec or lastErr)
   end
@@ -134,9 +152,9 @@ function O:event(ctx,name,payload)
   local isMove=name=="battle.move_used" or name=="battle.presentation_move"
   if isMove then
     local id,move=moveParts(payload)
-    local spec,err=readySpec(id,move)
+    local spec,err=readySpec(id,move,ctx,payload)
     if spec then
-      if self.active and self.active.stem==spec.stem
+      if self.active and self.active.spec==spec
           and (not b or not self.active.battle or matches(self.active.battle,b)) then
         return true
       end

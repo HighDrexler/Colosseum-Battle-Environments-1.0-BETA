@@ -78,6 +78,13 @@ local PASSIVE_SHOTS = {
   {eye={18,10,38},  focus={-1,5.2,-4},fov=33, hold=4.35, blend=1.00, travel={-1.0,.30,-1.4},focusTravel={.25,.06,.45}},
   {eye={-18,10,-38},focus={1,5.2,4}, fov=33, hold=4.35, blend=1.00, travel={1.0,.30,1.4}, focusTravel={-.25,.06,-.45}},
 }
+-- Command framing retains both trainers and both battle slots, with restrained
+-- same-side angle changes instead of one permanent distant master.
+local COMMAND_SHOTS = {
+  {eye={65,25,7},focus={0,5.8,0},fov=48,hold=5.8,blend=1.1,travel={-2.0,.3,-.6}},
+  {eye={64,26,-7},focus={0,5.8,0},fov=48,hold=5.4,blend=1.1,travel={-1.4,-.2,.8}},
+  {eye={62,24,1},focus={0,5.8,0},fov=47,hold=5.6,blend=1.0,travel={1.2,.25,.7}},
+}
 
 
 local state = {
@@ -92,6 +99,12 @@ local state = {
 }
 
 local function clamp(v,a,b) if v<a then return a elseif v>b then return b else return v end end
+local function atan2(y,x)
+  if math.atan2 then return math.atan2(y,x) end
+  if x>0 then return math.atan(y/x) end
+  if x<0 then return math.atan(y/x)+(y>=0 and math.pi or -math.pi) end
+  return y>0 and math.pi/2 or (y<0 and -math.pi/2 or 0)
+end
 local function wallClock()
   if love and love.timer and type(love.timer.getTime)=="function" then
     local ok,v=pcall(love.timer.getTime);if ok and type(v)=="number" then return v end
@@ -128,6 +141,11 @@ end
 local function stableSourcePose(raw)
   if not raw then state.sourcePose=nil;state.sourcePoseAt=state.time;return nil end
   local now=state.time
+  if raw.cut and state.sourceSerial~=raw.sourceSerial then
+    state.sourceSerial=raw.sourceSerial;state.sourcePose=copyPose(raw);state.sourcePoseAt=now
+    return copyPose(raw)
+  end
+  state.sourceSerial=raw.sourceSerial
   local dt=math.max(0,math.min(.08,now-(tonumber(state.sourcePoseAt) or now)))
   state.sourcePoseAt=now
   if not state.sourcePose then state.sourcePose=copyPose(raw);return copyPose(raw) end
@@ -179,12 +197,20 @@ local function arenaFrame(pose,arena)
   local out=copyPose(pose)
   local cam=arena and arena.camera
   local side=cam and tonumber(cam.side) or 58
-  local k=clamp(side/58,0.93,1.10)
+  local baseK=clamp(side/58,0.93,1.10)
+  -- Most arenas use the shared broadcast compositions at their authored radius.
+  -- Some source venues (notably Pyrite) have spectator architecture much closer
+  -- to the battle floor. Their retail cameras stay inside that lower bowl; use
+  -- data-driven radial/elevation compression rather than deleting source stands.
+  local radiusScale=clamp(cam and tonumber(cam.shotRadiusScale) or 1,0.55,1.20)
+  local heightScale=clamp(cam and tonumber(cam.shotHeightScale) or 1,0.55,1.20)
+  local k=baseK*radiusScale
   -- Larger environments move the camera itself farther away; this is more
   -- natural than endlessly increasing FOV and keeps Pokemon/trainer scale
   -- readable. Water Colosseum is k~=1 and therefore retains its stable framing.
   local f=out.focus
-  out.eye={f[1]+(out.eye[1]-f[1])*k, f[2]+(out.eye[2]-f[2])*(0.96+0.12*k), f[3]+(out.eye[3]-f[3])*k}
+  local vertical=(0.96+0.12*baseK)*heightScale
+  out.eye={f[1]+(out.eye[1]-f[1])*k, f[2]+(out.eye[2]-f[2])*vertical, f[3]+(out.eye[3]-f[3])*k}
   -- Realgam's identity lives above the battle deck: stacked crowd galleries and
   -- tower machinery. Bias the same held-shot compositions slightly upward
   -- rather than inventing extra cuts or a wider/fisheye lens.
@@ -214,26 +240,39 @@ end
 local function clampCameraVolume(pose,arena,phase)
   if not (pose and pose.eye and pose.focus) then return pose end
   local out=copyPose(pose);local spec=safeCameraSpec(arena)
+  local free=phase=="free"
   for i=1,3 do
     if not finite(out.eye[i]) then out.eye[i]=(i==2 and 20 or (i==1 and 54 or 13)) end
     if not finite(out.focus[i]) then out.focus[i]=(i==2 and 6 or 0) end
   end
   if not finite(out.fov) then out.fov=math.rad(40) end
   out.fov=clamp(out.fov,math.rad(spec.minFov or 31),math.rad(spec.maxFov or 52))
-  out.focus[2]=clamp(out.focus[2],3.8,9.2)
+  -- Compact source rooms can have authentic overhead geometry close to the
+  -- battle bowl. Let the venue narrow the optical target band as well as the
+  -- eye volume so source-Waza and blended shots cannot tilt back into it.
+  if free then
+    -- Manual composition is not an authored broadcast shot: permit vertical
+    -- aim/pan without imposing the narrow automatic optical-target band.
+    -- Physical eye height and outer venue radius still use the SAME limits.
+    out.focus[2]=clamp(out.focus[2],.75,math.max(1,math.min(24,(tonumber(spec.maxY) or 32)-1)))
+  else
+    out.focus[2]=clamp(out.focus[2],tonumber(spec.minFocusY) or 3.8,tonumber(spec.maxFocusY) or 9.2)
+  end
   local dx,dz=out.eye[1]-out.focus[1],out.eye[3]-out.focus[3]
   local horizontal=math.max(.001,math.sqrt(dx*dx+dz*dz))
   local dy=out.eye[2]-out.focus[2]
-  local pitch=math.deg(math.atan(dy,horizontal))
-  local maxPitch=tonumber(spec.maxPitch) or 24
-  local minPitch=tonumber(spec.minPitch) or -10
+  local pitch=math.deg(atan2(dy,horizontal))
+  local maxPitch=free and 65 or (tonumber(spec.maxPitch) or 24)
+  local minPitch=free and -18 or (tonumber(spec.minPitch) or -10)
   -- Attack/impact cameras should never become survey/bird's-eye shots. Source
   -- Waza cameras still choose the axis/composition; this cap only rejects the
   -- pathological elevation that hides the actual battle under the floor.
   if phase=="attack" or phase=="damage" or phase=="reaction" then maxPitch=math.min(maxPitch,21) end
   pitch=clamp(pitch,minPitch,maxPitch)
   local radius=math.sqrt(horizontal*horizontal+dy*dy)
-  radius=clamp(radius,tonumber(spec.minRadius) or 27,tonumber(spec.maxRadius) or 78)
+  local minRadius=tonumber(spec.minRadius) or 27
+  if free then minRadius=math.max(12,minRadius*.65) end
+  radius=clamp(radius,minRadius,tonumber(spec.maxRadius) or 78)
   local pr=math.rad(pitch);local hr=math.max(.001,math.cos(pr)*radius)
   local oldh=math.sqrt(dx*dx+dz*dz)
   local nx,nz
@@ -243,6 +282,7 @@ local function clampCameraVolume(pose,arena,phase)
   out.eye[2]=clamp(out.focus[2]+math.sin(pr)*radius,tonumber(spec.minY) or 6.5,tonumber(spec.maxY) or 32)
   return out
 end
+local arenaPoint,other
 local function projectPose(pose,p)
   local ex,ey,ez=pose.eye[1],pose.eye[2],pose.eye[3]
   local fx,fy,fz=pose.focus[1]-ex,pose.focus[2]-ey,pose.focus[3]-ez
@@ -367,7 +407,7 @@ local function sideFrom(ctx,payload,fields)
   end
   return nil
 end
-local function arenaPoint(arena,side,y)
+arenaPoint=function(arena,side,y)
   -- Camera coordinates live in STAGE space. Pokemon providers receive an
   -- actor view-projection with figureScale already multiplied into it, so
   -- arena.player/enemy are intentionally inverse-scaled actor coordinates.
@@ -385,7 +425,7 @@ local function trainerPoint(side,y)
   if side=="player" then return {13.2,y or 7.0,25.8} end
   return {-13.2,y or 7.0,-25.8}
 end
-local function other(side) return side=="enemy" and "player" or "enemy" end
+other=function(side) return side=="enemy" and "player" or "enemy" end
 local function manualPose()
   local r=state.radius; local ce=math.cos(state.elevation); local f=state.focus
   return {
@@ -403,25 +443,33 @@ local function shotPose(s,u)
     fov=math.rad(s.fov),
   }
 end
-local function passiveShot(arena)
-  local count=#PASSIVE_SHOTS
+local function cycleShot(shots)
+  local count=#shots
   if count==0 then return manualPose() end
   local total=0
-  for _,s in ipairs(PASSIVE_SHOTS) do total=total+s.hold+s.blend end
+  for _,s in ipairs(shots) do total=total+s.hold+s.blend end
   local t=state.idleClock%total
   for seq=1,count do
     local idx=((seq-1+state.shotOffset)%count)+1
-    local s=PASSIVE_SHOTS[idx]; local span=s.hold+s.blend
+    local s=shots[idx]; local span=s.hold+s.blend
     if t<=span then
       if t<=s.hold then return shotPose(s,t/math.max(0.01,s.hold)) end
       local nidx=(idx%count)+1
-      local a=shotPose(s,1); local b=shotPose(PASSIVE_SHOTS[nidx],0)
+      local a=shotPose(s,1); local b=shotPose(shots[nidx],0)
+      local ax,az=a.eye[1]-a.focus[1],a.eye[3]-a.focus[3]
+      local bx,bz=b.eye[1]-b.focus[1],b.eye[3]-b.focus[3]
+      local dot=(ax*bx+az*bz)/math.max(.001,math.sqrt((ax*ax+az*az)*(bx*bx+bz*bz)))
+      -- Opposing viewpoints are edits, not camera travel through the actors.
+      -- Hold the outgoing composition through its transition interval, then
+      -- cut once to the next shot. Nearby angles still get the authored dolly.
+      if dot<.5 then return a end
       return mix(a,b,(t-s.hold)/math.max(0.01,s.blend))
     end
     t=t-span
   end
-  return shotPose(PASSIVE_SHOTS[1],0)
+  return shotPose(shots[1],0)
 end
+local function passiveShot(arena)return cycleShot(PASSIVE_SHOTS) end
 
 local function trainerVisible(ctx,side)
   local provider=side=="player" and PlayerTrainer or Trainer
@@ -438,15 +486,13 @@ local function trainerPassiveMaster(ctx)
   local hasPlayer=trainerVisible(ctx,"player")
   local hasEnemy=trainerVisible(ctx,"enemy")
   if not (hasPlayer or hasEnemy) then return nil end
-  local drift=smooth((math.sin(state.idleClock*.20)+1)*.5)
-  local shot={eye={65,26,0},focus={0,5.8,0},fov=48,
-    travel={-2.2,.45,1.2},focusTravel={0,.08,0}}
+  local shot=cycleShot(COMMAND_SHOTS)
   if hasEnemy and not hasPlayer then
     shot.focus={-2.0,5.9,-3.5}
   elseif hasPlayer and not hasEnemy then
     shot.focus={2.0,5.9,3.5}
   end
-  return shotPose(shot,drift)
+  return shot
 end
 
 
@@ -585,6 +631,41 @@ local function eventShot(ctx,arena,side,kind,variant)
     return {eye={-sgn*(hasTrainer and 25 or 40),14,sgn*4},focus={midx,5.9,midz},fov=math.rad(hasTrainer and 41 or 45)}
   end
   return {eye={46,20,z+sgn*8},focus={a[1],6,z},fov=math.rad(37)}
+end
+
+-- The send-out shot follows the visible trainer's choreography, not the
+-- battle message timer. Composition remains a fallback until source camera
+-- tracks have been decoded and mapped to this arena's coordinate transform.
+local function liveSendoutShot(ctx,arena,requestedSide)
+  local chosen,side
+  for _,row in ipairs({{Trainer,"enemy"},{PlayerTrainer,"player"}}) do
+    local actor=row[1]
+    if (not requestedSide or row[2]==requestedSide) and actor and type(actor.sendoutStatus)=="function" then
+      local ok,status=pcall(actor.sendoutStatus,actor)
+      if ok and status and status.active and (not chosen or status.age<chosen.age) then chosen,side=status,row[2] end
+    end
+  end
+  if not chosen then return nil end
+  local pose=eventShot(ctx,arena,side,"switch",1)
+  if chosen.ball then
+    local tp=trainerPoint(side,6.6)
+    local u=math.max(0,math.min(1,(chosen.phase-.31)/.48))
+    -- During wind-up include the hand and torso; follow the projectile after release.
+    pose.focus={tp[1]+(chosen.ball[1]-tp[1])*u,tp[2]+(chosen.ball[2]-tp[2])*u,tp[3]+(chosen.ball[3]-tp[3])*u}
+  end
+  return pose,side
+end
+-- Shared by the four-slot presenter so second throws keep the same hand/ball
+-- framing and venue bounds as the initial singles-host sendout.
+function C:sendoutShot(ctx,arena,side)
+  local pose=liveSendoutShot(ctx,arena,side)
+  return pose and clampCameraVolume(pose,arena,"switch") or nil
+end
+function C:guardPose(pose,arena,phase)
+  return clampCameraVolume(pose,arena,phase)
+end
+function C:guardFreePose(pose,arena)
+  return clampCameraVolume(pose,arena,"free")
 end
 
 local function introShot(ctx)
@@ -791,7 +872,7 @@ function C:begin(ctx)
   state.time=0;state.idleClock=0;state.phaseAge=0;state.phase="intro";state.eventSide=nil;state.eventIndex=0;state.eventResult=nil;state.resultPending=nil;state.resultAt=0
   state.lastPose=nil;state.startPose=nil;state.special=nil;state.specialUntil=0
   state.shotLockUntil=0;state.pendingEvent=nil;state.lastCutTime=-999;state.lastEventName=nil;state.logicSpeed=battleSpeed(ctx)
-  state.sourcePose=nil;state.sourcePoseAt=0;state.wallAt=wallClock()
+  state.sourcePose=nil;state.sourceSerial=nil;state.sourcePoseAt=0;state.wallAt=wallClock()
   state.shotOffset=battleHash(ctx)%#PASSIVE_SHOTS
   state.manual=false;state.manualLocked=false;state.manualIdle=0;state.returning=false;resetManual()
 end
@@ -892,6 +973,8 @@ function C:update(ctx,dt)
       acceptEvent({name="battle.result",phase="exit",side=nil,indexed=false,ctx=ctx})
     end
   end
+  -- The decision-only controller replaces unrestricted legacy mouse input.
+  if V.FreeLookCamera then state.manualLocked=false;releaseManual();return end
   if pressed("f8") then
     state.manualLocked=not state.manualLocked
     if state.manualLocked then touchManual() else releaseManual() end
@@ -998,20 +1081,30 @@ function C:shot(ctx,phase,progress,base,arena)
   -- The event scheduler above is the sole owner of automatic shot changes.
   local activePhase=state.phase
   local target=targetFor(ctx,activePhase,base,arena);local pose
-  -- WazaSequence camera entries outrank the semantic CBE camera once their
-  -- source parameter curves are decoded. The handler currently preserves the
-  -- exact entry and returns nil rather than guessing a pose; this seam means the
-  -- future decoder does not require another camera architecture rewrite.
+  local sendoutTarget
+  if not state.manual and (activePhase=="intro" or activePhase=="switch" or activePhase=="passive" or activePhase=="command") then
+    sendoutTarget=liveSendoutShot(ctx,arena)
+    if sendoutTarget then target=sendoutTarget end
+  end
+  -- Waza phase framing follows the active effect and its live attachments.
+  -- These compositions approximate retail staging; full camera-curve decoding
+  -- can replace them through the same interface.
   local wh=V and V.WazaHandlers
   local sourceBlend=nil
+  local sourceCut=false
   if wh and type(wh.cameraPose)=="function" and not state.manual and (activePhase=="attack" or activePhase=="damage") then
     local ok,sourcePose=pcall(wh.cameraPose,ctx)
     if ok and type(sourcePose)=="table" and sourcePose.eye and sourcePose.focus and sourcePose.fov then
+      sourceCut=sourcePose.cut==true
       target=stableSourcePose(sourcePose)
       -- A source camera supplies composition, not permission to accelerate the
       -- lens. Keep the normal event blend; the wall-clock rate limiter above
       -- handles the fine motion inside the source shot.
       sourceBlend=math.max(.42,tonumber(sourcePose.blend) or .46)
+    else
+      -- A finished/missing source chapter must not leave a stale interpolation
+      -- origin for the next effect within the same semantic attack phase.
+      state.sourcePose=nil;state.sourceSerial=nil;state.sourcePoseAt=state.time
     end
   else
     state.sourcePose=nil;state.sourcePoseAt=state.time
@@ -1027,11 +1120,16 @@ function C:shot(ctx,phase,progress,base,arena)
   elseif activePhase=="passive" or activePhase=="command" then
     if state.startPose and state.phaseAge<0.72 then pose=mix(state.startPose,target,state.phaseAge/0.72) else pose=target end
   else
-    -- Waza supplies a source-authentic target composition, but easing remains
-    -- presentation-time so battle speed never multiplies camera velocity.
+    -- Hold/cut projectile chapters; other compositions retain presentation-time
+    -- easing. Arena visibility guards apply to both paths.
     local blend=sourceBlend or 0.46
-    pose=mix(state.startPose or base,target,state.phaseAge/math.max(.04,blend))
+    if sourceCut then pose=target else pose=mix(state.startPose or base,target,state.phaseAge/math.max(.04,blend)) end
   end
+  -- Blending starts from the host base/previous shot. On compact venues that
+  -- intermediate pose can itself lie outside the legal bowl even when the target
+  -- is safe (Pyrite's old intro began in the spectator balcony for this reason).
+  -- Re-apply the venue volume to the FINAL blended pose before the renderer sees it.
+  pose=clampCameraVolume(pose,arena,activePhase)
   state.lastPose=copyPose(pose);return pose,nil
 end
 function C:finish(ctx,reason)
@@ -1041,6 +1139,6 @@ function C:finish(ctx,reason)
   state.manual=false;state.manualLocked=false;state.manualIdle=0;state.returning=false
 end
 function C:status()
-  return {manual=state.manual,manualLocked=state.manualLocked,manualIdle=state.manualIdle,radius=state.radius,elevation=state.elevation,fov=state.fov,focus=copy3(state.focus),idleShots=#PASSIVE_SHOTS,director="colosseum-semantic-director-v12-safe-volume-readability",shotOffset=state.shotOffset,eventIndex=state.eventIndex,authoredZoomOut=AUTHORED_ZOOM_OUT,phase=state.phase,eventSide=state.eventSide,shotLockRemaining=math.max(0,state.shotLockUntil-state.time),pendingEvent=state.pendingEvent and state.pendingEvent.phase or nil,lastEvent=state.lastEventName,eventResult=state.eventResult,resultPending=state.resultPending,logicSpeed=state.logicSpeed,clock="presentation-time-speed-invariant",highSpeedMaster=false,mobileHudSafe=true,safeVolumes=true,subjectReadabilityGuard=true,sourceEyeSpeed=30,sourceFocusSpeed=22,sourceFovSpeed=24}
+  return {manual=state.manual,manualLocked=state.manualLocked,manualIdle=state.manualIdle,radius=state.radius,elevation=state.elevation,fov=state.fov,focus=copy3(state.focus),idleShots=#PASSIVE_SHOTS,commandShots=#COMMAND_SHOTS,idleAxisCuts=true,director="colosseum-semantic-director-v14-safe-idle-cuts",shotOffset=state.shotOffset,eventIndex=state.eventIndex,authoredZoomOut=AUTHORED_ZOOM_OUT,phase=state.phase,eventSide=state.eventSide,shotLockRemaining=math.max(0,state.shotLockUntil-state.time),pendingEvent=state.pendingEvent and state.pendingEvent.phase or nil,lastEvent=state.lastEventName,eventResult=state.eventResult,resultPending=state.resultPending,logicSpeed=state.logicSpeed,clock="presentation-time-speed-invariant",highSpeedMaster=false,mobileHudSafe=true,safeVolumes=true,subjectReadabilityGuard=true,sourceEyeSpeed=30,sourceFocusSpeed=22,sourceFovSpeed=24}
 end
 return C

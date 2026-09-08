@@ -19,14 +19,29 @@ local function ident()return {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1} end
 local function mul(a,b)
   local o={};for r=0,3 do for c=0,3 do local q=0;for k=0,3 do q=q+a[r*4+k+1]*b[k*4+c+1] end;o[r*4+c+1]=q end end;return o
 end
-local function localM(rx,ry,rz,sx,sy,sz,tx,ty,tz)
+local function localM(rx,ry,rz,sx,sy,sz,tx,ty,tz,parentScale)
   local cx,snx=math.cos(rx),math.sin(rx);local cy,sny=math.cos(ry),math.sin(ry);local cz,snz=math.cos(rz),math.sin(rz)
-  return {
+  local matrix={
     cz*cy*sx,(cz*sny*snx-snz*cx)*sy,(cz*sny*cx+snz*snx)*sz,tx,
     snz*cy*sx,(snz*sny*snx+cz*cx)*sy,(snz*sny*cx-cz*snx)*sz,ty,
     -sny*sx,cy*snx*sy,cy*cx*sz,tz,
     0,0,0,1,
   }
+  if parentScale then
+    for row=1,3 do
+      local divisor=parentScale[row]
+      if abs(divisor)<1e-8 then divisor=divisor<0 and -1e-8 or 1e-8 end
+      for column=1,3 do
+        local index=(row-1)*4+column
+        matrix[index]=matrix[index]*parentScale[column]/divisor
+      end
+    end
+  end
+  return matrix
+end
+local function inheritedScale(parentScale,sx,sy,sz,classical)
+  if classical then return parentScale end
+  return {sx*(parentScale and parentScale[1] or 1),sy*(parentScale and parentScale[2] or 1),sz*(parentScale and parentScale[3] or 1)}
 end
 -- Affine inverse (3x3 block via cofactor/adjugate, translation solved from it).
 -- Needed to build a per-bone skinning matrix (world * invert(bindWorld)) for
@@ -108,6 +123,8 @@ local function animScalar(blob,p,fmt,scale,limit)
   return b/scale,p+1
 end
 local function decodeFobj(a,fd)
+  local cached=a._fobjCache and a._fobjCache[fd]
+  if cached then return cached.track,cached.keys end
   local blob=a.blob;local len=u32(blob,fd+0x04+1) or 0;local start=f32(blob,fd+0x08+1) or 0
   local track=blob:byte(fd+0x0C+1) or 0;local vf=blob:byte(fd+0x0D+1) or 0;local tf=blob:byte(fd+0x0E+1) or 0
   local data=a:ptr(fd+0x10);if not data or len<=0 or len>16*1024*1024 then return track,{} end
@@ -122,27 +139,39 @@ local function decodeFobj(a,fd)
       if op==1 or op==2 or op==3 then value,p=animScalar(blob,p,vfmt,vscale,limit);time,p=packed(blob,p,limit)
       elseif op==4 then value,p=animScalar(blob,p,vfmt,vscale,limit);tan,p=animScalar(blob,p,tfmt,tscale,limit);time,p=packed(blob,p,limit)
       elseif op==5 then tan,p=animScalar(blob,p,tfmt,tscale,limit)
-      elseif op==6 then value,p=animScalar(blob,p,vfmt,vscale,limit) end
+      elseif op==6 then value,p=animScalar(blob,p,vfmt,vscale,limit);time,p=packed(blob,p,limit) end
       if value==nil or tan==nil then break end
       keys[#keys+1]={frame=clock,value=value,tan=tan or 0,op=op};clock=clock+(time or 0)
     end
   end
   if start~=0 then
-    local kept={};for _,k in ipairs(keys) do k.frame=k.frame-start;if k.frame>=0 then kept[#kept+1]=k end end;keys=kept
+    -- startframe is a SEEK into an existing FOBJ stream, not a filter.
+    -- Keep keys before the requested origin: they establish the value and
+    -- Hermite tangent on the left of frame zero. Removing them resets scale
+    -- tracks to zero (Blastoise/Diglett) and loses Articuno's neck rotation.
+    for _,k in ipairs(keys) do k.frame=k.frame-start end
   end
+  a._fobjCache=a._fobjCache or {}
+  a._fobjCache[fd]={track=track,keys=keys}
   return track,keys
 end
 local function fobjValue(keys,frame)
   if not keys or #keys==0 then return nil end
-  if #keys>1 and frame>=keys[#keys].frame then return keys[#keys].value end
+  -- A delayed stream has not written this channel yet; retain its JOBJ
+  -- transform. A pre-rolled stream, in contrast, still has its earlier keys.
+  if frame<keys[1].frame then return nil end
+  if frame>=keys[#keys].frame then
+    for i=#keys,1,-1 do if keys[i].op~=5 then return keys[i].value end end
+    return nil
+  end
   local p0,p1,d0,d1,t0,t1=0,0,0,0,0,0;local opPrev,op=1,1
   for _,k in ipairs(keys) do
     opPrev=op;op=k.op
-    if op==1 or op==2 then p0=p1;p1=k.value;d0=d1;if opPrev~=5 then d1=0 end;t0=t1;t1=k.frame
+    if op==1 or op==2 then p0=p1;p1=k.value;if opPrev~=5 then d0=d1;d1=0 end;t0=t1;t1=k.frame
     elseif op==3 then p0=p1;d0=d1;p1=k.value;d1=0;t0=t1;t1=k.frame
     elseif op==4 then p0=p1;p1=k.value;d0=d1;d1=k.tan;t0=t1;t1=k.frame
     elseif op==5 then d0=d1;d1=k.tan
-    elseif op==6 then p0=k.value;p1=k.value end
+    elseif op==6 then p0=p1;p1=k.value;t0=t1;t1=k.frame end
     if t1>frame and op~=5 then break end
     opPrev=op
   end
@@ -191,10 +220,9 @@ end
 
 local function nativePose(a,root,clipIndex,frame)
   -- nativePose clip ids are zero-based at the extractor boundary. Lua tables are
-  -- one-based, so clip 0 addresses the first HSD animation entry. GC6E01 B1
-  -- trainer archives expose that entry as a bind/T pose; clip 1 is the first
-  -- usable non-bind battle stance. Keep the API semantics explicit so clip 0
-  -- cannot be mistaken for an authored idle again.
+  -- one-based, so clip 0 addresses the first HSD animation entry. Its role
+  -- is asset-specific: some trainer DATs use a bind pose, while many PKX
+  -- Pokemon use a real animated idle. Callers resolve roles from metadata.
   local clips=nativeAnimations(a,root)
   local ci=math.max(0,math.floor(tonumber(clipIndex) or 0))
   local ar=clips[ci+1];if not ar then return nil,#clips end
@@ -211,6 +239,7 @@ local function nativePose(a,root,clipIndex,frame)
       if v~=nil then if track>=1 and track<=3 then s[track]=v elseif track>=5 and track<=7 then s[track+2]=v elseif track>=8 and track<=10 then s[track-4]=v end end
       fd=a:ptr(fd)
     end
+    s.classicalScale=(u32(b,aj+0x10+1) or 0)%2==1
     pose[j]=s
     pair(a:ptr(j+0x08),a:ptr(aj),depth+1);pair(a:ptr(j+0x0C),a:ptr(aj+0x04),depth+1)
   end
@@ -225,7 +254,20 @@ local function archiveAt(blob,base)
   if strings>base+fileSize then return nil end
   local a={blob=blob,base=base,fileSize=fileSize,dataSize=dataSize,data=data,reloc=reloc,relocCount=relocs,public=public,publicCount=pubs,external=external,externalCount=ext,strings=strings}
   function a:ptr(field)
-    local raw=u32(blob,field+1);if not raw or raw==0 then return nil end
+    local raw=u32(blob,field+1);if not raw then return nil end
+    if raw==0 then
+      -- Locate() relocates EVERY listed field, including data offset zero.
+      -- An unlisted zero is a null pointer. Build this set only when needed.
+      if not self._relocatedFields then
+        local fields={}
+        for i=0,self.relocCount-1 do
+          local offset=u32(blob,self.reloc+i*4+1)
+          if offset and offset>=0 and offset+4<=self.dataSize then fields[self.data+offset]=true end
+        end
+        self._relocatedFields=fields
+      end
+      if not self._relocatedFields[field] then return nil end
+    end
     local p=self.data+raw;if p<self.data or p>=self.data+self.dataSize then return nil end;return p
   end
   function a:publicSymbol(name)
@@ -347,6 +389,30 @@ local function colorDirectBytes(ctype)
   if ctype==2 or ctype==5 then return 4 end
   return 4
 end
+-- Optional arena-fidelity path. GX colors use a packed enum, NOT the
+-- numeric position/normal component enum. Leave default actor/MoveFX decoding
+-- unchanged unless the caller explicitly requests preserveVertexColors.
+local function packedVertexColor(blob,p,ctype)
+  local width=colorDirectBytes(ctype)
+  if ctype<0 or ctype>5 or p<1 or p+width-1>#blob then return nil,p end
+  local b1,b2,b3,b4=blob:byte(p,p+width-1)
+  local r,g,b,a
+  if ctype==0 then
+    local n=b1*256+b2
+    local r5=floor(n/2048);local g6=floor(n/32)%64;local b5=n%32
+    r=r5*8+floor(r5/4);g=g6*4+floor(g6/16);b=b5*8+floor(b5/4);a=255
+  elseif ctype==1 or ctype==2 then r,g,b,a=b1,b2,b3,255
+  elseif ctype==3 then
+    r=floor(b1/16)*17;g=(b1%16)*17;b=floor(b2/16)*17;a=(b2%16)*17
+  elseif ctype==4 then
+    local n=b1*65536+b2*256+b3
+    local r6=floor(n/262144)%64;local g6=floor(n/4096)%64
+    local b6=floor(n/64)%64;local a6=n%64
+    r=r6*4+floor(r6/16);g=g6*4+floor(g6/16)
+    b=b6*4+floor(b6/16);a=a6*4+floor(a6/16)
+  else r,g,b,a=b1,b2,b3,b4 end
+  return {r/255,g/255,b/255,a/255},p+width
+end
 local function parseDescs(a,p)
   local out={};local blob=a.blob
   for _=0,31 do
@@ -367,7 +433,12 @@ local function parseDescs(a,p)
   end
   return out
 end
-local function indexed(desc,idx,blob)
+local function indexed(desc,idx,blob,preserveColors)
+  if preserveColors and (desc.attr==11 or desc.attr==12) then
+    if not desc.array then return nil end
+    local stride=desc.stride>0 and desc.stride or colorDirectBytes(desc.ctype)
+    return packedVertexColor(blob,desc.array+idx*stride+1,desc.ctype)
+  end
   if not desc.array then return nil end
   local n=componentCount(desc.attr,desc.count,false);local sz=(desc.ctype==4 and 4) or ((desc.ctype==2 or desc.ctype==3) and 2 or 1);local stride=desc.stride>0 and desc.stride or n*sz
   local p=desc.array+idx*stride+1;local v={};for i=1,n do local q,d=readComp(blob,p,desc.ctype,desc.frac);v[i]=q;p=p+d end;return v
@@ -375,7 +446,7 @@ end
 local function direct(desc,blob,p)
   local n=componentCount(desc.attr,desc.count,true);local v={};for i=1,n do local q,d=readComp(blob,p,desc.ctype,desc.frac);v[i]=q;p=p+d end;return v,p
 end
-local function readVertex(descs,blob,p,posMap)
+local function readVertex(descs,blob,p,posMap,preserveColors)
   local out={}
   for _,d in ipairs(descs) do
     if d.attr<=8 then
@@ -394,14 +465,15 @@ local function readVertex(descs,blob,p,posMap)
         -- components. We do not need the color for CBE geometry, but consuming
         -- the exact packed width is critical or every following attribute/vertex
         -- is decoded at the wrong byte offset.
-        p=p+colorDirectBytes(d.ctype)
+        if preserveColors then out[d.attr],p=packedVertexColor(blob,p,d.ctype)
+        else p=p+colorDirectBytes(d.ctype) end
       else
         local v;v,p=direct(d,blob,p);out[d.attr]=v
       end
     elseif d.type==2 then
       local idx=blob:byte(p) or 0;p=p+1
       local dataIdx=(d.attr==9 and posMap and posMap[idx]) or idx
-      out[d.attr]=indexed(d,dataIdx,blob)
+      out[d.attr]=indexed(d,dataIdx,blob,preserveColors)
       -- GX_NRM_NBT3 encodes THREE independent indices in the display list.
       -- CBE only needs the first (normal) vector for lighting, but we must
       -- consume the binormal+tangent indices to keep the stream aligned.
@@ -409,7 +481,7 @@ local function readVertex(descs,blob,p,posMap)
     elseif d.type==3 then
       local idx=u16(blob,p) or 0;p=p+2
       local dataIdx=(d.attr==9 and posMap and posMap[idx]) or idx
-      out[d.attr]=indexed(d,dataIdx,blob)
+      out[d.attr]=indexed(d,dataIdx,blob,preserveColors)
       if (d.attr==10 or d.attr==25) and d.count==2 then p=p+4 end
     else return nil,p end
   end
@@ -602,7 +674,13 @@ local function triangles(kind,verts,out)
 end
 local POBJ_SHAPEANIM=0x1000
 local function appendDescs(dst,src)
-  for _,d in ipairs(src or {}) do dst[#dst+1]=d end
+  -- ShapeSet descriptors may point INTO the base descriptor array. GX
+  -- consumes one attribute per enum, never the duplicate tail of that array.
+  local seen={};for _,d in ipairs(dst) do seen[d.attr]=true end
+  for _,d in ipairs(src or {}) do
+    if not seen[d.attr] then dst[#dst+1]=d;seen[d.attr]=true end
+  end
+  table.sort(dst,function(a,b) return a.attr<b.attr end)
 end
 local function shapeVertexMap(a,shape)
   if not shape then return nil end
@@ -660,8 +738,9 @@ local function parseDisplay(a,pobj,world,budget,ownerJobj)
       for _=1,n do
         if p>pend then break end
         budget.displayOps=budget.displayOps+1
+        if budget.checkpoint and budget.displayOps%128==0 then budget.checkpoint() end
         if budget.displayOps>(budget.maxDisplayOps or 80000) then budget.exhausted="display decode operation budget";break end
-        local v;v,p=readVertex(descs,blob,p,posMap);if not v then break end;vs[#vs+1]=v
+        local v;v,p=readVertex(descs,blob,p,posMap,budget.preserveVertexColors);if not v then break end;vs[#vs+1]=v
       end
       if budget.exhausted then break end
       triangles(kind,vs,tris)
@@ -670,7 +749,9 @@ local function parseDisplay(a,pobj,world,budget,ownerJobj)
   end
   if guard>=8192 then budget.exhausted="display command budget" end
   local rows={}
-  for _,tri in ipairs(tris) do
+  for ti,tri in ipairs(tris) do
+    if budget.checkpoint and ti%64==0 then budget.checkpoint() end
+    local firstRow=#rows
     for _,v in ipairs(tri) do
       if budget.vertices+#rows>=(budget.maxVertices or 30000) then budget.exhausted="mesh vertex budget";break end
       local pos=v[9];if pos and #pos>=2 then
@@ -682,14 +763,24 @@ local function parseDisplay(a,pobj,world,budget,ownerJobj)
         end
         local x,y,z=pos[1] or 0,pos[2] or 0,pos[3] or 0;local wx,wy,wz=point(vertexWorld,x,y,z)
         local uv=v[13] or {0,0};local nr=v[10] or v[25] or {0,1,0};local nx,ny,nz=normal(vertexWorld,nr[1] or 0,nr[2] or 1,nr[3] or 0)
-        rows[#rows+1]={wx,wy,wz,uv[1] or 0,uv[2] or 0,nx,ny,nz}
+        local color=budget.preserveVertexColors and v[11]
+        if color then
+          -- Canonical extended row: XYZ, UV, RGBA, authored normal XYZ.
+          rows[#rows+1]={wx,wy,wz,uv[1] or 0,uv[2] or 0,color[1],color[2],color[3],color[4],nx,ny,nz}
+        else
+          rows[#rows+1]={wx,wy,wz,uv[1] or 0,uv[2] or 0,nx,ny,nz}
+        end
       end
+    end
+    if #rows-firstRow~=3 then
+      for i=#rows,firstRow+1,-1 do rows[i]=nil end
+      budget.incompleteTriangles=(budget.incompleteTriangles or 0)+1
     end
     if budget.exhausted then break end
   end
   return rows
 end
-local function decodeTextureObject(a,tobj,slot)
+local function decodeTextureObject(a,tobj,slot,sourceTextureState)
   if not tobj then return nil end
   local img=a:ptr(tobj+0x4C);if not img then return nil end
   local b=a.blob;local data=a:ptr(img);local w,h=u16(b,img+5),u16(b,img+7);local fmt=u32(b,img+9)
@@ -713,12 +804,58 @@ local function decodeTextureObject(a,tobj,slot)
   -- us from having to rediscover which texture stage was actually enabled.
   local wrapS=u32(b,tobj+0x34+1)
   local wrapT=u32(b,tobj+0x38+1)
-  return {
+  local flags=u32(b,tobj+0x40+1) or 0
+  local texture={
     w=w,h=h,format=fmt,rgba=rgba,dataOffset=data-a.data,
     wrapS=wrapS,wrapT=wrapT,slot=slot or 0,
-    texgen=u32(b,tobj+0x0C+1) or 0,
-    flags=u32(b,tobj+0x40+1) or 0,
+    texgen=u32(b,tobj+0x0C+1) or 0,flags=flags,
   }
+  -- Dense actor pose extraction keeps its original metadata/allocation cost.
+  if sourceTextureState~=true then return texture end
+  local function vector(off,default)
+    local v={}
+    for k=1,3 do local n=f32(b,tobj+off+(k-1)*4+1);v[k]=finite(n) and n or default end
+    return v
+  end
+  local blending=f32(b,tobj+0x44+1)
+  texture.coordinateMode=flags%16;texture.colorMap=floor(flags/0x10000)%16;texture.alphaMap=floor(flags/0x100000)%16
+  texture.blending=finite(blending) and blending or 1
+  texture.rotation=vector(0x10,0);texture.scale=vector(0x1C,1);texture.translation=vector(0x28,0)
+  texture.repeatS=b:byte(tobj+0x3C+1) or 1;texture.repeatT=b:byte(tobj+0x3D+1) or 1
+  return texture
+end
+
+-- SysDolphin MakeTextureMtx composes Scale * Rotation * Translation, with
+-- inverse UV scale, negated rotation Z/translation XY, and a mirrored-T phase.
+-- Ordinary static arena UVs can bake this affine stage without changing the
+-- canonical vertex layout. Actors and animated effect extractors do not opt in.
+local function sourceTextureMatrix(t)
+  if not t or t.coordinateMode~=0 or t.texgen~=4 then return nil end
+  local s,r,p=t.scale or {1,1,1},t.rotation or {0,0,0},t.translation or {0,0,0}
+  local rs,rt=tonumber(t.repeatS) or 1,tonumber(t.repeatT) or 1
+  if rs<=0 or rt<=0 then return nil end
+  local sx=abs(s[1])<1e-10 and 0 or rs/s[1]
+  local sy=abs(s[2])<1e-10 and 0 or rt/s[2]
+  local tm=localM(0,0,0,1,1,1,-p[1],-(p[2]+(t.wrapT==2 and s[2]/rt or 0)),p[3])
+  local rm=localM(r[1],r[2],-r[3],1,1,1,0,0,0)
+  local sm=localM(0,0,0,sx,sy,s[3],0,0,0)
+  return mul(sm,mul(rm,tm))
+end
+local function applySourceTextureState(rows,t,enabled)
+  if not enabled then return false end
+  local m=sourceTextureMatrix(t)
+  -- A varying Q requires projective interpolation in the GPU vertex schema.
+  -- Leave reflection/projected stages alone; the audited retail arena UV
+  -- stages all have constant Q=1 and are exactly representable as two UVs.
+  if not m or abs(m[9])>1e-10 or abs(m[10])>1e-10 then return false end
+  local q=m[11]+m[12]
+  if abs(q)<1e-10 then return false end
+  for _,v in ipairs(rows) do
+    local u,w=v[4],v[5]
+    v[4]=(m[1]*u+m[2]*w+m[3]+m[4])/q
+    v[5]=(m[5]*u+m[6]*w+m[7]+m[8])/q
+  end
+  return true
 end
 
 -- HSD_MOBJ can carry a chain of up to eight TOBJs, while RenderFlags TEX0..TEX7
@@ -727,7 +864,7 @@ end
 -- auxiliary map as the Pokemon's diffuse image or report an active material as
 -- "untextured". Match the native material contract and select the first ENABLED
 -- stage instead.
-local function firstEnabledTexture(a,mobj)
+local function firstEnabledTexture(a,mobj,sourceTextureState)
   if not mobj then return nil end
   local b=a.blob
   local renderFlags=u32(b,mobj+0x04+1) or 0
@@ -736,7 +873,7 @@ local function firstEnabledTexture(a,mobj)
   while tobj and slot<8 do
     local enabled=(math.floor(renderFlags/(2^(slot+4)))%2)==1
     if enabled then
-      local tex=decodeTextureObject(a,tobj,slot)
+      local tex=decodeTextureObject(a,tobj,slot,sourceTextureState)
       if tex then return tex end
     end
     tobj=a:ptr(tobj+0x04)
@@ -863,11 +1000,12 @@ local function candidateRoots(a,maxRoots)
 end
 local function extractRoot(a,root,opts)
   opts=opts or {}
+  if opts.checkpoint then opts.checkpoint("Decoding source geometry") end
   local groups={};local seen={};local min={1e30,1e30,1e30};local max={-1e30,-1e30,-1e30};local vertices=0
   local pose,clipCount=nil,0
   if opts.nativePose then pose,clipCount=nativePose(a,root,tonumber(opts.nativePose.clip) or 0,tonumber(opts.nativePose.frame) or 0) end
   local worldByJobj={};local mapSeen={};local jointWorlds={};local jointIndexByJobj={};local jointParents={}
-  local parentByJobj={};local flagsByJobj={};local inverseBindByJobj={}
+  local parentByJobj={};local flagsByJobj={};local inverseBindByJobj={};local scaleByJobj={}
   local function jobjSRT(j)
     local v=pose and pose[j]
     if v then return v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8],v[9] end
@@ -877,6 +1015,7 @@ local function extractRoot(a,root,opts)
   end
   local function mapWorld(j,parent,parentJobj,depth)
     if not j or mapSeen[j] or depth>256 or not plausibleJobj(a,j) then return end
+    if opts.checkpoint then opts.checkpoint() end
     mapSeen[j]=true
     parentByJobj[j]=parentJobj
     flagsByJobj[j]=u32(a.blob,j+0x04+1) or 0
@@ -884,7 +1023,11 @@ local function extractRoot(a,root,opts)
     -- PNMTXIDX is resolved inside each enveloped POBJ's own matrix palette; it
     -- is deliberately NOT interpreted as an index into this JOBJ traversal.
     local rx,ry,rz,sx,sy,sz,tx,ty,tz=jobjSRT(j)
-    local world=mul(parent,localM(rx,ry,rz,sx,sy,sz,tx,ty,tz));worldByJobj[j]=world
+    local parentScale=opts.nativeScaleCompensation and parentJobj and scaleByJobj[parentJobj] or nil
+    local classical=hasFlag(flagsByJobj[j],0x8)
+    if pose and pose[j] then classical=pose[j].classicalScale end
+    if opts.nativeScaleCompensation then scaleByJobj[j]=inheritedScale(parentScale,sx,sy,sz,classical) end
+    local world=mul(parent,localM(rx,ry,rz,sx,sy,sz,tx,ty,tz,parentScale));worldByJobj[j]=world
     -- ModelSequence/PKX body-map indices address the model's ordered JOBJ
     -- array. HSD builds that order with the same child-before-sibling DFS used
     -- here. Preserve the full source joint origin table so battle particles can
@@ -898,10 +1041,89 @@ local function extractRoot(a,root,opts)
     -- wrist and can incorrectly attach the ball to an elbow/shoulder).
     local parentIndex=parentJobj and jointIndexByJobj[parentJobj] or nil
     jointParents[ji+1]=parentIndex and (parentIndex+1) or 0
-    mapWorld(a:ptr(j+0x08),world,j,depth+1);mapWorld(a:ptr(j+0x0C),parent,parentJobj,depth+1)
+    -- An INSTANCE child is a reference to an already loaded joint, not a
+    -- transform child. Mapping it under this owner corrupts the shared bank's
+    -- rest matrix and makes subsequent instances inherit the first placement.
+    if not (opts.nativeSceneInstances and hasFlag(flagsByJobj[j],0x1000)) then mapWorld(a:ptr(j+0x08),world,j,depth+1) end
+    mapWorld(a:ptr(j+0x0C),parent,parentJobj,depth+1)
   end
   mapWorld(root,ident(),nil,0)
-  local budget={displayOps=0,vertices=0,maxDisplayOps=opts.maxDisplayOps or 80000,maxVertices=opts.maxVertices or 30000,jobjs=0,dobjs=0,pobjs=0,shapeIndexMap=opts.shapeIndexMap~=false,worldByJobj=worldByJobj,parentByJobj=parentByJobj,flagsByJobj=flagsByJobj,inverseBindByJobj=inverseBindByJobj,inverseBindResolved={},envelopeCoordCache={},envelopeWorldCache={},skinFix=opts.skinFix~=false,honorRenderPass=opts.honorRenderPass==true,skipShadowMaterials=opts.skipShadowMaterials==true,filterPlaceholders=opts.filterPlaceholders==true}
+  -- Trainer legs use authored two-bone IK chains. Ordinary SRT evaluation
+  -- leaves their ankles under the unsolved knee transform, tilting the feet.
+  -- Resolve only the explicit source JOINT1/JOINT2/EFFECTOR + IKHINT contract.
+  local ikDiagnostics=opts.nativeIKDiagnostics and {} or nil
+  if opts.nativeTrainerIK then
+    local function sub(x,y)return {x[1]-y[1],x[2]-y[2],x[3]-y[3]} end
+    local function dot(x,y)return x[1]*y[1]+x[2]*y[2]+x[3]*y[3] end
+    local function cross(x,y)return {x[2]*y[3]-x[3]*y[2],x[3]*y[1]-x[1]*y[3],x[1]*y[2]-x[2]*y[1]} end
+    local function unit(x)local d=sqrt(dot(x,x));if d<1e-8 then return nil end;return {x[1]/d,x[2]/d,x[3]/d},d end
+    local function pos(m)return {m[4],m[8],m[12]} end
+    local function constraint(j,kind,subtype)
+      local r=a:ptr(j+0x3c);local guard=0
+      while r and guard<64 do
+        local f=u32(a.blob,r+4+1) or 0
+        if hasFlag(f,0x80000000) and floor(f/0x10000000)%8==kind and (not subtype or f%0x10000000==subtype) then return a:ptr(r+8),f end
+        r=a:ptr(r);guard=guard+1
+      end
+    end
+    local function basis(x,z,origin,sc)
+      local y=unit(cross(z,x));if not y then return nil end
+      z=unit(cross(x,y));sc=sc or {1,1,1}
+      return {x[1]*sc[1],y[1]*sc[2],z[1]*sc[3],origin[1],x[2]*sc[1],y[2]*sc[2],z[2]*sc[3],origin[2],x[3]*sc[1],y[3]*sc[2],z[3]*sc[3],origin[3],0,0,0,1}
+    end
+    local function childWorld(j,parent)
+      local rx,ry,rz,sx,sy,sz,tx,ty,tz=jobjSRT(j)
+      return mul(parent,localM(rx,ry,rz,sx,sy,sz,tx,ty,tz,opts.nativeScaleCompensation and scaleByJobj[parentByJobj[j]] or nil))
+    end
+    for upper,flags in pairs(flagsByJobj) do
+      if floor(flags/0x200000)%4==1 then
+        local lower=a:ptr(upper+8);local eff=lower and a:ptr(lower+8)
+        local h1=constraint(upper,4);local h2,flip=lower and constraint(lower,4)
+        -- Lua's logical operators discard extra return values.
+        if lower then h2,flip=constraint(lower,4) end
+        local target=eff and constraint(eff,1,1)
+        local parent=parentByJobj[upper]
+        if h1 and h2 and target and worldByJobj[target] and parent and worldByJobj[parent]
+          and floor((flagsByJobj[lower] or 0)/0x200000)%4==2 and floor((flagsByJobj[eff] or 0)/0x200000)%4==3 then
+          local hip=pos(worldByJobj[parent]);local goal=pos(worldByJobj[target]);local delta=sub(goal,hip)
+          local dir,d=unit(delta);local sc1=scaleByJobj[upper] or {1,1,1};local sc2=scaleByJobj[lower] or sc1
+          local l1=(f32(a.blob,h1+1) or 0)*sc1[1];local l2=(f32(a.blob,h2+1) or 0)*sc2[1]
+          local old=worldByJobj[upper];local z={old[3],old[7],old[11]}
+          local bend=dir and unit(cross(z,dir))
+          if dir and bend and l1>1e-6 and l2>1e-6 then
+            z=unit(cross(dir,bend))
+            local along=(d*d+l1*l1-l2*l2)/(2*d)
+            along=math.max(-l1,math.min(l1,along))
+            local height=sqrt(math.max(0,l1*l1-along*along))*(hasFlag(flip or 0,4) and -1 or 1)
+            local knee={hip[1]+dir[1]*along+bend[1]*height,hip[2]+dir[2]*along+bend[2]*height,hip[3]+dir[3]*along+bend[3]*height}
+            local x1=unit(sub(knee,hip));local x2=unit(sub(goal,knee))
+            if x1 and x2 then
+              worldByJobj[upper]=basis(x1,z,hip,sc1);worldByJobj[lower]=basis(x2,z,knee,sc2)
+              local ew=childWorld(eff,worldByJobj[lower])
+              ew[4]=knee[1]+x2[1]*l2;ew[8]=knee[2]+x2[2]*l2;ew[12]=knee[3]+x2[3]*l2;worldByJobj[eff]=ew
+              local visited={}
+              local function descend(j,p,depth)
+                if not j or visited[j] or depth>256 then return end;visited[j]=true
+                if j~=lower and j~=eff then worldByJobj[j]=childWorld(j,p) end
+                descend(a:ptr(j+8),worldByJobj[j],depth+1);descend(a:ptr(j+12),p,depth+1)
+              end
+              -- Feet may be siblings of the effector under the lower bone.
+              -- Rebuild the whole changed subtree, preserving solved matrices.
+              descend(a:ptr(upper+8),worldByJobj[upper],0)
+              if ikDiagnostics then
+                ikDiagnostics[#ikDiagnostics+1]={upper=jointIndexByJobj[upper]+1,
+                  lower=jointIndexByJobj[lower]+1,effector=jointIndexByJobj[eff]+1,
+                  target=jointIndexByJobj[target]+1,length1=l1,length2=l2}
+              end
+            end
+          end
+        end
+      end
+    end
+    for j,index in pairs(jointIndexByJobj) do jointWorlds[index+1]=pos(worldByJobj[j]) end
+  end
+
+  local budget={checkpoint=opts.checkpoint,preserveVertexColors=opts.preserveVertexColors==true,displayOps=0,vertices=0,maxDisplayOps=opts.maxDisplayOps or 80000,maxVertices=opts.maxVertices or 30000,jobjs=0,dobjs=0,pobjs=0,shapeIndexMap=opts.shapeIndexMap~=false,worldByJobj=worldByJobj,parentByJobj=parentByJobj,flagsByJobj=flagsByJobj,inverseBindByJobj=inverseBindByJobj,inverseBindResolved={},envelopeCoordCache={},envelopeWorldCache={},skinFix=opts.skinFix~=false,honorRenderPass=opts.honorRenderPass==true,skipShadowMaterials=opts.skipShadowMaterials==true,filterPlaceholders=opts.filterPlaceholders==true}
   local maxJobjs=opts.maxJobjs or 1024;local maxDobjs=opts.maxDobjs or 4096;local maxPobjs=opts.maxPobjs or 8192
   -- Keep joint-world diagnostics because they are useful for detecting a truly
   -- degenerate source transform. Enveloped vertices are placed by their palette
@@ -914,13 +1136,32 @@ local function extractRoot(a,root,opts)
     local scale,trans=worldScaleTrans(world)
     jointStats[#jointStats+1]={jobj=j,scale=scale,trans=trans}
   end
-  local function walk(j,parent,depth)
-    if budget.exhausted or not j or seen[j] or depth>256 or not plausibleJobj(a,j) then return end
+  local activeInstances={}
+  local function walk(j,parent,depth,instanceMatrix,singleRoot)
+    if budget.exhausted or not j or (not instanceMatrix and seen[j]) or activeInstances[j] or depth>256 or not plausibleJobj(a,j) then return end
     budget.jobjs=budget.jobjs+1;if budget.jobjs>maxJobjs then budget.exhausted="JOBJ traversal budget";return end
-    seen[j]=true
+    if not instanceMatrix then seen[j]=true end
+    activeInstances[j]=true
     local b=a.blob;local rx,ry,rz,sx,sy,sz,tx,ty,tz=jobjSRT(j)
-    local world=mul(parent,localM(rx,ry,rz,sx,sy,sz,tx,ty,tz))
+    local world=worldByJobj[j]
     local flags=u32(b,j+0x04+1) or 0
+    if opts.nativeSceneInstances and hasFlag(flags,0x1000) then
+      -- HSD_JObjDispAll uses instance.world * inverse(target.world), then
+      -- submits ONLY the referenced subtree. It must neither traverse the
+      -- target's next sibling nor deduplicate other placements of this bank.
+      local target=a:ptr(j+8)
+      if not hasFlag(flags,0x10) and target then
+        local targetWorld=worldByJobj[target]
+        if not targetWorld then budget.exhausted="unresolved scene instance target" else
+          local delta=mul(world,invertAffine(targetWorld))
+          budget.sceneInstances=(budget.sceneInstances or 0)+1
+          walk(target,world,depth+1,delta,true)
+        end
+      end
+      if not singleRoot then walk(a:ptr(j+12),parent,depth+1,instanceMatrix) end
+      activeInstances[j]=nil
+      return
+    end
     -- SysDolphin HSD_JObj visibility/type bits. Pokemon extraction honors both
     -- explicit HIDDEN and the native OPA/XLU/TEXEDGE render-pass membership;
     -- zero-pass helper geometry must never become an ordinary CBE mesh.
@@ -976,6 +1217,13 @@ local function extractRoot(a,root,opts)
         localP=localP+1;budget.pobjs=budget.pobjs+1;if budget.pobjs>maxPobjs then budget.exhausted="POBJ traversal budget";break end
         local rows=parseDisplay(a,pobj,world,budget,j)
         if #rows>0 then
+          if instanceMatrix then
+            for _,v in ipairs(rows) do
+              v[1],v[2],v[3]=point(instanceMatrix,v[1],v[2],v[3])
+              local k=#v>=12 and 10 or 6
+              v[k],v[k+1],v[k+2]=normal(instanceMatrix,v[k],v[k+1],v[k+2])
+            end
+          end
           local accept=true
           if type(opts.groupFilter)=="function" then
             local okFilter,result=pcall(opts.groupFilter,rows,mat)
@@ -988,9 +1236,10 @@ local function extractRoot(a,root,opts)
             -- that CBE will never render.
             if not texLoaded then
               tex=nil
-              if opts.textures~=false then tex=firstEnabledTexture(a,mobj) end
+              if opts.textures~=false then tex=firstEnabledTexture(a,mobj,opts.sourceTextureState==true) end
               texLoaded=true
             end
+            applySourceTextureState(rows,tex,opts.sourceTextureState==true)
             for _,v in ipairs(rows) do for k=1,3 do if v[k]<min[k] then min[k]=v[k] end;if v[k]>max[k] then max[k]=v[k] end end end
             vertices=vertices+#rows;budget.vertices=vertices
             noteJointWorld(j,world)
@@ -1009,7 +1258,9 @@ local function extractRoot(a,root,opts)
       end
       dobj=a:ptr(dobj+0x04)
     end
-    walk(a:ptr(j+0x08),world,depth+1);walk(a:ptr(j+0x0C),parent,depth+1)
+    walk(a:ptr(j+0x08),world,depth+1,instanceMatrix)
+    if not singleRoot then walk(a:ptr(j+0x0C),parent,depth+1,instanceMatrix) end
+    activeInstances[j]=nil
   end
   walk(root,ident(),0)
   local jointScaleMin,jointScaleMax,jointScaleMedian,jointOutliers=nil,nil,nil,0
@@ -1034,12 +1285,27 @@ local function extractRoot(a,root,opts)
     envelopeCoordEntries=budget.envelopeCoordEntries or 0,singleEnvelopeCoord=budget.singleEnvelopeCoord or 0,singleEnvelopeNoCoord=budget.singleEnvelopeNoCoord or 0,inverseBindMissing=budget.inverseBindMissing or 0,
     honorRenderPass=budget.honorRenderPass,nonRenderJobjs=budget.nonRenderJobjs or 0,
     nonRenderDobjs=budget.nonRenderDobjs or 0,shadowDobjs=budget.shadowDobjs or 0,
-    placeholderGroupsRemoved=#removedGroups,placeholderVertsRemoved=placeholderVerts}
+    placeholderGroupsRemoved=#removedGroups,placeholderVertsRemoved=placeholderVerts,sceneInstances=budget.sceneInstances or 0}
   if budget.exhausted then return nil,budget.exhausted,stats end
-  if vertices<60 then return nil,"too few renderable vertices",stats end
+  -- Explicitly linked Waza transforms can be skeleton-only (Mist). Accept
+  -- only a declared source root with joints and NO polygon objects; a broken
+  -- mesh must not be relabelled as a successful invisible transform carrier.
+  local transformOnly=opts.semanticRootsOnly==true and opts.allowTransformOnly==true and opts.preserveJointMatrices==true
+    and vertices==0 and #filteredGroups==0 and #jointWorlds>0 and (budget.jobjs or 0)>0 and (budget.pobjs or 0)==0
+  if vertices<math.max(3,tonumber(opts.minVertices) or 60) and not transformOnly then return nil,"too few renderable vertices",stats end
+  if transformOnly then min={0,0,0};max={0,0,0} end
   -- Bounds cover source-visible geometry accepted by the decoder. The optional
   -- legacy spatial placeholder filter (normally OFF) runs after these numbers.
-  return {groups=filteredGroups,vertexCount=vertices,jointPositions=jointWorlds,jointParents=jointParents,
+  local jointMatrices
+  if opts.preserveJointMatrices then
+    jointMatrices={}
+    for j,index in pairs(jointIndexByJobj) do
+      local m=worldByJobj[j];local copy={}
+      for k=1,12 do copy[k]=m[k] end
+      jointMatrices[index+1]=copy
+    end
+  end
+  return {transformOnly=transformOnly,nativeIK=ikDiagnostics,groups=filteredGroups,vertexCount=vertices,jointPositions=jointWorlds,jointParents=jointParents,jointMatrices=jointMatrices,
     bounds={min=min,max=max,center={(min[1]+max[1])/2,(min[2]+max[2])/2,(min[3]+max[3])/2}}},nil,stats
 end
 
@@ -1067,10 +1333,18 @@ end
 -- crowd/effects, water). Trainer extraction wants one best actor root, but an
 -- arena must combine every semantic model-set root or entire galleries and
 -- effect layers disappear. This path intentionally avoids relocation guesses.
+local function decodeArchives(blob,opts)
+  local session=opts and opts.decodeSession
+  if session and session.blob==blob and session.archives then return session.archives end
+  local archives=H.findArchives(blob)
+  if session then session.blob=blob;session.archives=archives end
+  return archives
+end
+
 function H.extractSceneModel(blob,opts)
   opts=opts or {}
   if type(blob)~="string" then return nil,"HSD source is not bytes" end
-  local archives=H.findArchives(blob);if #archives==0 then return nil,"HSD archive not found" end
+  local archives=decodeArchives(blob,opts);if #archives==0 then return nil,"HSD archive not found" end
   local groups,total={},0
   local min,max={1e30,1e30,1e30},{-1e30,-1e30,-1e30}
   local rootCount,seenRoot=0,{}
@@ -1080,7 +1354,13 @@ function H.extractSceneModel(blob,opts)
       if root and not seenRoot[root] then
         seenRoot[root]=true;rootCount=rootCount+1
         if type(opts.progress)=="function" then pcall(opts.progress,rootCount,0) end
-        local model=select(1,extractRoot(a,root,opts))
+        local model,why=extractRoot(a,root,opts)
+        -- Empty semantic carriers are valid, but a failed native instance or
+        -- exhausted decode budget must not turn a partial venue into a ready
+        -- cache just because another modelset happened to contain geometry.
+        if not model and opts.nativeSceneInstances and why~="too few renderable vertices" then
+          return nil,("scene modelset %d failed: %s"):format(rootCount,tostring(why))
+        end
         if model then
           for _,g in ipairs(model.groups or {}) do groups[#groups+1]=g end
           total=total+(tonumber(model.vertexCount) or 0)
@@ -1090,7 +1370,7 @@ function H.extractSceneModel(blob,opts)
     end
   end
   if total<60 then return nil,("no renderable HSD scene modelsets (%d roots)"):format(rootCount) end
-  return {groups=groups,vertexCount=total,sceneRoots=rootCount,
+  return {groups=groups,vertexCount=total,sceneRoots=rootCount,textureStateVersion=opts.sourceTextureState==true and 1 or nil,
     bounds={min=min,max=max,center={(min[1]+max[1])/2,(min[2]+max[2])/2,(min[3]+max[3])/2}}}
 end
 
@@ -1154,7 +1434,7 @@ end
 function H.extractModel(blob,opts)
   opts=opts or {}
   if type(blob)~="string" then return nil,"HSD source is not bytes" end
-  local archives=H.findArchives(blob);if #archives==0 then return nil,"HSD archive not found" end
+  local archives=decodeArchives(blob,opts);if #archives==0 then return nil,"HSD archive not found" end
   local best=nil;local rootCount=0;local lastBudget=nil;local maxPartial=0;local shapeSeen=0
   for _,a in ipairs(archives) do
     -- Character PKX files expose authoritative model roots through scene_data.
@@ -1188,4 +1468,5 @@ function H.extractModel(blob,opts)
   end
   return best
 end
+H._test={packedVertexColor=packedVertexColor,decodeFobj=decodeFobj,fobjValue=fobjValue,nativeAnimations=nativeAnimations,localMatrix=localM,inheritedScale=inheritedScale,multiply=mul,nativePose=nativePose,sourceTextureMatrix=sourceTextureMatrix,applySourceTextureState=applySourceTextureState,decodeTextureObject=decodeTextureObject,extractRoot=extractRoot}
 return H

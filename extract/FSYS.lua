@@ -46,7 +46,11 @@ function F.decompressLZSS(blob,expected,opts)
   local bounded=(expected and expected>0)
   local limit=bounded and expected or maxOutput
 
+  local checkpointAt=16384
   while src<=srcEnd and outN<limit do
+    if opts.checkpoint and outN>=checkpointAt then
+      checkpointAt=outN+16384;opts.checkpoint("Decompressing source model")
+    end
     local flags=byte(blob,src);src=src+1
     if not flags then break end
     for _=1,8 do

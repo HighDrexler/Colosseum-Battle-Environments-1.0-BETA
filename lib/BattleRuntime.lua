@@ -1,5 +1,5 @@
 local V=...
-local R={installed=false,activeBattle=nil,pendingEnd=nil,finishWrapper=nil,
+local R={installed=false,activeBattle=nil,pendingEnd=nil,pendingEndReason=nil,pendingEndSince=nil,finishWrapper=nil,
   captureSoundWrapper=nil,captureSoundInner=nil,captureSoundBridge=false,nativeCaughtSuppressed=0,
   movePlayWrapper=nil,movePlayInner=nil,stereoWrapper=nil,stereoInner=nil,moveSoundBridge=false,nativeMoveSoundsSuppressed=0,
   modelPrewarm=nil,entryTiming=nil,exitTiming=nil}
@@ -22,6 +22,8 @@ local MoveFXOwnership=V.MoveFXOwnership
 local BattleSides=V.BattleSides
 local WazaHandlers=V.WazaHandlers
 local MoveFXExtractor=V.MoveFXExtractor
+local ResidentPrewarm=V.ResidentPrewarm
+local FrameWork=V.FrameWork
 
 local function platformOS()
   if love and love.system and type(love.system.getOS)=="function" then
@@ -146,7 +148,10 @@ local function dispatch(name,payload)
     if not side and type(payload)=="table" then side=payload.side or payload.targetSide end
     if BattleSides and type(BattleSides.value)=="function" then side=BattleSides.value(side) or side end
     local replacement=type(payload)=="table" and (payload.replacement or payload.newBattler or payload.battler or payload.target) or nil
-    if side then pcall(PokemonActors.prewarmSwitch,battle,side,replacement) end
+    if side then
+      pcall(PokemonActors.prewarmSwitch,battle,side,replacement,
+        ANDROID_RUNTIME and {allowExtract=false,deferCold=true} or nil)
+    end
   end
   if BattleDirector and type(BattleDirector.event)=="function" then
     pcall(BattleDirector.event,BattleDirector,ctx,name,payload)
@@ -222,40 +227,45 @@ local function beginBattle(payload)
 
   -- HARD OWNERSHIP CONTRACT:
   -- If CBE is equipped and COLOSSEUM ARENAS is enabled, CBE's local host owns
-  -- the complete BattleState world/compositor on BOTH generations. Stadium,
-  -- Battle Art, Dramatic Shape and any other full-stage provider are never
-  -- allowed to become the battle host. They may contribute Pokemon artwork or
-  -- portable battleActors through CurrentSpriteModels, but arena/camera/trainers
-  -- and BattleState presentation flow remain CBE-authored without exception.
+  -- the complete BattleState world/compositor on BOTH generations while it can
+  -- produce a valid frame. Stadium/Battle Art may contribute Pokemon artwork or
+  -- portable battleActors, but not the stage. A CBE render fault is the single
+  -- safety exception: that frame fails open to the authoritative engine field
+  -- rather than suppressing the battle into black.
   --
   -- Older builds delegated Gen I to Stadium's provider host when present. That
   -- allowed Battle Art staging selected inside Stadium to replace the arena,
   -- which is the regression this branch removes.
   if StadiumBridge then StadiumBridge.setDelegated(false) end
 
-  -- Model readiness is part of CBE's battle-entry contract. The old path
-  -- deliberately deferred HSD scene creation until draw() to avoid a black
-  -- transition stall; that traded one pause for a much worse visible late
-  -- spawn on high-detail Pokemon. Prepare both active battlers and only the
-  -- native action banks their current moves require before the arena opens.
-  local modelStart=wallNow()
-  if PokemonActors and type(PokemonActors.prewarmBattle)=="function" then
-    local okWarm,result=pcall(PokemonActors.prewarmBattle,battle)
-    if okWarm then R.modelPrewarm=result else R.modelPrewarm={failed=2,error=tostring(result)} end
-  end
-  local modelEnd=wallNow()
-
+  -- Android battle entry must establish a drawable CBE host BEFORE any Pokemon
+  -- cache/model work. The transition reaches its black resolve before this event;
+  -- doing source extraction or a large GPU upload first can therefore leave the
+  -- device staring at a black frame with no arena compositor alive yet.
   local hostStart=wallNow()
   local began=StandaloneHost.begin(battle)
   local hostEnd=wallNow()
-  R.entryTiming={totalMs=math.max(0,(hostEnd-entryStart)*1000),modelMs=math.max(0,(modelEnd-modelStart)*1000),
-    hostMs=math.max(0,(hostEnd-hostStart)*1000),began=began and true or false}
+
+  -- Desktop keeps the established eager active-pair readiness policy. Android
+  -- promotes only already-generated models here and queues genuinely cold models
+  -- for cooperative work AFTER the arena has successfully presented a frame.
+  -- No source extraction is permitted on this battle.started boundary.
+  local modelStart=wallNow()
+  if began and PokemonActors and type(PokemonActors.prewarmBattle)=="function" then
+    local opts=ANDROID_RUNTIME and {allowExtract=false,deferCold=true} or nil
+    local okWarm,result=pcall(PokemonActors.prewarmBattle,battle,opts)
+    if okWarm then R.modelPrewarm=result else R.modelPrewarm={failed=2,error=tostring(result)} end
+  else
+    R.modelPrewarm={ready=0,failed=0,deferred=0,hostUnavailable=not began}
+  end
+  local modelEnd=wallNow()
+  R.entryTiming={totalMs=math.max(0,(modelEnd-entryStart)*1000),modelMs=math.max(0,(modelEnd-modelStart)*1000),
+    hostMs=math.max(0,(hostEnd-hostStart)*1000),began=began and true or false,androidDeferred=ANDROID_RUNTIME and true or false}
   if NativeTrainerSprites then
     if began then NativeTrainerSprites:begin({battle=battle})
     else
-      -- Even a source/cache failure must not hand ownership to another battle
-      -- compositor. Keep CBE's staging bridge authoritative and fail only this
-      -- native trainer-picture suppression seam.
+      -- Host acquisition failed, so CBE is not presenting the world this battle.
+      -- Do not suppress native trainer pictures on top of the fail-open field.
       NativeTrainerSprites:finish({battle=battle})
     end
   end
@@ -271,6 +281,9 @@ local function finishPresentation(battle,reason)
   end
   local hostFinishStart=wallNow()
   if StandaloneHost then StandaloneHost.finish(reason or "battle.ended") end
+  if PokemonActors and type(PokemonActors.cancelBattlePrewarm)=="function" then
+    pcall(PokemonActors.cancelBattlePrewarm,"battle-ended")
+  end
   local hostFinishEnd=wallNow()
   -- A delegated Stadium compositor has no StandaloneHost session to own actor
   -- cleanup. Close CBE's portable actors explicitly at the same authoritative
@@ -296,11 +309,11 @@ local function finishPresentation(battle,reason)
   if ANDROID_RUNTIME then
     if PokemonActors and type(PokemonActors.trimRuntimeMemory)=="function" then
       local t0=wallNow()
-      -- Keep a bounded eight-species working set. Nothing is released while
-      -- residency is <=8, eliminating the battle-end eviction/reload cycle that
-      -- was still visible as occasional route-to-route stutter in 1.7.9. Once
-      -- above the cap, four party priorities + four recent species win the LRU.
-      pcall(PokemonActors.trimRuntimeMemory,{game=battle and battle.game,keepParty=4,keepRecent=4,softLimit=8})
+      -- Protect the entire six-slot player party. The previous four-slot guard
+      -- could evict slots 5-6 after every mobile battle and then rebuild them
+      -- when a menu/switch touched them. Keep a still-bounded ten-species set:
+      -- six party priorities plus four recent encounter species.
+      pcall(PokemonActors.trimRuntimeMemory,{game=battle and battle.game,keepParty=6,keepRecent=4,softLimit=10})
       pokemonTrimMs=math.max(0,(wallNow()-t0)*1000)
     end
     -- Do not enqueue model materialization back into ordinary overworld input
@@ -330,27 +343,38 @@ local function finishPresentation(battle,reason)
   if game and ArenaCatalog and type(ArenaCatalog.selected)=="function" and ArenaCatalog.selected(game)=="random"
       and type(ArenaCatalog.primeRandom)=="function" then
     local t0=wallNow();pcall(ArenaCatalog.primeRandom,game);randomPrimeMs=math.max(0,(wallNow()-t0)*1000)
+    -- The next RANDOM venue is known now, but never materialize it on the battle
+    -- exit seam. Add it to the stable-overworld coordinator instead.
+    if ResidentPrewarm and type(ResidentPrewarm.queueArena)=="function" then
+      pcall(ResidentPrewarm.queueArena,game,"post-battle-random")
+    end
   end
   R.exitTiming={totalMs=math.max(0,(wallNow()-exitStart)*1000),hostFinishMs=math.max(0,(hostFinishEnd-hostFinishStart)*1000),
     pokemonTrimMs=pokemonTrimMs,wazaTrimMs=wazaTrimMs,randomPrimeMs=randomPrimeMs}
   R.activeBattle=nil
   R.pendingEnd=nil
+  R.pendingEndReason=nil
+  R.pendingEndSince=nil
 end
 
 local function endBattle(payload)
   dispatch("battle.ended",payload)
   local battle=(type(payload)=="table" and payload.battle) or R.activeBattle
   battle=Compat and Compat.prepare(battle) or battle
-  -- Gen 2's pure battle model announces the outcome before its screen has
-  -- replayed the queued killing hit, faint, EXP, money, and victory messages.
-  -- Keep the presentation alive until BattleState:finishBattle reaches the
-  -- actual screen boundary. Gen 1 emits this event at its visual boundary and
-  -- retains the original immediate cleanup.
-  if Compat and Compat.isGen2Battle(battle) then
-    R.pendingEnd=battle
-    return
-  end
-  finishPresentation(battle,"battle.ended")
+  -- Never tear the CBE compositor down directly from battle.ended. Both engine
+  -- generations can emit/forward the result while the battle screen is still
+  -- the frame source for an exit transition. Releasing StandaloneHost here can
+  -- expose one native white-field/HUD frame before the overworld fade captures
+  -- its source -- the brief vanilla flash visible in the reported end-of-battle
+  -- clip. Latch the final CBE frame until the authoritative screen boundary.
+  --
+  -- Gen 2 owns that boundary through completeBattle() below. Gen 1 is released by
+  -- the input.step post-step seam only after the battle state has actually left
+  -- the stack, ensuring any transition snapshot taken during the engine step is
+  -- still sourced from the CBE composite.
+  R.pendingEnd=battle
+  R.pendingEndSince=wallNow()
+  R.pendingEndReason=(Compat and Compat.isGen2Battle(battle)) and "gen2.screen.finished" or "gen1.stack-exited"
 end
 
 local function installGen2FinishBoundary()
@@ -360,21 +384,89 @@ local function installGen2FinishBoundary()
   if not ok or type(BattleState)~="table" or type(BattleState.finishBattle)~="function" then
     return false
   end
-  if BattleState.finishBattle==R.finishWrapper then return true end
-  local inner=BattleState.finishBattle
+  local boundary=type(BattleState.completeBattle)=="function" and "completeBattle" or "finishBattle"
+  if BattleState[boundary]==R.finishWrapper then return true end
+  local inner=BattleState[boundary]
   R.finishWrapper=function(self,...)
     local results={pcall(inner,self,...)}
     local success=table.remove(results,1)
+    if not success then error(results[1],0) end
     local battle=Compat and Compat.prepare(self) or self
     local pending=R.pendingEnd
     if pending and ((Compat and Compat.matches(pending,battle)) or pending==battle) then
       finishPresentation(battle,"gen2.screen.finished")
     end
-    if not success then error(results[1],0) end
     return unpack(results)
   end
-  BattleState.finishBattle=R.finishWrapper
+  BattleState[boundary]=R.finishWrapper
   return true
+end
+
+function R.runWorkFrame(game,topBefore,topAfter)
+  local stateChanged=topBefore~=topAfter
+  local perfNow=wallNow()
+  if not R.activeBattle and not stateChanged then
+    -- Ordinary resident/prewarm work belongs ONLY on the true overworld
+    -- state. The previous `not battle + unchanged stack` test also matched
+    -- PC/Pokedex/Summary/dialogue screens, so an unrelated arena/trainer/
+    -- MoveFX upload could land directly on a menu input frame and freeze
+    -- the game + audio for seconds. Two explicit exceptions remain:
+    --   1) an active information-viewer lease, whose scheduler is restricted
+    --  to that viewer's already-cached, viewer-safe model promotion;
+    --   2) Hard Cache Save, an explicit build operation that must progress
+    --  while its settings screen is open.
+    local onOverworld=FrameWork and FrameWork.isOverworld(game,topAfter) or (topAfter and topAfter.isOverworld==true)
+    local viewerWork=false
+    local hardCacheWork=false
+    if ResidentPrewarm then
+      if type(ResidentPrewarm.viewerActive)=="function" then
+    local ok,v=pcall(ResidentPrewarm.viewerActive);viewerWork=ok and v==true
+      end
+      if type(ResidentPrewarm.hardCacheRunning)=="function" then
+    local ok,v=pcall(ResidentPrewarm.hardCacheRunning);hardCacheWork=ok and v==true
+      end
+    end
+    if ResidentPrewarm and type(ResidentPrewarm.pump)=="function" then
+      if onOverworld or viewerWork or hardCacheWork then pcall(ResidentPrewarm.pump,game) end
+    elseif onOverworld and PokemonActors and type(PokemonActors.pumpPartyPrewarm)=="function" then
+      -- Compatibility fallback for stripped integrations that omit the
+      -- coordinator: keep the old one-species queue rather than bulk warm.
+      pcall(PokemonActors.pumpPartyPrewarm,game)
+    end
+    -- Only a tiny incremental GC step remains in interactive Android TRUE
+    -- overworld frames. Even incremental GC is kept out of 3D menu browsing
+    -- so driver/Lua cleanup cannot coincide with rapid species changes.
+    if onOverworld and ANDROID_RUNTIME and perfNow>=androidGcNextAt and PokemonActors and type(PokemonActors.gcStep)=="function" then
+      pcall(PokemonActors.gcStep,24);androidGcNextAt=perfNow+0.18
+    end
+  elseif R.activeBattle and not stateChanged and ResidentPrewarm
+      and ResidentPrewarm.viewerActive and ResidentPrewarm.viewerActive() then
+    -- An optional Party/Summary overlay still belongs to the current battle.
+    -- Permit ONLY the selected viewer's resumable jobs, not startup/arena work.
+    pcall(ResidentPrewarm.pump,game,true)
+  elseif R.activeBattle and not stateChanged and ANDROID_RUNTIME and PokemonActors
+      and type(PokemonActors.pumpBattlePrewarm)=="function" then
+    local presented=false
+    if StandaloneHost and type(StandaloneHost.status)=="function" then
+      local okStatus,status=pcall(StandaloneHost.status)
+      presented=okStatus and type(status)=="table" and status.presented==true and status.failOpen~=true
+    end
+    if presented then
+      local okPump,worked,pending=pcall(PokemonActors.pumpBattlePrewarm,3)
+      if okPump and (worked==true or (tonumber(pending) or 0)>0) then return end
+    end
+    if perfNow>=androidActionWarmNextAt and type(PokemonActors.pumpActionPrewarm)=="function" then
+      pcall(PokemonActors.pumpActionPrewarm,1);androidActionWarmNextAt=perfNow+0.18
+    end
+  elseif R.activeBattle and not stateChanged and perfNow>=androidActionWarmNextAt and PokemonActors and type(PokemonActors.pumpActionPrewarm)=="function" then
+    -- Exact source action banks are staged rather than bulk-uploaded on
+    -- battle.started. One bank per stable frame window keeps transition latency
+    -- bounded without changing battle timing.
+    pcall(PokemonActors.pumpActionPrewarm,1);androidActionWarmNextAt=perfNow+0.07
+  end
+end
+function R.attachFrame(game)
+  return FrameWork and FrameWork.attach(game,R.runWorkFrame) or false
 end
 
 function R.install()
@@ -394,26 +486,35 @@ function R.install()
       local result=next(game,dt)
       local topAfter=stackTop(game)
       local stateChanged=topBefore~=topAfter
+
+      -- Gen 1 exit-presentation latch. battle.ended is delivered during the
+      -- engine step, but the same step may still need the current battle frame
+      -- as the source for BattleReturn/MapEntryAfterBattle. Keep CBE resident
+      -- through that work and release only after the battle state is no longer
+      -- top-of-stack. This removes the single-frame native battle leak without
+      -- delaying battle logic, map music restoration, or the actual fade.
+      if R.pendingEnd and not (Compat and Compat.isGen2Battle(R.pendingEnd)) then
+        local stillBattle=false
+        if topAfter then
+          stillBattle=(topAfter==R.pendingEnd)
+          if not stillBattle and Compat and type(Compat.matches)=="function" then
+            local okMatch,matched=pcall(Compat.matches,R.pendingEnd,topAfter)
+            stillBattle=okMatch and matched==true
+          end
+        end
+        if not stillBattle then
+          finishPresentation(R.pendingEnd,R.pendingEndReason or "gen1.stack-exited")
+        end
+      end
+
       if BattleDirector and R.activeBattle and type(BattleDirector.update)=="function" then
         pcall(BattleDirector.update,BattleDirector,contextFor(R.activeBattle),dt)
       end
-      if ANDROID_RUNTIME then
-        local t=wallNow()
-        if not R.activeBattle then
-          -- Only a tiny incremental GC step remains in interactive overworld
-          -- frames, and even that is skipped on ANY state-transition frame.
-          -- Arena, trainer, Pokemon and MoveFX materialization now happens at
-          -- explicit game-ready/battle-ready seams instead of opportunistically
-          -- inside player input.
-          if not stateChanged and t>=androidGcNextAt and PokemonActors and type(PokemonActors.gcStep)=="function" then
-            pcall(PokemonActors.gcStep,24);androidGcNextAt=t+0.18
-          end
-        elseif not stateChanged and t>=androidActionWarmNextAt and PokemonActors and type(PokemonActors.pumpActionPrewarm)=="function" then
-          -- Native action banks are exact source data but no longer all upload in
-          -- battle.started. Drain one small bank at a time only after the battle
-          -- screen is already stable, independent of battle speed.
-          pcall(PokemonActors.pumpActionPrewarm,1);androidActionWarmNextAt=t+0.18
-        end
+      -- Legacy hosts/tests without Game.update retain the old paced fallback.
+      -- On native Gen I/II, preparation drains once AFTER the real update.
+      if not (FrameWork and FrameWork.active(game)) then
+        R.attachFrame(game)
+        if not (FrameWork and FrameWork.attached(game)) then R.runWorkFrame(game,topBefore,topAfter) end
       end
       if StandaloneHost then
         -- Last-resort arbitration seam: if a later-priority mod rewrapped
@@ -435,13 +536,15 @@ function R.install()
     mod.events:on("battle.ended",endBattle)
   end
 
+  R.attachFrame(mod.game)
   R.installed=true
   return true
 end
 
 function R.status()
   return {installed=R.installed,active=R.activeBattle~=nil,pendingEnd=R.pendingEnd~=nil,
-    endBoundary=(Compat and Compat.current and Compat.current()==2) and "gen2.screen.finished" or "battle.ended",
+    endBoundary=(Compat and Compat.current and Compat.current()==2) and "gen2.screen.finished" or "gen1.stack-exited",
+    exitPresentationLatch=R.pendingEnd~=nil and (R.pendingEndReason or "pending") or "idle",
     captureSoundBridge=R.captureSoundBridge==true,nativeCaughtSuppressed=R.nativeCaughtSuppressed or 0,
     moveSoundBridge=R.moveSoundBridge==true,nativeMoveSoundsSuppressed=R.nativeMoveSoundsSuppressed or 0,
     modelPrewarm=R.modelPrewarm,entryTiming=R.entryTiming,exitTiming=R.exitTiming,

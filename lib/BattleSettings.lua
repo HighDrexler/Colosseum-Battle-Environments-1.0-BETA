@@ -1,6 +1,6 @@
 local S={}
 local installed=false
-local modRef,Trainer,Music,ArenaCatalog,BattleMenuUI,CacheManager,TrainerRoster,Compat
+local modRef,Trainer,Music,ArenaCatalog,BattleMenuUI,CacheManager,TrainerRoster,Compat,AudioFidelity
 local GEN1_START=table.concat({"Start","Menu"})
 
 local function prefs(game)
@@ -8,6 +8,8 @@ local function prefs(game)
     return {
       music="normal",arena="auto",arenasEnabled=true,cameraEnabled=true,pokemonModelsEnabled=true,
       playerModel="red",enemyTrainerModel="auto",rivalModel="leaf",
+      doubleBattlesEnabled=true,abilitiesEnabled=true,freeLookEnabled=true,
+      autoProgressEnabled=true,bossIntroEnabled=false,battleSoundsEnabled=true,
     }
   end
   local p=game.save.colosseumBattle
@@ -23,6 +25,16 @@ local function prefs(game)
   p.pokemonModelsEnabled=p.pokemonModelsEnabled and true or false
 
   -- Migrate older boolean trainer settings into the current model selectors.
+  if p.battleSoundsEnabled==nil then p.battleSoundsEnabled=true end
+  p.battleSoundsEnabled=p.battleSoundsEnabled==true
+  if p.bossIntroEnabled==nil then p.bossIntroEnabled=false end
+  p.bossIntroEnabled=p.bossIntroEnabled==true
+  if p.doubleBattlesEnabled==nil then p.doubleBattlesEnabled=true end
+  p.doubleBattlesEnabled=p.doubleBattlesEnabled==true
+  if p.abilitiesEnabled==nil then p.abilitiesEnabled=true end
+  p.abilitiesEnabled=p.abilitiesEnabled==true
+  if p.freeLookEnabled==nil then p.freeLookEnabled=true end
+  if p.autoProgressEnabled==nil then p.autoProgressEnabled=true end
   local legacy=p.sprites
   if p.playerModel==nil then
     p.playerModel=(p.playerTrainerModel==false or legacy=="off") and "off" or "red"
@@ -47,7 +59,7 @@ local function prefs(game)
   local validMusic={random=true,normal=true,first=true,cipher_peon=true,miror_b=true,cipher_admin=true,mirakle_b=true,semifinal=true,final=true,link1=true,link2=true,link3=true,original=true}
   if p.music=="colosseum" or p.music=="wild" or p.music=="trainer" or p.music=="gym" then p.music="normal" end
   if not validMusic[p.music] then p.music="normal" end
-  local validArena={auto=true,random=true,water=true,orre_colosseum=true,realgam_colosseum=true,outdoor_wild=true,mt_battle_summit=true}
+  local validArena={auto=true,random=true,water=true,orre_colosseum=true,relic_chamber=true,relic_cave=true,outskirts=true,pyrite_colosseum=true,deep_colosseum=true,realgam_colosseum=true,outdoor_wild=true,mt_battle_summit=true,cipher_lab_underground=true}
   if not validArena[p.arena] then p.arena="auto" end
   return p
 end
@@ -94,16 +106,32 @@ local function openBattleMenu(game,returnId,returnParent)
   local environmentToggle={keepOpen=true}
   local cameraToggle={keepOpen=true}
   local pokemonModelsToggle={keepOpen=true}
+  local doublesToggle={keepOpen=true}
+  local abilitiesToggle={keepOpen=true}
+  local bossIntroToggle={keepOpen=true}
+  local autoProgressToggle={keepOpen=true}
+  local freeLookToggle={keepOpen=true}
+  local soundsToggle={keepOpen=true}
+  local audioQualityRow={keepOpen=true}
   local musicRow={keepOpen=true}
   local arenaRow={keepOpen=true}
   local playerTrainerRow={keepOpen=true}
   local enemyTrainerRow={keepOpen=true}
   local rivalRow={keepOpen=true}
+  local hardCacheRow={keepOpen=true}
   local cacheRow={keepOpen=true}
   local function refresh()
     environmentToggle.label="COLOSSEUM ARENAS  "..(p.arenasEnabled and "ON" or "OFF")
     cameraToggle.label="COLOSSEUM CAMERA  "..(p.cameraEnabled and "ON" or "OFF")
     pokemonModelsToggle.label="COLOSSEUM MODELS  "..(p.pokemonModelsEnabled and "ON" or "OFF")
+    freeLookToggle.label="FREE LOOK CAMERA  "..(p.freeLookEnabled~=false and "ON" or "OFF")
+    autoProgressToggle.label="AUTO BATTLE FLOW  "..(p.autoProgressEnabled~=false and "ON" or "OFF")
+    soundsToggle.label="BATTLE SOUNDS  "..(p.battleSoundsEnabled and "COLOSSEUM" or "ORIGINAL")
+    local aq=AudioFidelity and AudioFidelity.status(modRef) or {}
+    audioQualityRow.label="AUDIO FIDELITY  "..(aq.pending and "UPDATE QUEUED" or "CACHE OPTIONS")
+    bossIntroToggle.label="BOSS INTRO  "..(p.bossIntroEnabled and "ON" or "OFF")
+    doublesToggle.label="DOUBLE BATTLES  "..(p.doubleBattlesEnabled and "ON" or "OFF")
+    abilitiesToggle.label="ABILITIES  "..(p.abilitiesEnabled and "ON" or "OFF")
     local musicLabel=(Music and Music.themeLabel and Music.themeLabel(game,p.music)) or tostring(p.music):upper()
     musicRow.label="MUSIC    "..musicLabel
     local arenaLabel="AUTO"
@@ -121,6 +149,16 @@ local function openBattleMenu(game,returnId,returnParent)
     playerTrainerRow.label="PLAYER MODEL     "..choiceLabel(p.playerModel,"player")
     enemyTrainerRow.label="ENEMY TRAINERS   "..choiceLabel(p.enemyTrainerModel,"enemy")
     rivalRow.label="RIVAL MODEL      "..choiceLabel(p.rivalModel,"rival")
+    local hs=CacheManager and CacheManager.hardCacheStatus and CacheManager.hardCacheStatus() or {running=false,ready=false,pending=0,total=0}
+    if hs.running and hs.paused then hardCacheRow.label="HARD CACHE SAVE   PAUSED / RESUME"
+    elseif hs.running then
+      local total=math.max(tonumber(hs.total) or 0,(tonumber(hs.done) or 0)+(tonumber(hs.pending) or 0))
+      hardCacheRow.label=("HARD CACHE SAVE   BUILDING %d/%d"):format(tonumber(hs.done) or 0,total)
+    elseif hs.stage=="failed" then hardCacheRow.label="HARD CACHE SAVE   INCOMPLETE / RETRY"
+    elseif hs.ready then hardCacheRow.label="HARD CACHE SAVE   READY / REFRESH"
+    elseif hs.teamReady then hardCacheRow.label="HARD CACHE SAVE   TEAM READY / MORE"
+    elseif hs.needsShinyRefresh then hardCacheRow.label="HARD CACHE SAVE   UPDATE SHINIES"
+    else hardCacheRow.label="HARD CACHE SAVE   BUILD" end
     local cs=CacheManager and CacheManager.inspect and CacheManager.inspect() or {sourceReady=false,sourceStatus="UNKNOWN"}
     cacheRow.label="ROM SOURCE   "..(cs.sourceReady and "READY" or tostring(cs.sourceStatus or "NOT IMPORTED"))
   end
@@ -136,6 +174,20 @@ local function openBattleMenu(game,returnId,returnParent)
   pokemonModelsToggle.onSelect=function()
     p.pokemonModelsEnabled=not p.pokemonModelsEnabled
     refresh()
+  end
+  doublesToggle.onSelect=function()
+    p.doubleBattlesEnabled=not p.doubleBattlesEnabled
+    refresh()
+  end
+  abilitiesToggle.onSelect=function()
+    p.abilitiesEnabled=not p.abilitiesEnabled
+    refresh()
+  end
+  freeLookToggle.onSelect=function()p.freeLookEnabled=not p.freeLookEnabled;refresh()end
+  autoProgressToggle.onSelect=function() p.autoProgressEnabled=not p.autoProgressEnabled;refresh() end
+  soundsToggle.onSelect=function() p.battleSoundsEnabled=not p.battleSoundsEnabled;refresh() end
+  bossIntroToggle.onSelect=function()
+    p.bossIntroEnabled=not p.bossIntroEnabled;refresh()
   end
   musicRow.onSelect=function()
     local options=(Music and Music.themeOptions and Music.themeOptions(game)) or {{id="normal",label="NORMAL BATTLE"},{id="original",label="ORIGINAL / OFF"}}
@@ -154,6 +206,47 @@ local function openBattleMenu(game,returnId,returnParent)
     local picker=Menu.new(game,rows,{tx=1,ty=1,tw=19,maxVisible=8})
     if BattleMenuUI and BattleMenuUI.mark then BattleMenuUI.mark(picker,"BATTLE MUSIC",rows,8,"COLOSSEUM SOUNDTRACK") end
     for i,opt in ipairs(options) do if opt.id==p.music then picker.index=i;picker:clampScroll();break end end
+    game.stack:push(picker)
+  end
+
+  audioQualityRow.onSelect=function()
+    if not AudioFidelity then return end
+    local quality={keepOpen=true};local apply={keepOpen=true};local cancel={keepOpen=true};local info={keepOpen=true}
+    local armed,errorMessage=false,nil
+    local function labels()
+      local st=AudioFidelity.status(modRef)
+      quality.label="NEW RENDERS: "..st.preference:upper()..(st.preference=="auto" and (" ("..st.effective:upper()..")") or "")
+      apply.label=armed and "CONFIRM UPDATE ON NEXT LAUNCH" or "APPLY / RESUME ON NEXT LAUNCH"
+      cancel.label=st.pending and "CANCEL QUEUED UPDATE" or "NO UPDATE QUEUED"
+      info.label=errorMessage or (st.pending and (st.pending:upper().." UPDATE QUEUED - RESTART GAME"))
+        or (st.state=="ready" and ("LAST UPDATE: "..tostring(st.lastQuality):upper().." COMPLETE"))
+        or (st.state=="incomplete" and "LAST UPDATE INCOMPLETE - RETRY") or "EXISTING AUDIO IS KEPT UNTIL APPLY"
+    end
+    quality.onSelect=function()
+      local old=AudioFidelity.preference(modRef)
+      local q=old=="auto" and "high" or (old=="high" and "fast" or "auto")
+      local ok,why=AudioFidelity.setPreference(modRef,q)
+      errorMessage=not ok and tostring(why) or nil;armed=false;labels();refresh()
+    end
+    apply.onSelect=function()
+      if not armed then armed=true;labels();return end
+      local ok,why=AudioFidelity.request(modRef)
+      errorMessage=not ok and tostring(why) or nil;armed=false;labels();refresh()
+    end
+    cancel.onSelect=function()
+      local ok,why=AudioFidelity.cancelRequest(modRef)
+      errorMessage=not ok and tostring(why) or nil;armed=false;labels();refresh()
+    end
+    local rows={quality,apply,cancel,info,
+      {label="HIGH: BETTER RESAMPLING / SLOWER BUILD",keepOpen=true},
+      {label="AUTO: FAST ON MOBILE, HIGH ELSEWHERE",keepOpen=true},
+      {label="MODEL CACHES ARE NOT REBUILT",keepOpen=true},
+      {label="BACK",onSelect=function()refresh()end}}
+    labels()
+    local picker=Menu.new(game,rows,{tx=1,ty=1,tw=29,maxVisible=8})
+    if BattleMenuUI and BattleMenuUI.mark then
+      BattleMenuUI.mark(picker,"AUDIO FIDELITY",rows,8,"CACHE UPDATE ONLY - NO LIVE SYNTHESIS")
+    end
     game.stack:push(picker)
   end
 
@@ -177,6 +270,44 @@ local function openBattleMenu(game,returnId,returnParent)
     for i,opt in ipairs(options) do if opt.id==p.arena then picker.index=i;picker:clampScroll();break end end
     game.stack:push(picker)
   end
+  hardCacheRow.onSelect=function()
+    local rows={}
+    local hs=CacheManager and CacheManager.hardCacheStatus and CacheManager.hardCacheStatus() or {}
+    local progressRow={label="",keepOpen=true}
+    local control={label="",keepOpen=true}
+    local function labels()
+      hs=CacheManager and CacheManager.hardCacheStatus and CacheManager.hardCacheStatus() or {}
+      local state=hs.paused and "PAUSED" or (hs.running and "PREPARING" or (hs.stage=="failed" and "FAILED" or (hs.ready and "READY" or (hs.teamReady and "TEAM READY" or (hs.completed and "READY" or "IDLE")))))
+      progressRow.label=("%s  %d/%d"):format(state,tonumber(hs.done) or 0,tonumber(hs.total) or 0)
+      control.label=hs.paused and "RESUME PREPARATION" or "PAUSE PREPARATION"
+      refresh()
+    end
+    local function queue(scope)
+      if CacheManager and CacheManager.hardCacheSave then CacheManager.hardCacheSave(game,scope) end
+      labels()
+    end
+    rows[#rows+1]={label="PREPARE CURRENT TEAM",keepOpen=true,onSelect=function() queue("team") end}
+    rows[#rows+1]={label="PREPARE TEAM + PC",keepOpen=true,onSelect=function() queue("full") end}
+    control.onSelect=function()
+      local status=CacheManager and CacheManager.hardCacheStatus and CacheManager.hardCacheStatus() or {}
+      if CacheManager and CacheManager.pauseHardCache then CacheManager.pauseHardCache(not status.paused) end
+      labels()
+    end
+    rows[#rows+1]=control;rows[#rows+1]=progressRow
+    rows[#rows+1]={label="TEAM: BATTLE MODELS + MOVES",keepOpen=true}
+    rows[#rows+1]={label="PC: ALSO PREPARE STORED MODELS",keepOpen=true}
+    rows[#rows+1]={label="EXISTING CACHES ARE REUSED",keepOpen=true}
+    labels()
+    local picker=Menu.new(game,rows,{tx=1,ty=1,tw=19,maxVisible=7})
+    if BattleMenuUI and BattleMenuUI.mark then BattleMenuUI.mark(picker,"CACHE PREPARATION",rows,7,"CURRENT TEAM IS THE QUICK START") end
+    local nativeUpdate=picker.update
+    picker.update=function(self,dt,...)
+      if nativeUpdate then nativeUpdate(self,dt,...) end
+      self._cbeStatusClock=(self._cbeStatusClock or 0)+(tonumber(dt) or 0)
+      if self._cbeStatusClock>=.25 then self._cbeStatusClock=0;labels() end
+    end
+    game.stack:push(picker)
+  end
   cacheRow.onSelect=function()
     local cs=CacheManager and CacheManager.inspect and CacheManager.inspect()
       or {ready=false,runtimeReady=false,sourceReady=false,sourceStatus="UNKNOWN",source="UNKNOWN",files=0,sizeLabel="0 B",componentCounts={}}
@@ -197,6 +328,7 @@ local function openBattleMenu(game,returnId,returnParent)
       {label=("TRAINERS   %d/%d%s"):format(cs.trainerResolved or 0,cs.trainerTotal or 10,(cs.trainerResolved or 0)==(cs.trainerTotal or 10) and "  READY" or ""),keepOpen=true},
       {label=componentLabel("audio","AUDIO"),keepOpen=true},
       {label=componentLabel("transition","TRANSITION"),keepOpen=true},
+      {label="HARD CACHE   "..((cs.hardCacheReady and "READY / REFRESH") or "NOT BUILT"),keepOpen=true},
     }
     if cs.sourceFingerprint then rows[#rows+1]={label="FINGERPRINT RECORDED",keepOpen=true} end
     if cs.trainerFirstError then rows[#rows+1]={label="TRAINER FIRST   "..tostring(cs.trainerFirstError),keepOpen=true} end
@@ -257,7 +389,7 @@ local function openBattleMenu(game,returnId,returnParent)
   refresh()
   -- Trainer presentation is intentionally three independent ownership rows:
   -- player Red, ordinary/special enemy trainers, and the Kanto rival substitute.
-  local mainRows={environmentToggle,cameraToggle,pokemonModelsToggle,musicRow,arenaRow,playerTrainerRow,enemyTrainerRow,rivalRow,cacheRow,back}
+  local mainRows={environmentToggle,cameraToggle,pokemonModelsToggle,doublesToggle,abilitiesToggle,autoProgressToggle,freeLookToggle,bossIntroToggle,musicRow,soundsToggle,audioQualityRow,arenaRow,playerTrainerRow,enemyTrainerRow,rivalRow,hardCacheRow,cacheRow,back}
   menu=Menu.new(game,mainRows,{tx=1,ty=2,tw=24,maxVisible=10,onCancel=function() reopen(game,returnId,returnParent) end})
   menu.screenId="CbeBattleSettings"
   if BattleMenuUI and BattleMenuUI.mark then
@@ -266,9 +398,9 @@ local function openBattleMenu(game,returnId,returnParent)
   game.stack:push(menu)
 end
 
-function S.install(mod,trainer,music,arenaCatalog,battleMenuUI,cacheManager,trainerRoster,compat)
+function S.install(mod,trainer,music,arenaCatalog,battleMenuUI,cacheManager,trainerRoster,compat,audioFidelity)
   if installed then return true end
-  modRef,Trainer,Music,ArenaCatalog,BattleMenuUI,CacheManager,TrainerRoster,Compat=mod,trainer,music,arenaCatalog,battleMenuUI,cacheManager,trainerRoster,compat
+  modRef,Trainer,Music,ArenaCatalog,BattleMenuUI,CacheManager,TrainerRoster,Compat,AudioFidelity=mod,trainer,music,arenaCatalog,battleMenuUI,cacheManager,trainerRoster,compat,audioFidelity
   if BattleMenuUI and BattleMenuUI.install then BattleMenuUI.install() end
   if not (mod and mod.hooks and type(mod.hooks.wrap)=="function") then return false end
   mod.hooks:wrap("ui.start_menu.items",function(next,game,items)
@@ -299,6 +431,7 @@ end
 function S.prefs(game) return prefs(game) end
 function S.cameraEnabled(game) return prefs(game or (modRef and modRef.game)).cameraEnabled~=false end
 function S.pokemonModelsEnabled(game) return prefs(game or (modRef and modRef.game)).pokemonModelsEnabled~=false end
+function S.abilitiesEnabled(game) return prefs(game or (modRef and modRef.game)).abilitiesEnabled==true end
 function S.setCameraEnabled(game,value)
   local p=prefs(game or (modRef and modRef.game)); p.cameraEnabled=value~=false; return p.cameraEnabled
 end
@@ -306,10 +439,13 @@ function S.status(game)
   local p=prefs(game or (modRef and modRef.game))
   return {
     installed=installed,arenasEnabled=p.arenasEnabled,cameraEnabled=p.cameraEnabled,pokemonModelsEnabled=p.pokemonModelsEnabled,
+    battleSoundsEnabled=p.battleSoundsEnabled,freeLookEnabled=p.freeLookEnabled,autoProgressEnabled=p.autoProgressEnabled,bossIntroEnabled=p.bossIntroEnabled,doubleBattlesEnabled=p.doubleBattlesEnabled,
+    abilitiesEnabled=p.abilitiesEnabled,
     music=p.music,musicLabel=Music and Music.themeLabel and Music.themeLabel(game,p.music),
     arena=p.arena,playerModel=p.playerModel,enemyTrainerModel=p.enemyTrainerModel,rivalModel=p.rivalModel,
     playerTrainerModel=p.playerTrainerModel,enemyTrainerModels=p.enemyTrainerModels,
     cache=CacheManager and CacheManager.status and CacheManager.status() or nil,
+    audioFidelity=AudioFidelity and AudioFidelity.status(modRef) or nil,
   }
 end
 return S

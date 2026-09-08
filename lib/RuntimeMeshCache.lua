@@ -1,10 +1,16 @@
 local V=...
 local Assets=V.GeneratedAssets
-local R={version=1}
+local R={version=2}
+local luaMemo={}
+local luaMemoHits=0
+local luaMemoLoads=0
 local unpackArgs=table.unpack or unpack
 
+function R.packSupported()
+  return love and love.data and type(love.data.pack)=="function"
+end
 function R.supported()
-  return love and love.data and type(love.data.pack)=="function" and type(love.data.newByteData)=="function"
+  return R.packSupported() and type(love.data.newByteData)=="function"
     and love.graphics and type(love.graphics.newMesh)=="function"
 end
 
@@ -20,9 +26,9 @@ end
 -- allocation cost of writing a runtime sidecar. Output bytes are unchanged.
 local PACK_BATCH=64
 
-function R.packRows(rows,stride)
+function R.packRows(rows,stride,checkpoint)
   stride=math.max(1,math.floor(tonumber(stride) or 0))
-  if stride<=0 or not R.supported() then return nil,"runtime binary mesh API unavailable" end
+  if stride<=0 or not R.packSupported() then return nil,"runtime binary pack API unavailable" end
   rows=rows or {}
   local count=#rows
   if count==0 then return nil,"no vertex rows" end
@@ -48,13 +54,14 @@ function R.packRows(rows,stride)
     if not ok or type(bytes)~="string" then return nil,tostring(bytes or "love.data.pack failed") end
     chunkCount=chunkCount+1;chunks[chunkCount]=bytes
     i=i+take
+    if checkpoint then checkpoint() end
   end
   return table.concat(chunks,"",1,chunkCount)
 end
 
-function R.writeRows(path,rows,stride)
+function R.writeRows(path,rows,stride,checkpoint)
   if not (Assets and Assets.write) then return false,"generated cache writer unavailable" end
-  local bytes,err=R.packRows(rows,stride);if not bytes then return false,err end
+  local bytes,err=R.packRows(rows,stride,checkpoint);if not bytes then return false,err end
   local ok,why=Assets.write(path,bytes)
   return ok~=false and ok~=nil,why,#bytes
 end
@@ -72,6 +79,8 @@ function R.meshFromBytes(format,bytes,stride,usage)
   local okData,data=pcall(love.data.newByteData,bytes)
   if not okData or not data then pcall(function() if mesh.release then mesh:release() end end);return nil,tostring(data or "newByteData failed") end
   local okSet,setErr=pcall(mesh.setVertices,mesh,data,1,count)
+  -- setVertices copies the upload; the staging buffer is not a resident asset.
+  if data.release then pcall(data.release,data) end
   if not okSet then pcall(function() if mesh.release then mesh:release() end end);return nil,tostring(setErr) end
   return mesh,nil,count
 end
@@ -108,15 +117,29 @@ local function serialize(v,seen,depth)
 end
 function R.writeLua(path,value)
   if not (Assets and Assets.write) then return false,"generated cache writer unavailable" end
+  path=tostring(path or "")
   local ok,err=Assets.write(path,"return "..serialize(value).."\n")
+  if ok~=false and ok~=nil then luaMemo[path]=value end
   return ok~=false and ok~=nil,err
 end
 function R.readLua(path)
   if not (Assets and Assets.read) then return nil,"generated cache reader unavailable" end
+  path=tostring(path or "")
+  local memo=luaMemo[path]
+  if memo~=nil then luaMemoHits=luaMemoHits+1;return memo end
   local src,err=Assets.read(path);if type(src)~="string" then return nil,err end
-  local f,e=load(src,"@generated/"..tostring(path));if not f then return nil,e end
+  local f,e=load(src,"@generated/"..path);if not f then return nil,e end
   local ok,v=pcall(f);if not ok then return nil,v end
+  luaMemo[path]=v;luaMemoLoads=luaMemoLoads+1
   return v
+end
+function R.invalidateLua(path)
+  if path==nil then luaMemo={} else luaMemo[tostring(path)]=nil end
+  return true
+end
+function R.memoStatus()
+  local n=0;for _ in pairs(luaMemo) do n=n+1 end
+  return {entries=n,hits=luaMemoHits,loads=luaMemoLoads}
 end
 function R.read(path)
   return Assets and Assets.read and Assets.read(path) or nil

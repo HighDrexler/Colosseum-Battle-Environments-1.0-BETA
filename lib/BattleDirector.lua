@@ -104,7 +104,7 @@ function D:update(ctx,dt)
   ensure(ctx)
   local step=math.max(0,tonumber(dt) or 0)
   state.time=state.time+step
-  if WazaSequence and type(WazaSequence.update)=="function" then
+  if not (V.DoublesRuntime and V.DoublesRuntime.combat(ctx and ctx.battle)) and WazaSequence and type(WazaSequence.update)=="function" then
     pcall(WazaSequence.update,WazaSequence,ctx,step)
   end
   for _,side in ipairs({"player","enemy"}) do

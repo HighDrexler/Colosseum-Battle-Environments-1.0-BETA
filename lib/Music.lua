@@ -55,6 +55,10 @@ end
 local function assetPath(_,asset) return assetData(asset) end
 local function themeCached(theme)
   if not theme then return false end
+  -- Full cache integrity is enforced once by AudioProbe's v9 ledger before the
+  -- CBE runtime is allowed to install. Keep this hot runtime/menu path to cheap
+  -- existence probes; assetData() still performs RIFF/WAVE validation when the
+  -- selected theme is actually materialized.
   return GeneratedAssets.exists(theme.intro) and GeneratedAssets.exists(theme.loop)
 end
 local function registerTheme(game,theme)
@@ -103,7 +107,7 @@ local function ensureSongs(game)
     if theme and theme.song and themeCached(theme) then
       if registerTheme(game,theme) then missingWarned[theme.id]=nil end
     elseif theme and not missingWarned[theme.id] then
-      missingWarned[theme.id]=true;log(modRef,"warn","Optional Colosseum theme unavailable; using original game audio when selected: "..theme.id)
+      missingWarned[theme.id]=true;log(modRef,"error","CBE audio contract breach: canonical Colosseum theme cache is missing at runtime: "..theme.id)
     end
   end
   return installed,available
@@ -125,7 +129,7 @@ function M.themeOptions(game)
     out[#out+1]={id="random",label="RANDOM"}
     for _,t in ipairs(THEMES) do if themeCached(t) then out[#out+1]={id=t.id,label=t.label} end end
   end
-  out[#out+1]={id="original",label=haveTheme and "ORIGINAL / OFF" or "ORIGINAL / CACHE REQUIRED"}
+  out[#out+1]={id="original",label=haveTheme and "ORIGINAL / OFF" or "ORIGINAL / AUDIO REQUIRED"}
   return out
 end
 function M.themeLabel(game,mode)
@@ -183,6 +187,6 @@ function M.status()
     local ready=themeCached(t);if ready then available=available+1 end
     list[#list+1]={id=t.id,label=t.label,sequence=t.seq,song=t.song,available=ready}
   end
-  return {installed=installed,hookInstalled=hookInstalled,availableThemes=available,totalThemes=#THEMES,mode=M.getMode(gameRef),modeLabel=M.themeLabel(gameRef),themeOptions=M.themeOptions(gameRef),themes=list,randomChoice=randomBattleTheme and randomBattleTheme.id or nil,renderer="CBE generated-audio cache / lazy runtime theme residency / MusyX source compiler",sourceGroup="snd_music"}
+  return {installed=installed,hookInstalled=hookInstalled,availableThemes=available,totalThemes=#THEMES,mode=M.getMode(gameRef),modeLabel=M.themeLabel(gameRef),themeOptions=M.themeOptions(gameRef),themes=list,randomChoice=randomBattleTheme and randomBattleTheme.id or nil,renderer="CBE canonical v9 source-audio cache / lazy runtime theme residency / cross-platform MusyX source compiler",sourceGroup="snd_music"}
 end
 return M

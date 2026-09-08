@@ -2,25 +2,31 @@ local V=...
 local HSD,FSYS=V.HSD,V.FSYS
 local T={}
 local TARGETS={
-  -- Battle actors are selected by authoritative GC6E01 member name.  The old
-  -- vertex-count heuristic could call a Cipher agent "Wes", a gym NPC
-  -- "Brendan", and a generic trainer "Dakim".  Apart from being the wrong
-  -- people, several of those A1 field meshes are unsuitable battle bind poses.
-  -- B1 members are the disc's battle models and are stable extraction inputs.
-  {id="red",modelId=0x02,height=16.101305,verts=2550,scaleMul=1.62,playerScaleMul=1.00,pivotY=7.4,exactArchive="people_archive.fsys",exactName="akami_m_b1.dat",directSource=true},
-  {id="leaf",modelId=0x03,height=15.735957,verts=2328,scaleMul=1.66,playerScaleMul=1.02,pivotY=7.3,exactArchive="people_archive.fsys",exactName="akami_f_b1.dat",directSource=true},
-  {id="wes",modelId=0x01,height=17.406225,verts=3069,scaleMul=1.50,playerScaleMul=.93,pivotY=8.0,exactArchive="field_common.fsys",exactName="ken_b1.dat",directSource=true},
+  -- Exact source members, checked against local pose galleries. Suffixes are
+  -- not a universal role contract: Wes/Dakim A1 contain the battle action banks;
+  -- the previously selected B1 banks contain different, reduced animation sets.
+  {id="red",modelId=0x02,height=16.101305,verts=2550,scaleMul=1.62,playerScaleMul=1.00,pivotY=7.4,exactArchive="pkx_akami_m_a1.fsys",exactName="akami_m_a1.pkx",directSource=true},
+  {id="leaf",modelId=0x03,height=15.735957,verts=2328,scaleMul=1.66,playerScaleMul=1.02,pivotY=7.3,exactArchive="pkx_akami_f_a1.fsys",exactName="akami_f_a1.pkx",directSource=true},
+  {id="wes",modelId=0x01,height=17.406225,verts=3069,scaleMul=1.50,playerScaleMul=.93,pivotY=8.0,exactArchive="people_archive.fsys",exactName="ken_a1.dat",directSource=true,
+    -- A1 assignments are based on inspected source pose sequences. Keep the
+    -- selected clips explicit rather than letting motion magnitude choose a gait.
+    excludedBattleClips={},nativeRoles={gesture=2,reaction=7,opening=1,throw=2,sendout=2,command=5,brace=7,concern=3,frustration=4,defeat=6,recall=8,victory=9}},
   -- Identity audit against the known-good source caches and GC6E01 battle assets:
   -- akami_* are the Kanto Red/Leaf battle actors; agb_* are Brendan/May.
   -- Keep these as separate exact members. Never alias Red/Leaf to the Hoenn pair.
-  {id="brendan",modelId=0x0B,height=16.86189,verts=2442,scaleMul=1.55,playerScaleMul=.96,pivotY=7.7,exactArchive="people_archive.fsys",exactName="agb_m_b1.dat",directSource=true},
-  {id="may",modelId=0x0A,height=16.25281,verts=2493,scaleMul=1.60,playerScaleMul=.99,pivotY=7.5,exactArchive="people_archive.fsys",exactName="agb_f_b1.dat",directSource=true},
-  {id="cooltrainer_m",modelId=0x35,height=17.69574,verts=3105,scaleMul=1.47,pivotY=8.1,exactArchive="people_archive.fsys",exactName="traner_m_b1.dat",directSource=true},
-  {id="cooltrainer_f",modelId=0x36,height=16.49731,verts=2283,scaleMul=1.58,pivotY=7.6,exactArchive="people_archive.fsys",exactName="traner_f_b1.dat",directSource=true},
-  {id="dakim",modelId=0x0D,height=34.61308,verts=2544,scaleMul=1.0,playerScaleMul=.62,pivotY=12.8,exactArchive="people_archive.fsys",exactName="battleyama_b1.dat",directSource=true,nativeIdleProbe=true},
-  {id="nascour",modelId=0x11,height=22.98924,verts=2415,scaleMul=1.48,playerScaleMul=.92,pivotY=12.2,exactArchive="people_archive.fsys",exactName="boss999_b1.dat",directSource=true},
-  {id="miror_b",modelId=0x0F,height=26.78492,verts=2361,scaleMul=1.28,playerScaleMul=.80,pivotY=11.3,exactArchive="people_archive.fsys",exactName="boss555_b1.dat",directSource=true},
+  {id="brendan",modelId=0x0B,height=16.86189,verts=2442,scaleMul=1.55,playerScaleMul=.96,pivotY=7.7,exactArchive="pkx_agb_m_a1.fsys",exactName="agb_m_a1.pkx",directSource=true},
+  {id="may",modelId=0x0A,height=16.25281,verts=2493,scaleMul=1.60,playerScaleMul=.99,pivotY=7.5,exactArchive="pkx_agb_f_a1.fsys",exactName="agb_f_a1.pkx",directSource=true},
+  {id="cooltrainer_m",modelId=0x35,height=17.69574,verts=3105,scaleMul=1.47,pivotY=8.1,exactArchive="people_archive.fsys",exactName="traner_m_a1.dat",directSource=true},
+  {id="cooltrainer_f",modelId=0x36,height=16.49731,verts=2283,scaleMul=1.58,pivotY=7.6,exactArchive="people_archive.fsys",exactName="traner_f_a1.dat",directSource=true},
+  {id="dakim",modelId=0x0D,height=34.61308,verts=2544,scaleMul=1.0,playerScaleMul=.62,pivotY=12.8,exactArchive="people_archive.fsys",exactName="battleyama_a1.dat",directSource=true,nativeIdleProbe=true,nativeRoles={gesture=2,reaction=7,opening=1,throw=2,sendout=2,command=5,brace=7,concern=3,frustration=4,defeat=6,recall=8,victory=9}},
+  {id="nascour",modelId=0x11,height=22.98924,verts=2415,scaleMul=1.48,playerScaleMul=.92,pivotY=12.2,exactArchive="people_archive.fsys",exactName="boss999_a1.dat",directSource=true},
+  {id="miror_b",modelId=0x0F,height=26.78492,verts=2361,scaleMul=1.28,playerScaleMul=.80,pivotY=11.3,exactArchive="people_archive.fsys",exactName="boss555_a1.dat",directSource=true},
 }
+-- Shared ten-slot A1 battle bank, selected after source pose inspection.
+-- Keep these separate: a hit must not reuse the throw or a field gait.
+local BATTLE_ROLES={gesture=2,reaction=7,opening=1,throw=2,sendout=2,command=5,
+  brace=7,concern=3,frustration=4,defeat=6,recall=8,victory=9}
+for _,target in ipairs(TARGETS) do target.nativeRoles=target.nativeRoles or BATTLE_ROLES end
 local function q(s)return string.format("%q",s) end
 local function num(x)if x~=x or x==math.huge or x==-math.huge then return "0" end;return ("%.7g"):format(x) end
 local function signature(tex)
@@ -66,30 +72,6 @@ local function normalizeLike(model,targetHeight,referenceBounds)
   normalizeJointPositions(model.jointPositions,s,cx,mn[2],cz)
   model.bounds={min=nmin,max=nmax,center={(nmin[1]+nmax[1])/2,(nmin[2]+nmax[2])/2,(nmin[3]+nmax[3])/2}}
   return model
-end
-local function alignSampleFeet(base,sample,height)
-  if not (base and sample and #(base.groups or {})==#(sample.groups or {})) then return false end
-  local floorY=base.bounds and base.bounds.min and base.bounds.min[2] or 0
-  local limit=floorY+math.max(.001,height or 1)*.12
-  local dx,dy,dz,n=0,0,0,0
-  for gi,g in ipairs(base.groups or {}) do
-    local sg=sample.groups[gi];if not sg or #(g.vertices or {})~=#(sg.vertices or {}) then return false end
-    for vi,v in ipairs(g.vertices or {}) do if (v[2] or 0)<=limit then
-      local q=sg.vertices[vi];dx=dx+((q[1] or 0)-(v[1] or 0));dy=dy+((q[2] or 0)-(v[2] or 0));dz=dz+((q[3] or 0)-(v[3] or 0));n=n+1
-    end end
-  end
-  if n<12 then return true end
-  dx,dy,dz=dx/n,dy/n,dz/n
-  local mn={1e30,1e30,1e30};local mx={-1e30,-1e30,-1e30}
-  for _,g in ipairs(sample.groups or {}) do for _,q in ipairs(g.vertices or {}) do
-    q[1]=q[1]-dx;q[2]=q[2]-dy;q[3]=q[3]-dz
-    for k=1,3 do if q[k]<mn[k] then mn[k]=q[k] end;if q[k]>mx[k] then mx[k]=q[k] end end
-  end end
-  for _,q in ipairs(sample.jointPositions or {}) do
-    q[1]=(tonumber(q[1]) or 0)-dx;q[2]=(tonumber(q[2]) or 0)-dy;q[3]=(tonumber(q[3]) or 0)-dz
-  end
-  sample.bounds={min=mn,max=mx,center={(mn[1]+mx[1])/2,(mn[2]+mx[2])/2,(mn[3]+mx[3])/2}}
-  return true
 end
 local POSE_OFFSET={
   breath=9,look=12,
@@ -159,10 +141,11 @@ local function finiteMetric(m)
 end
 local function sourcePoseSample(base,clip,frame,targetHeight,referenceBounds)
   if not (HSD and type(HSD.extractNativePose)=="function") then return nil end
-  local sample=HSD.extractNativePose(base,clip,frame,{textures=false,maxVertices=30000,maxDisplayOps=120000,maxJobjs=1536,maxDobjs=6144,maxPobjs=12288})
+  local sample=HSD.extractNativePose(base,clip,frame,{textures=false,nativeScaleCompensation=true,nativeTrainerIK=true,maxVertices=30000,maxDisplayOps=120000,maxJobjs=1536,maxDobjs=6144,maxPobjs=12288})
   if not sample then return nil end
   normalizeLike(sample,targetHeight,referenceBounds)
-  if not alignSampleFeet(base,sample,targetHeight) then return nil end
+  -- Preserve authored translation and lift using the same reference as the base.
+  if not sameTopology(base,sample) then return nil end
   local metrics=poseMetrics(base,sample,targetHeight)
   if not finiteMetric(metrics) then return nil end
   return {model=sample,clip=clip,frame=frame,metrics=metrics}
@@ -189,7 +172,12 @@ local function attachSourcePoseBank(model,target,referenceBounds,progressLabel)
   clipCount=tonumber(clipCount) or (idleInfo and tonumber(idleInfo.clipCount)) or 0
   model.nativeClipCount=clipCount
   local idleCandidates={}
-  local actionByClip={}
+  local actionByClip,locomotionRows={},{}
+  local excludedBattleClips={}
+  for _,clip in ipairs((target and target.excludedBattleClips) or {}) do excludedBattleClips[tonumber(clip) or -1]=true end
+  model.nativeExcludedBattleClips={};model.nativeInferredLocomotionClips={};model.nativeLocomotionFallbackClips={}
+  for clip in pairs(excludedBattleClips) do model.nativeExcludedBattleClips[#model.nativeExcludedBattleClips+1]=clip end
+  table.sort(model.nativeExcludedBattleClips)
   local function sample(clip,frame)
     return sourcePoseSample(model,clip,frame,target.height,referenceBounds)
   end
@@ -220,7 +208,34 @@ local function attachSourcePoseBank(model,target,referenceBounds,progressLabel)
           c.phase=f;row.samples[#row.samples+1]=c
         end
       end
-      if #row.samples>=3 then actionByClip[#actionByClip+1]=row end
+      if #row.samples>=3 and not excludedBattleClips[clip] then
+        -- Unknown B1 banks can contain locomotion as well as battle actions.
+        -- Use a deliberately conservative, data-derived guard: only reject a
+        -- clip when lower-body displacement overwhelmingly dominates the upper
+        -- body across the whole sampled arc. This catches obvious gait cycles
+        -- without excluding stomps, throws, braces or victory motions that
+        -- legitimately involve the legs. Exact recovered role exclusions (Wes
+        -- 5/8) still take precedence above.
+        local lo,up,asym,head=0,0,0,0
+        for _,c in ipairs(row.samples) do local m=c.metrics or {};lo=lo+(m.lower or 0);up=up+(m.upper or 0);asym=asym+(m.asym or 0);head=head+(m.head or 0) end
+        local n=#row.samples;lo,up,asym,head=lo/n,up/n,asym/n,head/n
+        row.locomotionScore=lo/math.max(.001,up)
+        row.locomotionLike=(lo>.028 and lo>up*1.55 and asym<.020 and head<lo*.82)
+        if row.locomotionLike then model.nativeInferredLocomotionClips[#model.nativeInferredLocomotionClips+1]=clip;locomotionRows[#locomotionRows+1]=row
+        else actionByClip[#actionByClip+1]=row end
+      end
+    end
+  end
+
+  -- A heuristic must never erase the action bank. If a character has an
+  -- unusually leg-driven battle set, restore the least gait-like suspect(s) so
+  -- gesture and reaction can still come from distinct source clips. Exact role
+  -- exclusions such as Wes walk/run are never restored here.
+  if #actionByClip<2 and #locomotionRows>0 then
+    table.sort(locomotionRows,function(a,b)return (a.locomotionScore or math.huge)<(b.locomotionScore or math.huge) end)
+    for _,row in ipairs(locomotionRows) do
+      if #actionByClip>=2 then break end
+      actionByClip[#actionByClip+1]=row;model.nativeLocomotionFallbackClips[#model.nativeLocomotionFallbackClips+1]=row.clip
     end
   end
 
@@ -242,7 +257,9 @@ local function attachSourcePoseBank(model,target,referenceBounds,progressLabel)
         local off=(leadSide<0) and (m.right or 0) or (m.left or 0)
         sc=lead*1.95+(m.asym or 0)*1.10+(m.upper or 0)*.62-off*.42-(m.lower or 0)*.22+(m.overall or 0)*.12
       else
-        sc=(m.lower or 0)*.74+(m.upper or 0)*.46+(m.overall or 0)*.58+math.abs(m.torsoDy or 0)*1.05
+        -- A battle reaction is torso/upper-body led. The previous score rewarded
+        -- lower-body travel, which made locomotion clips attractive reactions.
+        sc=(m.upper or 0)*.78+(m.overall or 0)*.52+math.abs(m.torsoDy or 0)*1.05+(m.head or 0)*.22-(m.lower or 0)*.38
       end
       if sc>best then best=sc end
     end
@@ -256,6 +273,13 @@ local function attachSourcePoseBank(model,target,referenceBounds,progressLabel)
     local penalty=(gesture and row.clip==gesture.clip and #actionByClip>1) and .22 or 0
     local score=clipScore(row,"reaction")-penalty
     if not reaction or score>(reaction._score or -math.huge) then reaction=row;reaction._score=score end
+  end
+
+  for _,pool in ipairs({actionByClip,locomotionRows}) do
+    for _,row in ipairs(pool) do
+      if target.nativeRoles and row.clip==target.nativeRoles.gesture then gesture=row end
+      if target.nativeRoles and row.clip==target.nativeRoles.reaction then reaction=row end
+    end
   end
 
   local function nearestPhase(row,want)
@@ -308,7 +332,7 @@ local function attachSourcePoseBank(model,target,referenceBounds,progressLabel)
     for i=1,5 do gestureFrames[i]=c end
   end
   if not reactionFrames[1] then
-    local c=chooseCandidate(all,function(m)return -((m.lower or 0)+(m.overall or 0)*.5) end)
+    local c=chooseCandidate(all,function(m)return -((m.upper or 0)*.9+(m.overall or 0)*.45+math.abs(m.torsoDy or 0)*.8-(m.lower or 0)*.35) end)
     for i=1,5 do reactionFrames[i]=c end
   end
   breath=breath or look
@@ -376,7 +400,7 @@ local function selectReleaseJoint(model,target)
   return best
 end
 
-local function cacheLua(target,model,texturePaths,sourceName)
+local function cacheLua(target,model,texturePaths,sourceName,runtimeBins,sourceSize)
   local b=model.bounds
   local poseMap={}
   local function pointsLua(points)
@@ -398,8 +422,13 @@ local function cacheLua(target,model,texturePaths,sourceName)
     local p=model.nativePoseMap and model.nativePoseMap[name]
     if p then poseMap[#poseMap+1]=name.."={clip="..num(p.clip)..",frame="..num(p.frame)..",rms="..num(p.metrics and p.metrics.overall or 0).."}" end
   end
-  local out={"-- Generated locally from the user's Pokemon Colosseum GC6E01 disc.\nreturn {formatVersion=26,morphFormat=\"source-hsd-dense-clipfamilies-v7-five-sample-adjacent-interpolation\",source=",q("Pokemon Colosseum / "..target.id.." / "..sourceName),
-    ",sourceRoot=",q(model.sourceRootMode or "unknown"),",nativeClipCount=",num(model.nativeClipCount or 0),",poseMap={",table.concat(poseMap,","),"},releaseJoint=",num(model.releaseJoint or 0),",releaseSide=",num(model.releaseSide or -1),",releaseJointScore=",num(model.releaseJointScore or 0),",jointPositions=",pointsLua(model.jointPositions),",jointParents=",intsLua(model.jointParents),",poseJointPositions={",table.concat(poseJoints,","),"},bounds={min={",num(b.min[1]),",",num(b.min[2]),",",num(b.min[3]),"},max={",num(b.max[1]),",",num(b.max[2]),",",num(b.max[3]),"},center={",num(b.center[1]),",",num(b.center[2]),",",num(b.center[3]),"}},groups={\n"}
+  local excluded={};for _,v in ipairs(model.nativeExcludedBattleClips or {}) do excluded[#excluded+1]=tostring(math.floor(tonumber(v) or 0)) end
+  local inferred={};for _,v in ipairs(model.nativeInferredLocomotionClips or {}) do inferred[#inferred+1]=tostring(math.floor(tonumber(v) or 0)) end
+  local locomotionFallback={};for _,v in ipairs(model.nativeLocomotionFallbackClips or {}) do locomotionFallback[#locomotionFallback+1]=tostring(math.floor(tonumber(v) or 0)) end
+  local out={"-- Generated locally from the user's Pokemon Colosseum GC6E01 disc.\nreturn {formatVersion=26,morphFormat=\"source-hsd-dense-clipfamilies-v8-retail-motion-role-filter\",source=",q("Pokemon Colosseum / "..target.id.." / "..sourceName),
+    ",sourceRoot=",q(model.sourceRootMode or "unknown"),",nativeClipCount=",num(model.nativeClipCount or 0),",excludedBattleClips={",table.concat(excluded,","),"},inferredLocomotionClips={",table.concat(inferred,","),"},poseMap={",table.concat(poseMap,","),"},releaseJoint=",num(model.releaseJoint or 0),",releaseSide=",num(model.releaseSide or -1),",releaseJointScore=",num(model.releaseJointScore or 0),",jointPositions=",pointsLua(model.jointPositions),",jointParents=",intsLua(model.jointParents),",poseJointPositions={",table.concat(poseJoints,","),"},bounds={min={",num(b.min[1]),",",num(b.min[2]),",",num(b.min[3]),"},max={",num(b.max[1]),",",num(b.max[2]),",",num(b.max[3]),"},center={",num(b.center[1]),",",num(b.center[2]),",",num(b.center[3]),"}}"}
+  if runtimeBins then out[#out+1] = ",runtimeMeshVersion=1,sourceSize="..num(sourceSize or 0) end
+  out[#out+1] = ",groups={\n"
   for gi,g in ipairs(model.groups) do
     out[#out+1]="{material="..q("source_group_"..gi)
     local function color3(v,default)
@@ -413,23 +442,103 @@ local function cacheLua(target,model,texturePaths,sourceName)
       ..",useConstant="..tostring(g.useConstant==true)..",useVertexColor="..tostring(g.useVertexColor==true)
       ..",useDiffuseLighting="..tostring(g.useDiffuseLighting~=false)..",textureSlot="..num(tonumber(g.textureSlot) or -1)
     local tp=texturePaths[gi]
-    if tp then out[#out+1]=",texture={path="..q(tp.path)..",w="..tp.w..",h="..tp.h.."}" end
-    out[#out+1]=",vertices={\n"
-    for _,v in ipairs(g.vertices) do
-      local x,y,z,u,w,nx,ny,nz=v[1],v[2],v[3],v[4] or 0,v[5] or 0,v[6] or 0,v[7] or 1,v[8] or 0
-      local row={x,y,z,u,w,nx,ny,nz}
-      for _,off in ipairs({9,12,15,18,21,24,27,30,33,36,39,42}) do
-        row[#row+1]=v[off] or x;row[#row+1]=v[off+1] or y;row[#row+1]=v[off+2] or z
-      end
-      local parts={};for i=1,#row do parts[i]=num(row[i]) end;out[#out+1]="{"..table.concat(parts,",").."},\n"
+    if tp then
+      local tex=g.texture or {}
+      out[#out+1]=",texture={path="..q(tp.path)..",w="..tp.w..",h="..tp.h
+        ..",wrapS="..num(tonumber(tex.wrapS) or 0)..",wrapT="..num(tonumber(tex.wrapT) or 0).."}"
     end
-    out[#out+1]="}},\n"
+    if runtimeBins and runtimeBins[gi] then
+      out[#out+1]=",runtimeBin="..q(runtimeBins[gi]).."},\n"
+    else
+      out[#out+1]=",vertices={\n"
+      for _,v in ipairs(g.vertices) do
+        local x,y,z,u,w,nx,ny,nz=v[1],v[2],v[3],v[4] or 0,v[5] or 0,v[6] or 0,v[7] or 1,v[8] or 0
+        local row={x,y,z,u,w,nx,ny,nz}
+        for _,off in ipairs({9,12,15,18,21,24,27,30,33,36,39,42}) do
+          row[#row+1]=v[off] or x;row[#row+1]=v[off+1] or y;row[#row+1]=v[off+2] or z
+        end
+        local parts={};for i=1,#row do parts[i]=num(row[i]) end;out[#out+1]="{"..table.concat(parts,",").."},\n"
+      end
+      out[#out+1]="}},\n"
+    end
   end
   out[#out+1]="}}\n";return table.concat(out)
+end
+
+local unpackArgs=table.unpack or unpack
+local RUNTIME_PACK_BATCH=64
+local function runtimeVerticesBytes(vertices)
+  if not (love and love.data and type(love.data.pack)=="function") then return nil end
+  vertices=vertices or {};if #vertices==0 then return nil end
+  local stride=44;local rowFmt=string.rep("f",stride);local batchFmt=string.rep(rowFmt,RUNTIME_PACK_BATCH)
+  local buf,chunks={},{};local i=1
+  while i<=#vertices do
+    local take=math.min(RUNTIME_PACK_BATCH,#vertices-i+1);local k=0
+    for r=i,i+take-1 do
+      local row=vertices[r];if type(row)~="table" then return nil end
+      local x,y,z=tonumber(row[1]) or 0,tonumber(row[2]) or 0,tonumber(row[3]) or 0
+      for j=1,stride do
+        local v=tonumber(row[j]);if v==nil and j>=9 then local axis=(j-9)%3;v=(axis==0 and x) or (axis==1 and y) or z end
+        v=tonumber(v) or 0;if v~=v or v==math.huge or v==-math.huge then v=0 end
+        k=k+1;buf[k]=v
+      end
+    end
+    local ok,bytes=pcall(love.data.pack,"string",take==RUNTIME_PACK_BATCH and batchFmt or string.rep(rowFmt,take),unpackArgs(buf,1,k))
+    if not ok or type(bytes)~="string" then return nil end
+    chunks[#chunks+1]=bytes;i=i+take
+  end
+  return table.concat(chunks)
 end
 local function write(mod,path,data,paths)
   local ok,err=mod.cache:write(path,data);assert(ok,err or ("cache write failed: "..path));if paths then paths[#paths+1]=path end
 end
+-- Full chronological geometry/normal tracks. Keep the base normalization;
+-- never subtract the mean foot displacement from an authored frame.
+local function writeNativeTracks(mod,target,model,referenceBounds,generated)
+  assert(love and love.data and love.data.pack,"native trainer tracks require binary packing")
+  local roles={idle=1,gesture=model.nativeGestureClip,reaction=model.nativeReactionClip}
+  for role,clip in pairs(target.nativeRoles or {}) do roles[role]=clip end
+  local meta={"local roles={}\n"};local encoded={}
+  for _,role in ipairs({"idle","gesture","reaction","opening","throw","sendout","command","brace","concern","frustration","defeat","recall","victory"}) do
+    local clip=roles[role]
+    local info=clip and HSD.nativeAnimationInfo(model,clip)
+    local finish=info and tonumber(info.endFrame)
+    if encoded[clip] then
+      meta[#meta+1]="roles."..role.."=roles."..encoded[clip].."\n"
+    elseif finish and finish>0 and finish<=1800 then
+      encoded[clip]=role
+      local count=math.ceil(finish)+1
+      local chunks={};for gi=1,#model.groups do chunks[gi]={} end
+      local joints={}
+      for fi=0,count-1 do
+        local frame=math.min(fi,finish)
+        local pose=assert(HSD.extractNativePose(model,clip,frame,{textures=false,nativeScaleCompensation=true,nativeTrainerIK=true,maxVertices=30000,maxDisplayOps=120000,maxJobjs=1536,maxDobjs=6144,maxPobjs=12288}))
+        normalizeLike(pose,target.height,referenceBounds)
+        assert(sameTopology(model,pose),"native trainer track topology changed")
+        for gi,g in ipairs(pose.groups) do
+          local bytes={}
+          for _,v in ipairs(g.vertices) do
+            bytes[#bytes+1]=love.data.pack("string","ffffff",v[1],v[2],v[3],v[6] or 0,v[7] or 1,v[8] or 0)
+          end
+          chunks[gi][#chunks[gi]+1]=table.concat(bytes)
+        end
+        local points={}
+        for _,v in ipairs(pose.jointPositions or {}) do points[#points+1]="{"..num(v[1])..","..num(v[2])..","..num(v[3]).."}" end
+        joints[#joints+1]="{"..table.concat(points,",").."}"
+      end
+      meta[#meta+1]="roles."..role.."={clip="..clip..",endFrame="..num(finish)..",count="..count..",joints={"..table.concat(joints,",").."},groups={"
+      for gi,g in ipairs(model.groups) do
+        local path=("cache/trainers/%s/native_v1/%s_%02d.f32"):format(target.id,role,gi)
+        write(mod,path,table.concat(chunks[gi]),generated)
+        meta[#meta+1]="{path="..q(path)..",vertices="..#g.vertices.."},"
+      end
+      meta[#meta+1]="}}\n"
+    end
+  end
+  meta[#meta+1]="return {version=1,fps=60,roles=roles}"
+  write(mod,("cache/trainers/%s/native_v1/index.lua"):format(target.id),table.concat(meta),generated)
+end
+
 local function openArchive(disc,name)
   local f=disc:file(name);if not f then return nil end
   local ok,arc=pcall(FSYS.open,disc,f);if not ok then return nil end
@@ -451,6 +560,7 @@ function T.run(mod,disc,progress,generated,options)
     archiveSeen[key]=true;archiveNames[#archiveNames+1]=name
   end
   want("people_archive.fsys");want("field_common.fsys");want("fight_common.fsys")
+  for _,target in ipairs(runTargets) do want(target.exactArchive) end
   -- Pick up alternate character containers without opening the full 1000+ FSYS
   -- inventory. This makes the extractor resilient to naming differences while
   -- keeping first-run source reads bounded.
@@ -462,7 +572,7 @@ function T.run(mod,disc,progress,generated,options)
     end
   end
 
-  local archives={};local diag={"CBE trainer scan / extractor rev 13 / dense native B1 clip-family bank v7 / five-sample adjacent interpolation / semantic scene root","mode="..(options.directOnly and "exact-source repair" or "full"),"archives requested="..#archiveNames}
+  local archives={};local diag={"CBE trainer scan / battle source A1 banks / full native action tracks / semantic scene root","mode="..(options.directOnly and "exact-source repair" or "full"),"archives requested="..#archiveNames}
   for _,name in ipairs(archiveNames) do
     local arc=openArchive(disc,name)
     if arc then
@@ -544,7 +654,7 @@ function T.run(mod,disc,progress,generated,options)
         progress(("TRAINER FINAL DECOMPRESS  %s  %d%%"):format(label,pct),0,1)
       end,
     });assert(ok and type(blob)=="string",blob or ("trainer source read failed: "..src.key))
-    local opts={textures=true,maxRoots=32,maxVertices=30000,maxDisplayOps=120000,maxJobjs=1536,maxDobjs=6144,maxPobjs=12288,
+    local opts={textures=true,nativeScaleCompensation=true,nativeTrainerIK=true,maxRoots=32,maxVertices=30000,maxDisplayOps=120000,maxJobjs=1536,maxDobjs=6144,maxPobjs=12288,
       nativePose={clip=1,frame=0},semanticRootsOnly=true}
     local model,err=HSD.extractModel(blob,opts)
     local rootMode="scene-modelset"
@@ -557,6 +667,7 @@ function T.run(mod,disc,progress,generated,options)
     assert(model,err or ("trainer HSD decode failed: "..src.key))
     model.sourceRootMode=rootMode
     local ref={min={model.bounds.min[1],model.bounds.min[2],model.bounds.min[3]},max={model.bounds.max[1],model.bounds.max[2],model.bounds.max[3]}}
+    model.sourceReferenceBounds=ref
     normalize(model,target.height)
     attachSourcePoseBank(model,target,ref,label)
     selectReleaseJoint(model,target)
@@ -619,6 +730,7 @@ function T.run(mod,disc,progress,generated,options)
     else
       used[best.source.key]=true
       local model=decodeWinner(best.source,target);local texturePaths={};local textureMap={}
+      writeNativeTracks(mod,target,model,model.sourceReferenceBounds,generated)
       for gi,g in ipairs(model.groups) do if g.texture then
         local sig=signature(g.texture);local tp=textureMap[sig]
         if not tp then
@@ -630,10 +742,33 @@ function T.run(mod,disc,progress,generated,options)
       local cachePath=("cache/trainers/%s/model_cache.lua"):format(target.id)
       local sourceName=best.source.archive.." :: "..best.source.entry.name
       write(mod,cachePath,cacheLua(target,model,texturePaths,sourceName),generated)
+
+      -- Emit the runtime float32 sidecar NOW, while decoded HSD rows are already
+      -- resident. Previously the first battle/UI appearance had to parse the huge
+      -- canonical Lua geometry, upload it, then write this same fast cache. That
+      -- defeated the cache exactly when low-end devices needed it most.
+      local runtimeBins,runtimeOK={},love and love.data and type(love.data.pack)=="function"
+      if runtimeOK then
+        for gi,g in ipairs(model.groups or {}) do
+          local bytes=runtimeVerticesBytes(g.vertices)
+          if not bytes then runtimeOK=false;break end
+          local path=("cache/runtime_mesh_v1/trainers/%s/base_%02d.f32"):format(target.id,gi)
+          write(mod,path,bytes,generated);runtimeBins[gi]=path
+        end
+      end
+      local sourceInfo=mod.cache and type(mod.cache.info)=="function" and mod.cache:info(cachePath) or nil
+      local sourceSize=type(sourceInfo)=="table" and tonumber(sourceInfo.size) or nil
+      if runtimeOK and #runtimeBins==#(model.groups or {}) and #runtimeBins>0 then
+        local metaPath=("cache/runtime_mesh_v1/trainers/%s/base.lua"):format(target.id)
+        write(mod,metaPath,cacheLua(target,model,texturePaths,sourceName,runtimeBins,sourceSize),generated)
+      end
       local poseCount=0;for _ in pairs(model.nativePoseMap or {}) do poseCount=poseCount+1 end
       local nativePose=("clip1/frame0 + %d dense source pose targets / %d clips / root=%s"):format(poseCount,tonumber(model.nativeClipCount) or 0,tostring(model.sourceRootMode or "?"))
       resolved[target.id]={archive=best.source.archive,entry=best.source.entry.index,name=best.source.entry.name,score=bestScore,vertices=model.vertexCount,groups=#model.groups,cache=cachePath,archiveBase=model.archive and model.archive.base or 0,nativePose=nativePose}
-      diag[#diag+1]=( "%s %s <- %s:%s idx=%d score=%.4f vertices=%d groups=%d hsdBase=0x%X nativePose=%s" ):format(target.exactName and "EXACT" or "RESOLVED",target.id,safeName(best.source.archive),safeName(best.source.entry.name),tonumber(best.source.entry.index) or -1,bestScore,model.vertexCount,#model.groups,resolved[target.id].archiveBase,nativePose)
+      local excluded=#(model.nativeExcludedBattleClips or {})>0 and (" excludedBattleClips="..join(model.nativeExcludedBattleClips,"/")) or ""
+      local inferred=#(model.nativeInferredLocomotionClips or {})>0 and (" inferredLocomotionClips="..join(model.nativeInferredLocomotionClips,"/")) or ""
+      local locomotionFallback=#(model.nativeLocomotionFallbackClips or {})>0 and (" locomotionFallbackClips="..join(model.nativeLocomotionFallbackClips,"/")) or ""
+      diag[#diag+1]=( "%s %s <- %s:%s idx=%d score=%.4f vertices=%d groups=%d hsdBase=0x%X nativePose=%s%s%s%s" ):format(target.exactName and "EXACT" or "RESOLVED",target.id,safeName(best.source.archive),safeName(best.source.entry.name),tonumber(best.source.entry.index) or -1,bestScore,model.vertexCount,#model.groups,resolved[target.id].archiveBase,nativePose,excluded,inferred,locomotionFallback)
     end
   end
 
@@ -654,7 +789,7 @@ function T.run(mod,disc,progress,generated,options)
   end
   write(mod,"build/trainer_scan.txt",table.concat(diag,"\n").."\n",generated)
 
-  local report={"return {version=6,resolved={"}
+  local report={"return {version=7,resolved={"}
   for _,t in ipairs(runTargets) do local r=resolved[t.id];if r then report[#report+1]=string.format("%s={archive=%q,entry=%d,name=%q,score=%.6f,vertices=%d,groups=%d,archiveBase=%d},",t.id,r.archive,r.entry,r.name,r.score,r.vertices,r.groups,r.archiveBase or 0) end end
   report[#report+1]="},firstSourceError="..string.format("%q",firstSourceError or "")..",unresolved={"
   for _,t in ipairs(runTargets) do if unresolved[t.id] then report[#report+1]=string.format("%s=%q,",t.id,unresolved[t.id]) end end

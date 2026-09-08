@@ -1,4 +1,6 @@
 local V = ...
+local pendingReaction=nil
+local animationClock={}
 local BattleDirector=V.BattleDirector
 local GeneratedAssets=V.GeneratedAssets
 local mod, Mat4, TrainerRig = V.mod, V.Mat4, V.TrainerRig
@@ -6,6 +8,7 @@ local TrainerPerformance=V.TrainerPerformance
 local BattleSides=V.BattleSides
 local TrainerRoster=V.TrainerRoster
 local TrainerMorph=V.TrainerMorph
+local RuntimeMeshCache=V.RuntimeMeshCache
 local P = {}
 
 local function platformOS()
@@ -114,6 +117,49 @@ local function readLua(path)
   local ok,value=pcall(chunk);if not ok then return nil,value end;return value
 end
 
+
+local TRAINER_RUNTIME_MESH_VERSION=1
+local playerRuntimeHits,playerRuntimeFallbacks=0,0
+local function trainerRuntimeTag(wanted) return tostring(wanted or "trainer"):gsub("[^%w_%-]","_") end
+local function trainerRuntimeRoot(wanted) return "cache/runtime_mesh_v1/trainers/"..trainerRuntimeTag(wanted) end
+local function trainerRuntimeMetaPath(wanted) return trainerRuntimeRoot(wanted).."/base.lua" end
+local function trainerRuntimeBinPath(wanted,i) return trainerRuntimeRoot(wanted)..("/base_%02d.f32"):format(tonumber(i) or 0) end
+local function trainerSourceSize(cfg,meta)
+  local info=GeneratedAssets and GeneratedAssets.info and GeneratedAssets.info(cfg and cfg.cache) or nil
+  if not info then return nil end
+  -- Some Gen1Recomp cache backends expose file existence/type but omit size.
+  -- The sidecar was committed under the trainer identity marker, so reuse its
+  -- recorded source size rather than parsing the canonical Lua just to count it.
+  return tonumber(info.size) or tonumber(meta and meta.sourceSize) or 0
+end
+local function trainerRuntimeUsable(meta,wanted,sourceSize)
+  if not (DENSE_MESH and RuntimeMeshCache and type(RuntimeMeshCache.readLua)=="function") then return false end
+  if type(meta)~="table" or tonumber(meta.runtimeMeshVersion)~=TRAINER_RUNTIME_MESH_VERSION or tonumber(meta.formatVersion)~=26 then return false end
+  if sourceSize==nil or type(meta.groups)~="table" or #meta.groups==0 then return false end
+  local recorded=tonumber(meta.sourceSize) or 0
+  if sourceSize>0 and recorded>0 and recorded~=sourceSize then return false end
+  for i,g in ipairs(meta.groups) do
+    local path=type(g)=="table" and (g.runtimeBin or trainerRuntimeBinPath(wanted,i)) or nil
+    local info=path and GeneratedAssets.info and GeneratedAssets.info(path) or nil
+    if not info then return false end
+    local size=tonumber(info.size)
+    if size and (size<176 or size%176~=0) then return false end
+  end
+  return true
+end
+local function releaseLoveObject(obj,seen)
+  if obj==nil then return end
+  seen=seen or {};if seen[obj] then return end;seen[obj]=true
+  pcall(function() if type(obj.release)=="function" then obj:release() end end)
+end
+local function releaseScene(entry)
+  if type(entry)~="table" then return end
+  if TrainerMorph.releaseTracks then TrainerMorph.releaseTracks(entry.groups) end
+  local seen={}
+  for _,g in ipairs(entry.groups or {}) do if type(g)=="table" then releaseLoveObject(g.mesh,seen) end end
+  for _,img in pairs(entry.textures or {}) do releaseLoveObject(img,seen) end
+end
+
 local function loadCaptureAssetIndex()
   if captureAssetIndex~=nil then return captureAssetIndex or nil,captureAssetError end
   local idx,err=readLua("cache/capture/index.lua")
@@ -140,9 +186,9 @@ local function captureBallId(value)
   if raw:find("NET",1,true) then return "net" end
   return "poke"
 end
-local function sourceBallAsset(phase)
+local function sourceBallAsset(phase,ballOverride)
   local idx=loadCaptureAssetIndex();if not idx then return nil end
-  local id=captureBallId(capture and capture.ball)
+  local id=ballOverride or captureBallId(capture and capture.ball)
   local row=idx.balls and idx.balls[id];local phases=row and row.phases
   -- A cache row is source-backed only when extraction explicitly proved and
   -- locked the retail model. Never interpret an unresolved/fallback row as a
@@ -168,6 +214,15 @@ local function sourceAssetFrame(asset,phase,u,bp)
   if phase=="shake" or phase=="caught" then return 0 end
   return q*finish
 end
+local function throwFacing(origin,target)
+  local x=(target[1] or 0)-(origin[1] or 0)
+  local z=(target[3] or 0)-(origin[3] or 0)
+  if math.abs(x)+math.abs(z)<1e-8 then return 0 end
+  if math.atan2 then return math.atan2(x,z) end
+  if z==0 then return x>0 and math.pi/2 or -math.pi/2 end
+  local a=math.atan(x/z)
+  return z<0 and a+(x>=0 and math.pi or -math.pi) or a
+end
 local function sourceBallModel(asset,bp)
   local b=asset and asset.bounds or {};local mn=b.min or {-1,-1,-1};local mx=b.max or {1,1,1};local c=b.center or {0,0,0}
   local sx=math.abs((tonumber(mx[1]) or 1)-(tonumber(mn[1]) or -1))
@@ -177,6 +232,12 @@ local function sourceBallModel(asset,bp)
   local sc=SOURCE_BALL_DIAMETER/span
   local center=Mat4.translate(-(tonumber(c[1]) or 0),-(tonumber(c[2]) or 0),-(tonumber(c[3]) or 0))
   local scaled=Mat4.mul(Mat4.scale(sc,sc,sc),center)
+  -- GC6E01 snatch_shake / monsterball_open texture+vertex checks put the
+  -- button on LOCAL +Z. The former unverified -Z assumption inverted it.
+  if bp and bp.kind=="sendout" then
+    return Mat4.mul(Mat4.translate(bp[1],bp[2],bp[3]),
+      Mat4.mul(Mat4.rotateY(tonumber(bp.yaw) or 0),scaled))
+  end
 
   -- Airborne motion gets one coherent forward roll. Once the ball is planted,
   -- it never spins around its centre. A shake rotates the entire retail prop
@@ -195,12 +256,12 @@ local function sourceBallModel(asset,bp)
   end
   return Mat4.mul(Mat4.translate(bp[1],bp[2],bp[3]),scaled)
 end
-local function imageFromRaw(spec)
+local function imageFromRaw(spec,wrapS,wrapT)
   local bytes,readErr=GeneratedAssets.read(spec.path);if not bytes then return nil,readErr or ("missing "..tostring(spec.path)) end
   local ok,data=pcall(love.image.newImageData,spec.w,spec.h,"rgba8",bytes);if not ok then return nil,data end
   local ok2,img=pcall(love.graphics.newImage,data);if not ok2 then return nil,img end
   if img.setFilter then local okf=pcall(img.setFilter,img,"linear","linear",16);if not okf then pcall(img.setFilter,img,"linear","linear") end end
-  if img.setWrap then pcall(img.setWrap,img,"clamp","clamp") end
+  if img.setWrap then pcall(img.setWrap,img,wrapS or "clamp",wrapT or "clamp") end
   return img
 end
 local function shadowVertex(x,y,z,u,v)
@@ -356,46 +417,88 @@ local function loadScene(ctx)
   if not cfg then return nil,reason or "player-model-unavailable" end
   local wanted=tostring(cfg.id or cfg.label or cfg.cache or "player")
   if scene and shader and sceneKey==wanted then currentReason=reason;return scene end
-  if sceneKey~=wanted then scene=nil;shader=nil;errorText=nil;sceneKey=nil end
+  if sceneKey~=wanted then
+    releaseScene(scene);scene=nil;errorText=nil;sceneKey=nil
+  end
   currentConfig=cfg;currentModel=wanted;currentReason=reason;applyModelScale()
   if errorText then return nil,errorText end
   if not (love and love.graphics and love.image and love.graphics.newMesh and love.graphics.newShader) then errorText="LÖVE mesh/shader API unavailable";return nil,errorText end
-  local cache,err=readLua(cfg.cache);if not cache then errorText=tostring(err);return nil,errorText end
+
+  -- Prefer the extraction-time binary sidecar. The canonical Lua cache remains
+  -- authoritative recovery, but parsing thousands of 44-float rows on the first
+  -- Stats/PC/battle appearance is exactly the hitch the runtime cache should avoid.
+  local cache,err,fromRuntime
+  local rt
+  if cfg.directSource~=false and DENSE_MESH and RuntimeMeshCache and type(RuntimeMeshCache.readLua)=="function" then
+    rt=select(1,RuntimeMeshCache.readLua(trainerRuntimeMetaPath(wanted)))
+    local sourceSize=trainerSourceSize(cfg,rt)
+    if trainerRuntimeUsable(rt,wanted,sourceSize) then cache=rt;fromRuntime=true;playerRuntimeHits=playerRuntimeHits+1 end
+  end
+  if not cache then cache,err=readLua(cfg.cache) end
+  if not cache then errorText=tostring(err);return nil,errorText end
   if tonumber(cache.formatVersion)~=26 then
     errorText=(cfg.label or wanted).." trainer cache format "..tostring(cache.formatVersion or "?").." is stale; rebuild required for dense source animation"
     return nil,errorText
   end
+
   local textures,groups={},{}
+  local canonicalFallback=nil
   for i,g in ipairs(cache.groups or {}) do
-    local path=g.texture and g.texture.path;local img=path and textures[path] or nil
-    if path and not img then img,err=imageFromRaw(g.texture);if not img then errorText=tostring(err);return nil,errorText end;textures[path]=img end
-    -- Direct source geometry stays untouched; source material/pass state is
-    -- retained per HSD DOBJ group instead of flattening the trainer to one
-    -- opaque texture-only material.
-    local weighted=preparePlayerVertices(g.vertices or {},currentModel==DEFAULT_PLAYER_MODEL and not cfg.directSource)
-    local denseWeighted=weighted
-    if not DENSE_MESH then
-      local compact={}
-      for ri,row in ipairs(denseWeighted) do compact[ri]=TrainerMorph.compactVertex(row,nil,nil) end
-      weighted=compact
+    local path=g.texture and g.texture.path
+    local wrapS,wrapT="clamp","clamp"
+    if path and TrainerMorph.textureWrap then wrapS,wrapT=TrainerMorph.textureWrap(g.texture,g,wanted) end
+    local textureKey=path and (path..":"..wrapS..":"..wrapT)
+    local img=textureKey and textures[textureKey] or nil
+    if path and not img then img,err=imageFromRaw(g.texture,wrapS,wrapT);if not img then errorText=tostring(err);releaseScene({groups=groups,textures=textures});return nil,errorText end;textures[textureKey]=img end
+    local mesh,meshErr,denseWeighted
+    if fromRuntime and RuntimeMeshCache and type(RuntimeMeshCache.meshFromPath)=="function" then
+      mesh,meshErr=RuntimeMeshCache.meshFromPath(FORMAT,g.runtimeBin or trainerRuntimeBinPath(wanted,i),44,"static")
     end
-    local ok,mesh=pcall(love.graphics.newMesh,DENSE_MESH and FORMAT or FORMAT_COMPACT,weighted,"triangles",DENSE_MESH and "static" or "dynamic")
-    if not ok then errorText=(cfg.label or wanted).." mesh "..i..": "..tostring(mesh);return nil,errorText end
+    if not mesh then
+      local sourceGroup=g
+      if fromRuntime and type(g.vertices)~="table" then
+        if canonicalFallback==nil then
+          local canonical,cerr=readLua(cfg.cache)
+          if type(canonical)=="table" and tonumber(canonical.formatVersion)==26 then canonicalFallback=canonical else canonicalFallback=false;meshErr=tostring(cerr or meshErr or "canonical player trainer fallback unavailable") end
+        end
+        if canonicalFallback and canonicalFallback.groups and canonicalFallback.groups[i] then sourceGroup=canonicalFallback.groups[i];playerRuntimeFallbacks=playerRuntimeFallbacks+1 end
+      end
+      local vertices=sourceGroup and sourceGroup.vertices or {}
+      if type(vertices)~="table" or #vertices==0 then
+        errorText=(cfg.label or wanted).." mesh "..i.." runtime sidecar failed and canonical vertices are unavailable: "..tostring(meshErr or "empty mesh")
+        releaseScene({groups=groups,textures=textures});return nil,errorText
+      end
+      local weighted=preparePlayerVertices(vertices,currentModel==DEFAULT_PLAYER_MODEL and not cfg.directSource)
+      denseWeighted=weighted
+      if not DENSE_MESH then
+        local compact={};for ri,row in ipairs(denseWeighted) do compact[ri]=TrainerMorph.compactVertex(row,nil,nil) end;weighted=compact
+      end
+      local ok,built=pcall(love.graphics.newMesh,DENSE_MESH and FORMAT or FORMAT_COMPACT,weighted,"triangles",DENSE_MESH and "static" or "dynamic")
+      if not ok then errorText=(cfg.label or wanted).." mesh "..i..": "..tostring(built);releaseScene({groups=groups,textures=textures});return nil,errorText end
+      mesh=built
+    end
     if img then mesh:setTexture(img) end
     local d=g.diffuse or {1,1,1}
     groups[#groups+1]={mesh=mesh,material=g.material,image=img,textured=img~=nil,
       diffuse={tonumber(d[1]) or 1,tonumber(d[2]) or 1,tonumber(d[3]) or 1},
       alpha=tonumber(g.alpha) or 1,xlu=g.xlu==true,noz=g.noz==true,
+      useDiffuseLighting=g.useDiffuseLighting~=false,
       renderFlags=tonumber(g.renderFlags) or 0,shadow=g.shadow==true,effect=g.effect==true,
       poseSourceRows=(not DENSE_MESH) and denseWeighted or nil,posePair=nil}
   end
-  local ok,sh=pcall(love.graphics.newShader,VERTEX,PIXEL);if not ok or not sh then errorText=(cfg.label or wanted).." shader: "..tostring(sh or "unavailable");return nil,errorText end
-  shader=sh;local sok,serr=ensureShadow();if not sok then errorText=(cfg.label or wanted).." shadow: "..tostring(serr);return nil,errorText end
+  if not shader then
+    local ok,sh=pcall(love.graphics.newShader,VERTEX,PIXEL);if not ok or not sh then errorText=(cfg.label or wanted).." shader: "..tostring(sh or "unavailable");releaseScene({groups=groups,textures=textures});return nil,errorText end
+    shader=sh
+  end
+  local sok,serr=ensureShadow();if not sok then errorText=(cfg.label or wanted).." shadow: "..tostring(serr);releaseScene({groups=groups,textures=textures});return nil,errorText end
   scene={groups=groups,bounds=cache.bounds,source=cache.source,textures=textures,
     jointPositions=cache.jointPositions,jointParents=cache.jointParents,poseJointPositions=cache.poseJointPositions,
     releaseJoint=tonumber(cache.releaseJoint),releaseSide=tonumber(cache.releaseSide),
-    releaseJointScore=tonumber(cache.releaseJointScore)};sceneKey=wanted
-  log(ctx,"info","loaded player trainer %s: %d material groups",cfg.label or wanted,#groups);return scene
+    releaseJointScore=tonumber(cache.releaseJointScore),runtimeSidecar=fromRuntime==true};sceneKey=wanted
+  scene.nativeTrack=TrainerMorph.loadTracks(wanted,groups)
+  scene.drawGroups=TrainerMorph.materialOrder and TrainerMorph.materialOrder(groups) or groups
+  log(ctx,"info","loaded player trainer %s: %d material groups%s",cfg.label or wanted,#groups,fromRuntime and " (runtime sidecar)" or "")
+  return scene
 end
 local function battleOf(ctx) if type(ctx)~="table" then return nil end;return ctx.battle or (ctx.kind and ctx) or nil end
 local function enabled(ctx)
@@ -414,6 +517,10 @@ function P:prewarm(ctx)
   return s~=nil,err
 end
 function P:shouldRender(ctx) return enabled(ctx) end
+local normalReleasePoint
+local sendoutTarget
+local sendoutForward
+local arenaForward={0,-1}
 local trigger,performanceId
 function P:begin(ctx)
   battleKey=battleOf(ctx);age=0;actionKind=nil;actionAge=0;actionStrength=0;initialThrowQueued=false;initialOpeningQueued=false;lastSendingOut=false;resultSeen=nil;capture=nil;drawFrames=0;currentMotion=nil
@@ -455,8 +562,8 @@ local function playCaptureSuccessAudio(ctx)
 end
 
 function P:update(ctx,dt)
-  local b=battleOf(ctx);if b~=battleKey then stopCaptureSuccessAudio();battleKey=b;age=0;actionKind=nil;actionAge=0;actionStrength=0;initialThrowQueued=false;initialOpeningQueued=false;lastSendingOut=false;resultSeen=nil;pendingFrustration=nil;capture=nil;currentMotion=nil;performanceState=TrainerPerformance and TrainerPerformance.resetState(performanceState,"red") or nil end
-  activeNow=self:shouldRender(ctx);dt=TrainerPerformance and TrainerPerformance.realDt(ctx,dt) or (tonumber(dt) or 0)
+  local b=battleOf(ctx);if b~=battleKey then stopCaptureSuccessAudio();battleKey=b;age=0;actionKind=nil;actionAge=0;actionStrength=0;initialThrowQueued=false;initialOpeningQueued=false;lastSendingOut=false;resultSeen=nil;pendingFrustration=nil;pendingReaction=nil;capture=nil;currentMotion=nil;performanceState=TrainerPerformance and TrainerPerformance.resetState(performanceState,"red") or nil end
+  activeNow=self:shouldRender(ctx);dt=TrainerPerformance and TrainerPerformance.realDt(ctx,dt,animationClock) or (tonumber(dt) or 0)
   if activeNow then
     local cfg=playerModelFor(ctx)
     if cfg and sceneKey~=tostring(cfg.id or cfg.label or cfg.cache or "player") then loadScene(ctx) end
@@ -506,15 +613,21 @@ function P:update(ctx,dt)
   end
   if activeNow and pendingFrustration then
     pendingFrustration=pendingFrustration-dt
-    if pendingFrustration<=0 then pendingFrustration=nil;trigger("frustration",1.0,true) end
+    if pendingFrustration<=0 then pendingFrustration=nil;pendingReaction=nil;trigger("frustration",1.0) end
   end
   if activeNow and TrainerPerformance then
     local id=performanceId();local duration=actionKind and TrainerPerformance.duration(id,actionKind) or nil
-    if actionKind and actionAge>(duration or 1.2) then actionKind=nil;actionStrength=0 end
+    if actionKind and actionAge>(duration or 1.2) then
+      if TrainerPerformance.terminal(actionKind) then actionAge=duration
+      else actionKind=nil;actionStrength=0 end
+    end
+    if not actionKind and pendingReaction then
+      local queued=pendingReaction;pendingReaction=nil;trigger(queued.kind,queued.strength)
+    end
     currentMotion,performanceState=TrainerPerformance.step(performanceState,id,age,actionKind,actionAge,actionStrength,"player",dt)
   end
 end
-function P:finish() stopCaptureSuccessAudio();battleKey=nil;age=0;activeNow=false;actionKind=nil;actionAge=0;actionStrength=0;initialThrowQueued=false;initialOpeningQueued=false;lastSendingOut=false;resultSeen=nil;pendingFrustration=nil;capture=nil;currentMotion=nil;performanceState=TrainerPerformance and TrainerPerformance.resetState(performanceState,"red") or nil end
+function P:finish() stopCaptureSuccessAudio();battleKey=nil;age=0;activeNow=false;actionKind=nil;actionAge=0;actionStrength=0;initialThrowQueued=false;initialOpeningQueued=false;lastSendingOut=false;resultSeen=nil;pendingFrustration=nil;pendingReaction=nil;capture=nil;currentMotion=nil;performanceState=TrainerPerformance and TrainerPerformance.resetState(performanceState,"red") or nil end
 local function entryPose()
   local p=smooth((age-0.06)/1.05)
   -- Start just outside whichever arena back-line is active and settle inward.
@@ -533,8 +646,17 @@ performanceId=function()
   return tostring((currentConfig and currentConfig.id) or currentModel or "red"):lower()
 end
 trigger=function(kind,strength,force)
-  if not force and TrainerPerformance and not TrainerPerformance.shouldTrigger({battle=battleKey},actionKind,actionAge,kind) then return end
+  if TrainerPerformance and TrainerPerformance.terminal(actionKind) then return false end
+  if not force and TrainerPerformance and not TrainerPerformance.shouldTrigger({battle=battleKey},actionKind,actionAge,kind,TrainerPerformance.duration(performanceId(),actionKind)) then
+    if kind~=actionKind and not (actionKind=="concern" and kind=="brace") then
+      pendingReaction=TrainerPerformance.queueReaction(pendingReaction,kind,strength)
+    end
+    return false
+  end
+  if TrainerPerformance and TrainerPerformance.terminal(kind) then pendingReaction=nil;pendingFrustration=nil end
+  normalReleasePoint=nil;sendoutTarget=nil;sendoutForward=nil
   actionKind=kind;actionAge=0;actionStrength=strength or 1
+  return true
 end
 
 function P:event(ctx,name,payload)
@@ -564,9 +686,8 @@ function P:event(ctx,name,payload)
     if targetSide=="player" then
       local b=battleOf(ctx);local dmg=tonumber(payload.damage) or 0
       local maxhp=b and b.player and b.player.mon and b.player.mon.stats and tonumber(b.player.mon.stats.hp) or 1
-      local ratio=dmg/math.max(1,maxhp)
-      if ratio>=.30 then trigger("concern",1.0)
-      elseif ratio>=.085 then trigger("brace",.68) end
+      local kind,strength=TrainerPerformance.damageReaction(dmg,maxhp)
+      if kind then trigger(kind,strength) end
     end
   elseif name=="battle.status_inflicted" then
     local targetSide=payloadSide(ctx,payload,{"target","battler","side","targetSide"})
@@ -673,6 +794,10 @@ local function setShader(vp,model,pose,unlit,tint,opacity,motion)
   motion=motion or {}
   if not shader then local loaded=loadScene(nil); if not (loaded and shader) then return false end end
   love.graphics.setShader(shader);shader:send("vp","row",vp);shader:send("model","row",model);shader:send("cameraEye",pose and pose.eye or {54,24,13});shader:send("unlit",unlit or 0);shader:send("tintColor",tint or {1,1,1,1});shader:send("opacity",opacity or 1)
+  -- Shadow/ball draws share the trainer program but not its material. Inherit
+  -- neither the previous group's alpha nor its texture-disabled state; GLSL
+  -- also initializes these uniforms to zero before the first body draw.
+  shader:send("materialColor",{1,1,1,1});shader:send("useTexture",1)
   TrainerMorph.sendMixes(shader,motion)
 end
 function P:drawShadow(ctx,vp,pose)
@@ -686,10 +811,11 @@ function P:draw(ctx,vp,pose)
   TrainerMorph.bindPair(s.groups,motion)
   love.graphics.setDepthMode("lequal",true);love.graphics.setBlendMode("alpha","alphamultiply");if love.graphics.setMeshCullMode then love.graphics.setMeshCullMode("none") end;love.graphics.setColor(1,1,1,1)
   setShader(vp,model,pose,0,{1,1,1,1},smooth(p.progress/.38),motion)
-  for _,grp in ipairs(s.groups) do
+  for _,grp in ipairs(s.drawGroups or s.groups) do
     local d=grp.diffuse or {1,1,1}
     shader:send("materialColor",{d[1] or 1,d[2] or 1,d[3] or 1,grp.alpha or 1})
     shader:send("useTexture",grp.textured and 1 or 0)
+    shader:send("unlit",grp.useDiffuseLighting==false and 1 or 0)
     if love.graphics.setDepthMode then love.graphics.setDepthMode("lequal",not (grp.noz or grp.xlu)) end
     love.graphics.draw(grp.mesh)
   end
@@ -702,59 +828,7 @@ local function transformPoint(m,p)
   local x,y,z=tonumber(p and p[1]) or 0,tonumber(p and p[2]) or 0,tonumber(p and p[3]) or 0
   return {m[1]*x+m[2]*y+m[3]*z+m[4],m[5]*x+m[6]*y+m[7]*z+m[8],m[9]*x+m[10]*y+m[11]*z+m[12]}
 end
-local function mixJointPoint(base,poses,index,motion)
-  local p=base and base[index];if type(p)~="table" then return nil end
-  motion=motion or {}
-  local x,y,z=tonumber(p[1]) or 0,tonumber(p[2]) or 0,tonumber(p[3]) or 0
-  local weights={}
-  local sum=0
-  for i=1,5 do
-    local gw=math.max(tonumber(motion["gesture"..i]) or 0,0)
-    local rw=math.max(tonumber(motion["reaction"..i]) or 0,0)
-    weights[#weights+1]={"gesture"..i,gw};sum=sum+gw
-    weights[#weights+1]={"reaction"..i,rw};sum=sum+rw
-  end
-  local action=clamp(sum,0,1)
-  if sum>.0001 then
-    local tx,ty,tz,tw=0,0,0,0
-    for _,row in ipairs(weights) do
-      local name,w=row[1],row[2]
-      local q=poses and poses[name] and poses[name][index]
-      if q and w>0 then
-        tx=tx+(tonumber(q[1]) or x)*w
-        ty=ty+(tonumber(q[2]) or y)*w
-        tz=tz+(tonumber(q[3]) or z)*w
-        tw=tw+w
-      end
-    end
-    if tw>.0001 then
-      x=x+(tx/tw-x)*action;y=y+(ty/tw-y)*action;z=z+(tz/tw-z)*action
-    end
-  else
-    -- Old-cache compatibility during a failed/partial rebuild.
-    local legacy={{"arm",motion.arm},{"shift",motion.shift},{"settle",motion.settle},{"command",motion.command},{"brace",motion.brace}}
-    local tx,ty,tz,tw=0,0,0,0
-    for _,row in ipairs(legacy) do
-      local q=poses and poses[row[1]] and poses[row[1]][index];local w=math.max(tonumber(row[2]) or 0,0)
-      if q and w>0 then tx=tx+(tonumber(q[1]) or x)*w;ty=ty+(tonumber(q[2]) or y)*w;tz=tz+(tonumber(q[3]) or z)*w;tw=tw+w end
-    end
-    if tw>.0001 then
-      action=clamp(tw,0,1);x=x+(tx/tw-x)*action;y=y+(ty/tw-y)*action;z=z+(tz/tw-z)*action
-    end
-  end
-  local secondary=1-action
-  local function secondaryPose(name,w)
-    local q=poses and poses[name] and poses[name][index]
-    if q and w~=0 then
-      x=x+((tonumber(q[1]) or x)-(tonumber(p[1]) or x))*w*secondary
-      y=y+((tonumber(q[2]) or y)-(tonumber(p[2]) or y))*w*secondary
-      z=z+((tonumber(q[3]) or z)-(tonumber(p[3]) or z))*w*secondary
-    end
-  end
-  secondaryPose("breath",tonumber(motion.breath) or 0)
-  secondaryPose("look",tonumber(motion.look) or 0)
-  return {x,y,z}
-end
+local mixJointPoint=TrainerRig.mixJointPoint
 local function runtimeReleaseJoint()
   if not (scene and type(scene.jointPositions)=="table" and #scene.jointPositions>0) then return nil end
   if scene.runtimeReleaseJoint~=nil then return scene.runtimeReleaseJoint or nil end
@@ -807,15 +881,16 @@ local function runtimeReleaseJoint()
   return best
 end
 
-local function releaseAnchor()
+local function releaseAnchor(sampleMotion)
   -- 1.5.62: the ISO-derived trainer cache records the exact JOBJ chosen as the
   -- lead throwing hand plus that joint's retained source-pose positions. Apply
   -- the same morph weights and root transform as the visible trainer, so the
   -- ball physically sits in the hand until the release seam.
   local idx=runtimeReleaseJoint()
   if idx and idx>0 and scene.jointPositions and scene.jointPositions[idx] then
-    local motion=idleMotion()
-    local localPoint=mixJointPoint(scene.jointPositions,scene.poseJointPositions,idx,motion)
+    local motion=sampleMotion or idleMotion()
+    local localPoint=scene.nativeTrack and TrainerMorph.trackJoint(scene.nativeTrack,idx,motion)
+    localPoint=localPoint or mixJointPoint(scene.jointPositions,scene.poseJointPositions,idx,motion)
     if localPoint then
       local b=scene.bounds or {};local mn=b.min or {0,0,0};local mx=b.max or {0,16,0}
       local h=math.max(.001,(tonumber(mx[2]) or 16)-(tonumber(mn[2]) or 0))
@@ -851,18 +926,33 @@ local function releaseAnchor()
   return {FINAL_X-releaseX*lead,releaseY,FINAL_Z-0.46},"heuristic"
 end
 
+local function sendoutYaw()
+  local f=sendoutForward or arenaForward
+  return throwFacing({0,0,0},{f[1],0,f[2]})
+end
 local function normalThrowBallPose()
   if actionKind~="throw" then return nil end
   local id=performanceId();local d=TrainerPerformance and TrainerPerformance.duration(id,"throw") or 1.48
   local phase=clamp(actionAge/math.max(.001,d),0,1)
-  if phase<.31 or phase>.79 then return nil end
+  if phase>.79 then return nil end
+  if phase<.31 then
+    local hand=releaseAnchor()
+    return {hand[1],hand[2],hand[3],0,kind="sendout",handAttached=true,
+      yaw=sendoutYaw()}
+  end
   local u=clamp((phase-.31)/.48,0,1)
-  local start=releaseAnchor()
-  local target={SENDOUT_TARGET_X,3.85,SENDOUT_TARGET_Z}
+  -- Sample the release pose even if a slow frame skipped the release seam.
+  -- Once airborne the origin must not follow the recovering hand.
+  if not normalReleasePoint then
+    local motion=TrainerPerformance and TrainerPerformance.idle(id,age,"throw",.31*d,actionStrength,"player")
+    normalReleasePoint=releaseAnchor(motion)
+  end
+  local start=normalReleasePoint
+  local target=sendoutTarget or {SENDOUT_TARGET_X,3.85,SENDOUT_TARGET_Z}
   local x=start[1]+(target[1]-start[1])*u
   local z=start[3]+(target[3]-start[3])*u
   local y=start[2]+(target[2]-start[2])*u+math.sin(u*math.pi)*4.65
-  return {x,y,z,u,kind="sendout"}
+  return {x,y,z,u,kind="sendout",yaw=sendoutYaw()}
 end
 
 local function capturePhase(c)
@@ -1040,11 +1130,41 @@ local function captureBallTints()
   if id:find("SAFARI",1,true) then return {.94,.94,.86,1},{.30,.48,.18,1},{.16,.22,.10,1} end
   return {.96,.96,.94,1},{.84,.08,.07,1},{.035,.035,.04,1}
 end
+function P:sendoutStatus()
+  if not activeNow or actionKind~="throw" or (capture and not capture.done) then return nil end
+  local duration=TrainerPerformance.duration(performanceId(),"throw")
+  local phase=clamp(actionAge/math.max(.001,duration),0,1)
+  return {active=phase<1,phase=phase,ball=normalThrowBallPose(),duration=duration,age=actionAge}
+end
+function P:beginSendout(target,forward)
+  if not activeNow or (capture and not capture.done) then return nil end
+  if not trigger("throw",1,true) then return nil end
+  sendoutTarget=target and {target[1],target[2],target[3]} or nil
+  sendoutForward=forward and {forward[1],forward[2]} or nil
+  initialOpeningQueued=true;pendingReaction=nil;pendingFrustration=nil
+  return TrainerPerformance.duration(performanceId(),"throw")
+end
+function P:clearSendoutTarget() sendoutTarget=nil;sendoutForward=nil end
+
+-- Both trainers use the same verified source Poké Ball and facing transform.
+-- A missing source asset still declines cleanly to each trainer's fallback.
+function P:drawSendoutBall(ctx,vp,pose,bp)
+  local asset=sourceBallAsset("throw","poke")
+  local handlers=V.WazaHandlers
+  if not (bp and asset and handlers and type(handlers.drawAsset)=="function") then return false end
+  local ok,drew=pcall(handlers.drawAsset,ctx,asset,vp,sourceBallModel(asset,bp),0,
+    {opacity=bp.opacity or 1,depthAlways=false,forceOpaque=true,cullMode="none"})
+  if ok and drew==true then captureSourceDrawFrames=captureSourceDrawFrames+1;ballDrawFrames=ballDrawFrames+1;return true end
+  if not ok then captureAssetError=tostring(drew) end
+  return false
+end
+
 function P:drawBall(ctx,vp,pose)
   local bp=ballPose()
   if not bp then return false end
   local captureActive=capture and not capture.done
-  local sourcePropActive=captureActive or bp.kind=="sendout"
+  if not captureActive and bp.kind=="sendout" and self:drawSendoutBall(ctx,vp,pose,bp) then return true end
+  local sourcePropActive=captureActive
 
   -- Primary path: exact ball-type-specific prop and HSD animation compiled from
   -- Colosseum's snatch_attack / snatch_ball_land / snatch_shake / snatch_miss.
@@ -1079,7 +1199,7 @@ function P:drawBall(ctx,vp,pose)
   local scale=grounded and .180 or .188
   local roll=bp.rock or (grounded and 0 or (tonumber(bp.spin) or 0))
   local model=Mat4.mul(Mat4.translate(bp[1],bp[2],bp[3]),
-    Mat4.mul(Mat4.rotateZ(roll),Mat4.scale(scale,scale,scale)))
+    Mat4.mul(bp.kind=="sendout" and Mat4.rotateY(bp.yaw or 0) or Mat4.rotateZ(roll),Mat4.scale(scale,scale,scale)))
   -- Fallback obeys the same solid-object depth contract as the source prop.
   -- Rear triangles may render, but depth testing/writes prevent them from ever
   -- punching through the front shell on stale or partially rebuilt caches.
@@ -1118,6 +1238,10 @@ function P:setArenaProfile(def)
   if t then FINAL_X=tonumber(t[1]) or FINAL_X;FINAL_Z=tonumber(t[2]) or FINAL_Z end
   if playerMon then SENDOUT_TARGET_X=tonumber(playerMon[1]) or SENDOUT_TARGET_X;SENDOUT_TARGET_Z=tonumber(playerMon[2]) or SENDOUT_TARGET_Z end
   if enemyMon then CAPTURE_TARGET_X=tonumber(enemyMon[1]) or CAPTURE_TARGET_X;CAPTURE_TARGET_Z=tonumber(enemyMon[2]) or CAPTURE_TARGET_Z end
+  if playerMon and enemyMon then
+    local dx,dz=(enemyMon[1] or 0)-(playerMon[1] or 0),(enemyMon[2] or 0)-(playerMon[2] or 0)
+    if math.abs(dx)+math.abs(dz)>1e-8 then arenaForward={dx,dz} else arenaForward={0,-1} end
+  end
   local sc=def and def.trainerScale and tonumber(def.trainerScale.player)
   if sc then arenaModelScale=sc;applyModelScale() end
 end
@@ -1125,12 +1249,16 @@ end
 function P:anchor(y) return {FINAL_X,y or 7.0,FINAL_Z} end
 function P:resetRuntime()
   stopCaptureSuccessAudio()
-  scene=nil;sceneKey=nil;shader=nil;shadowImage=nil;shadowMesh=nil;errorText=nil
+  releaseScene(scene);scene=nil;sceneKey=nil
+  releaseLoveObject(shader);shader=nil
+  releaseLoveObject(shadowMesh);releaseLoveObject(shadowImage);shadowImage=nil;shadowMesh=nil;errorText=nil
+  releaseLoveObject(ballMeshWhite);releaseLoveObject(ballMeshRed);releaseLoveObject(ballMeshBlack);releaseLoveObject(ballTexture)
   currentConfig=nil;currentModel="red";currentReason=nil;MODEL_SCALE=arenaModelScale
   activeNow=false;age=0;drawFrames=0;actionKind=nil;actionAge=0;actionStrength=0;lastSendingOut=false
   ballMeshWhite=nil;ballMeshRed=nil;ballMeshBlack=nil;ballTexture=nil;ballError=nil;ballDrawFrames=0
   captureAssetIndex=nil;captureAssetError=nil;captureSourceDrawFrames=0
   return true
 end
-function P:status() return {active=activeNow,ready=scene~=nil,error=errorText,model=(currentConfig and currentConfig.label) or tostring(currentModel):upper(),modelSource=currentConfig and currentConfig.source or nil,modelReason=currentReason,pose="NativeHSD-source-hand-anchored-throw-player",action=actionKind,modelScale=MODEL_SCALE,final={FINAL_X,0,FINAL_Z},ballTarget={SENDOUT_TARGET_X,0,SENDOUT_TARGET_Z},captureTarget={CAPTURE_TARGET_X,0,CAPTURE_TARGET_Z},drawFrames=drawFrames,ballReady=(captureAssetIndex and true) or ballMeshRed~=nil,ballError=ballError,captureAssetError=captureAssetError,captureSourceDrawFrames=captureSourceDrawFrames,ballDrawFrames=ballDrawFrames,releaseJoint=scene and scene.releaseJoint or nil,releaseJointScore=scene and scene.releaseJointScore or nil,capture=P:captureStatus(),morph=TrainerMorph.status(),windowsCompat=WINDOWS_RUNTIME} end
+function P:status() return {active=activeNow,ready=scene~=nil,error=errorText,model=(currentConfig and currentConfig.label) or tostring(currentModel):upper(),modelSource=currentConfig and currentConfig.source or nil,modelReason=currentReason,pose="NativeHSD-source-hand-anchored-throw-player",action=actionKind,modelScale=MODEL_SCALE,final={FINAL_X,0,FINAL_Z},ballTarget={SENDOUT_TARGET_X,0,SENDOUT_TARGET_Z},captureTarget={CAPTURE_TARGET_X,0,CAPTURE_TARGET_Z},drawFrames=drawFrames,ballReady=(captureAssetIndex and true) or ballMeshRed~=nil,ballError=ballError,captureAssetError=captureAssetError,captureSourceDrawFrames=captureSourceDrawFrames,ballDrawFrames=ballDrawFrames,releaseJoint=scene and scene.releaseJoint or nil,releaseJointScore=scene and scene.releaseJointScore or nil,capture=P:captureStatus(),runtimeMeshHit=scene and scene.runtimeSidecar==true or false,runtimeMeshHits=playerRuntimeHits,runtimeMeshFallbacks=playerRuntimeFallbacks,morph=TrainerMorph.status(),windowsCompat=WINDOWS_RUNTIME} end
+P._test={throwFacing=throwFacing,sourceBallModel=sourceBallModel}
 return P

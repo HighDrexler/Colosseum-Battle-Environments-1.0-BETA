@@ -5,6 +5,7 @@ local CurrentSpriteModels=V.CurrentSpriteModels
 local ArenaCatalog=V.ArenaCatalog
 local GeneratedAssets=V.GeneratedAssets
 local RuntimeMeshCache=V.RuntimeMeshCache
+local RelicPresentation=V.RelicPresentation
 local A = {}
 
 local function platformOS()
@@ -71,12 +72,14 @@ uniform float sceneTime;
 attribute vec4 VertexTint;
 attribute vec3 VertexNormal;
 varying vec4 tint;
+varying float crowdPhase;
 varying vec3 worldPos;
 varying vec3 worldNormal;
 vec4 position(mat4 transform_projection, vec4 vertex_position) {
   tint = VertexTint;
+  crowdPhase=clamp(length(VertexNormal)-1.0,0.0,1.0);
   vec4 localPos = vertex_position;
-  vec3 localNormal = VertexNormal;
+  vec3 localNormal = normalize(VertexNormal);
   if (materialMode > 0.5 && materialMode < 1.5) {
     if (materialFlow < 0.5) {
       /* Horizontal pools carry true cross-wave displacement and normals. */
@@ -95,21 +98,10 @@ vec4 position(mat4 transform_projection, vec4 vertex_position) {
       localPos.x += sin(vertex_position.y*0.045 + sceneTime*1.36) * 0.10;
     }
   } else if (materialMode > 3.5 && materialMode < 4.5) {
-    /* Source crowd cards keep their original seats, but each disconnected card
-       receives a stable phase from VertexTint. This breaks the synchronized
-       cardboard-wall look without creating any new floating geometry. UV.y is
-       bottom=1/top=0 so feet stay planted behind the balcony lip. */
-    float tip = 1.0-clamp(VertexTexCoord.y,0.0,1.0);
-    float cardPhase=clamp((tint.r-.80)*5.0,0.0,1.0);
-    float cp=cardPhase*6.2831853 + floor(vertex_position.y*.035)*.43;
-    float tempo=.54+cardPhase*.31;
-    float sway=sin(sceneTime*tempo+cp);
-    float sway2=sin(sceneTime*(.39+cardPhase*.17)-cp*1.37);
-    float cheerBase=max(0.0,sin(sceneTime*.31+cp*1.91));
-    float cheer=pow(cheerBase,14.0);
-    localPos.y += (sway*.105+sway2*.035+cheer*.34)*tip;
-    localPos.x += (sway2*.050+cheer*(cardPhase-.5)*.085)*tip;
-    localPos.z += (sway*.028+cheer*.030)*tip;
+    /* Retail audience cards occupy half-height atlas cells: their bottom V is
+       .5 or .496094, not 1. UV-driven sway therefore lifted every spectator's
+       feet. Preserve the authored vertices exactly; source crowd animation
+       requires a verified texture-animation track, never invented geometry. */
   } else if (materialMode > 3.10 && materialMode < 3.40) {
     /* Wildland foliage cards: very restrained summit/field wind.  UV.y is
        authored bottom=1/top=0, so trunks/grass roots stay planted while leaf
@@ -167,30 +159,66 @@ vec4 position(mat4 transform_projection, vec4 vertex_position) {
   return vp * world;
 }
 ]]
-local MOBILE_VERTEX = [[
-uniform mat4 vp;
-uniform mat4 model;
-attribute vec4 VertexTint;
-attribute vec3 VertexNormal;
-varying vec4 tint;
-varying vec3 worldNormal;
-vec4 position(mat4 transform_projection, vec4 vertex_position) {
-  tint = VertexTint;
-  worldNormal = normalize((model * vec4(VertexNormal,0.0)).xyz);
-  return vp * (model * vertex_position);
-}
-]]
+-- Vertex operations are GLES-safe and identical across platforms; retain the
+-- small mobile fragment shader instead of paying the desktop pixel cost.
+local MOBILE_VERTEX = VERTEX
 local MOBILE_PIXEL = [[
 uniform float materialAlpha;
+uniform float materialMode;
+uniform float sourceTextureColorMap;
+uniform float sourceTextureBlending;
 uniform float sceneProfile;
 uniform vec3 materialDiffuse;
 uniform vec3 materialAmbient;
+uniform float sourceDiffuseLighting;
+uniform float sourceVertexColor;
+uniform float sourceVertexAlpha;
 varying vec4 tint;
+varying float crowdPhase;
 varying vec3 worldNormal;
+varying vec3 worldPos;
 vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
-  vec4 tex = Texel(texture,uv) * color * tint;
-  if (tex.a <= 0.012) discard;
+  vec4 sourceTint = vec4(mix(vec3(1.0),tint.rgb,step(0.5,sourceVertexColor)),mix(1.0,tint.a,step(0.5,sourceVertexAlpha)));
+  vec4 texel = Texel(texture,uv);
+  vec4 tex = texel * color * sourceTint;
+  float alpha = tex.a * materialAlpha;
+  if (materialMode > 2.5) {
+    /* Match desktop cutout/depth coverage. Fractional edge texels must not
+       leave translucent rectangles around the source audience on GLES. */
+    if (alpha < 0.34) discard;
+    alpha = 1.0;
+  } else if (alpha <= 0.012) discard;
+  if (sourceDiffuseLighting < 0.5 && !(sceneProfile > 0.5 && sceneProfile < 1.5)) {
+    /* HSD chooses vertex RGB OR material diffuse before its texture stage.
+       Unlit source materials do not multiply both, add ambient, or acquire a
+       second venue grade. Wildlands retains its authored lighting below. */
+    vec3 sourceBase = sourceVertexColor > 0.5 ? sourceTint.rgb : materialDiffuse;
+    vec3 sourceRGB = sourceTextureColorMap > 2.5 && sourceTextureColorMap < 3.5
+      ? mix(sourceBase,texel.rgb,clamp(sourceTextureBlending,0.0,1.0))
+      : texel.rgb * sourceBase;
+    return vec4(sourceRGB * color.rgb,alpha);
+  }
   float ndl = max(dot(normalize(worldNormal),normalize(vec3(0.34,0.83,0.44))),0.0);
+  if (sourceDiffuseLighting < 0.5) {
+    vec3 sourceColor=clamp(materialDiffuse + materialAmbient*0.12,vec3(0.08),vec3(1.25));
+    vec3 shaded=tex.rgb*sourceColor;
+    if (sceneProfile > 6.5 && sceneProfile < 7.5) {
+      /* Outskirts: portable exposure rolloff keeps the pale desert from
+         clipping to white while preserving the warm Orre sunlight. */
+      float l=dot(shaded,vec3(.299,.587,.114));
+      shaded=mix(vec3(l),shaded,.94)*vec3(1.015,.985,.925);
+      shaded=clamp((shaded-vec3(.46))*.88+vec3(.43),vec3(0.0),vec3(.93));
+      float floorMask=(1.0-smoothstep(1.5,8.0,abs(worldPos.y)))*clamp(worldNormal.y*.82+.18,0.0,1.0);
+      float floorL=clamp(dot(shaded,vec3(.299,.587,.114)),.20,.96);
+      vec3 unifiedSand=vec3(.870,.805,.635)*(.82+.20*floorL)+(shaded-vec3(floorL))*.12;
+      shaded=mix(shaded,unifiedSand,floorMask*.78);
+    } else if (sceneProfile > 8.5 && sceneProfile < 9.5) {
+      /* Unlit Deep materials stay source-authored. Give them only a tiny
+         contrast recovery; do not green-tint or crush them. */
+      shaded=clamp((shaded-vec3(.42))*1.045+vec3(.42),vec3(0.0),vec3(1.0))*.985;
+    }
+    return vec4(shaded,alpha);
+  }
   if (sceneProfile < 0.5) {
     /* Phenac / Water Colosseum: the source HSD already carries bright diffuse
        and ambient values. Adding both at full strength on the GLES fast path
@@ -204,15 +232,72 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
     float luma = dot(shaded,vec3(0.299,0.587,0.114));
     shaded = mix(vec3(luma)*vec3(0.965,0.990,1.015),shaded,0.90);
     shaded = clamp((shaded-vec3(0.46))*0.95+vec3(0.43),vec3(0.0),vec3(0.88));
-    return vec4(shaded,tex.a * materialAlpha);
+    return vec4(shaded,alpha);
   }
   vec3 light = clamp(materialAmbient + materialDiffuse * (0.42 + ndl*0.58),0.0,1.65);
-  return vec4(tex.rgb * light, tex.a * materialAlpha);
+  vec3 shaded=tex.rgb*light;
+  if (sceneProfile > 6.5 && sceneProfile < 7.5) {
+    float l=dot(shaded,vec3(.299,.587,.114));
+    shaded=mix(vec3(l),shaded,.94)*vec3(1.015,.985,.925);
+    shaded=clamp((shaded-vec3(.46))*.88+vec3(.43),vec3(0.0),vec3(.93));
+    float floorMask=(1.0-smoothstep(1.5,8.0,abs(worldPos.y)))*clamp(worldNormal.y*.82+.18,0.0,1.0);
+    float floorL=clamp(dot(shaded,vec3(.299,.587,.114)),.20,.96);
+    vec3 unifiedSand=vec3(.870,.805,.635)*(.82+.20*floorL)+(shaded-vec3(floorL))*.12;
+    shaded=mix(shaded,unifiedSand,floorMask*.78);
+  } else if (sceneProfile > 8.5 && sceneProfile < 9.5) {
+    float l=dot(shaded,vec3(.299,.587,.114));
+    shaded=mix(vec3(l),shaded,.965)*vec3(.92,.965,.95)*.86;
+  }
+  return vec4(shaded,alpha);
 }
 ]]
+-- Emergency Android shader fallback. The primary mobile shader preserves
+-- authored motion/material behavior; this pair exists solely to keep the source
+-- arena visible on GLES drivers that reject the larger vertex program. It uses
+-- the same source geometry/textures with static transforms and simple HSD color.
+local ANDROID_SAFE_VERTEX = [[
+uniform mat4 vp;
+uniform mat4 model;
+attribute vec4 VertexTint;
+attribute vec3 VertexNormal;
+varying vec4 tint;
+varying float crowdPhase;
+varying vec3 worldPos;
+varying vec3 worldNormal;
+vec4 position(mat4 transform_projection, vec4 vertex_position) {
+  tint=VertexTint; crowdPhase=0.0;
+  vec4 world=model*vertex_position;
+  worldPos=world.xyz; worldNormal=normalize((model*vec4(VertexNormal,0.0)).xyz);
+  return vp*world;
+}
+]]
+local ANDROID_SAFE_PIXEL = [[
+uniform float materialAlpha;
+uniform float materialMode;
+uniform vec3 materialDiffuse;
+uniform float sourceVertexColor;
+uniform float sourceVertexAlpha;
+varying vec4 tint;
+varying float crowdPhase;
+varying vec3 worldPos;
+varying vec3 worldNormal;
+vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
+  vec4 texel=Texel(texture,uv)*color;
+  vec3 base=materialDiffuse;
+  if (sourceVertexColor>0.5) base*=tint.rgb;
+  float a=texel.a*materialAlpha;
+  if (sourceVertexAlpha>0.5) a*=tint.a;
+  if (materialMode>2.5) { if (a<0.34) discard; a=1.0; }
+  else if (a<=0.012) discard;
+  return vec4(clamp(texel.rgb*base,vec3(0.0),vec3(1.0)),clamp(a,0.0,1.0));
+}
+]]
+
 local PIXEL = [[
 uniform float materialAlpha;
 uniform float materialMode;
+uniform float sourceTextureColorMap;
+uniform float sourceTextureBlending;
 uniform float materialFlow;
 uniform float sceneTime;
 uniform float sceneRadiusWorld;
@@ -223,8 +308,13 @@ uniform vec3 materialAmbient;
 uniform vec3 materialSpecular;
 uniform float materialShininess;
 uniform float materialDetail;
+uniform float sourceDiffuseLighting;
+uniform float sourceVertexColor;
+uniform float sourceVertexAlpha;
+uniform float sourceConstantColor;
 uniform vec2 texelStep;
 varying vec4 tint;
+varying float crowdPhase;
 varying vec3 worldPos;
 varying vec3 worldNormal;
 vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
@@ -279,7 +369,7 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
      surviving seated crowd cards). Treat them like alpha-test hardware:
      either the pixel exists and writes depth, or it does not. */
   if (materialMode > 2.5) {
-    float a = texel.a * tint.a * materialAlpha * color.a;
+    float a = texel.a * mix(1.0,tint.a,step(0.5,sourceVertexAlpha)) * materialAlpha * color.a;
     if (a < 0.34) discard;
     texel.a = 1.0;
   }
@@ -298,7 +388,20 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
     }
   }
 
-  float a = texel.a * tint.a * materialAlpha * color.a;
+  float a = texel.a * mix(1.0,tint.a,step(0.5,sourceVertexAlpha)) * materialAlpha * color.a;
+
+  vec4 sourceTint = vec4(mix(vec3(1.0),tint.rgb,step(0.5,sourceVertexColor)),mix(1.0,tint.a,step(0.5,sourceVertexAlpha)));
+  if (sourceDiffuseLighting < 0.5 && !(sceneProfile > 0.5 && sceneProfile < 1.5)) {
+    /* Native HSD unlit color selection is exclusive: RENDER_VERTEX supplies
+       raster RGB; otherwise material.diffuse supplies the constant. Texture
+       modulation or the source BLEND operation follows that selection. */
+    if (a < (materialMode > 1.5 && materialMode < 2.5 ? 0.016 : 0.025)) discard;
+    vec3 sourceBase = sourceVertexColor > 0.5 ? sourceTint.rgb : materialDiffuse;
+    vec3 sourceRGB = sourceTextureColorMap > 2.5 && sourceTextureColorMap < 3.5
+      ? mix(sourceBase,texel.rgb,clamp(sourceTextureBlending,0.0,1.0))
+      : texel.rgb * sourceBase;
+    return vec4(sourceRGB * color.rgb,materialMode > 2.5 ? 1.0 : a);
+  }
 
   /* Extracted waterfall glints are energy layers, not translucent cards. Keep
      only their bright strokes and dramatically reduce their intensity. */
@@ -327,26 +430,16 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
   vec3 srcMat = mix(vec3(1.0), clamp(materialDiffuse * 1.48, vec3(0.30), vec3(1.15)), 0.24);
   srcMat *= mix(vec3(1.0), clamp(materialAmbient * 1.10, vec3(0.42), vec3(1.14)), 0.10);
   float light = 0.75 + ndl * 0.18 + twoSide * 0.10 + hemi * 0.055;
-  vec3 shaded = texel.rgb * mix(vec3(1.0),tint.rgb,0.58) * color.rgb * srcMat * light;
-
-  /* Crowd billboards are already pre-lit artwork in the Colosseum atlas.
-     Running them through stone-style normals/specular was bleaching faces and
-     making adjacent cards vary wildly. Keep their source colors punchy and
-     stable while retaining depth-test occlusion against the stadium. */
-  if (materialMode > 3.5 && materialMode < 4.5) {
-    vec3 crowd = clamp((texel.rgb - vec3(0.47)) * 1.09 + vec3(0.49),vec3(0.0),vec3(1.0));
-    float cardPhase=clamp((tint.r-.80)*5.0,0.0,1.0);
-    float crowdLife = 0.982 + 0.028 * sin(sceneTime * (.72+cardPhase*.36) + cardPhase*12.0);
-    float footShade=1.0-.075*smoothstep(.68,.98,uv.y);
-    float edgeCoverage=(
-      Texel(texture,uv+vec2(texelStep.x,0.0)).a+
-      Texel(texture,uv-vec2(texelStep.x,0.0)).a+
-      Texel(texture,uv+vec2(0.0,texelStep.y)).a+
-      Texel(texture,uv-vec2(0.0,texelStep.y)).a)*.25;
-    float edgeDepth=.88+.12*smoothstep(.08,.90,edgeCoverage);
-    float faceDepth=.93+.07*abs(dot(normalize(worldNormal),normalize(cameraEye-worldPos)));
-    crowd *= vec3(1.015,1.010,1.005) * crowdLife * footShade * edgeDepth * faceDepth;
-    shaded = crowd * mix(vec3(1.0),tint.rgb,0.10) * color.rgb;
+  vec3 shaded;
+  if (sourceDiffuseLighting < 0.5) {
+    /* Pre-lit/constant HSD materials must not receive an invented CBE Lambert
+       pass. Preserve the source texture/color relationship instead. */
+    vec3 baseMat = sourceConstantColor > 0.5
+      ? clamp(materialDiffuse + materialAmbient*0.08,vec3(0.06),vec3(1.25))
+      : clamp(materialDiffuse*0.94 + materialAmbient*0.18,vec3(0.10),vec3(1.20));
+    shaded = texel.rgb * sourceTint.rgb * color.rgb * baseMat;
+  } else {
+    shaded = texel.rgb * mix(vec3(1.0),sourceTint.rgb,0.58) * color.rgb * srcMat * light;
   }
 
   if (materialMode > 4.5) {
@@ -447,7 +540,10 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
     float dNear = length(worldPos - cameraEye);
     float detail = 1.0 - smoothstep(44.0,78.0,dNear);
     vec3 crisp = clamp((shaded - vec3(0.50))*1.09 + vec3(0.50),0.0,1.0);
-    shaded = mix(shaded,crisp,detail*0.60);
+    bool strictSourceFidelity = (sceneProfile > 4.5 && sceneProfile < 5.5)
+      || (sceneProfile > 6.5 && sceneProfile < 7.5)
+      || (sceneProfile > 8.5 && sceneProfile < 9.5);
+    shaded = mix(shaded,crisp,detail*(strictSourceFidelity ? 0.08 : 0.60));
 
     if (materialMode < 0.5) {
       float outer = sceneProfile < .5
@@ -474,7 +570,7 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
         shaded += vec3(.042,.019,.006)*desertFace*(.42+.58*outer);
         shaded += vec3(.004,.009,.019)*(1.0-desertFace);
         shaded *= .985 + ageBreak*.018;
-      } else if (sceneProfile > 3.5) {
+      } else if (sceneProfile > 3.5 && sceneProfile < 4.5) {
         /* Realgam: neutral-cool industrial key.  Keep the architecture darker
            than 0.0.59 so recesses, panel seams and cyan technology survive
            instead of bleaching into one white mass. */
@@ -483,14 +579,48 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
         shaded *= .950 + .060*metalFace + .022*machineBreak;
         shaded += vec3(.002,.010,.016)*metalFace;
         shaded += vec3(.001,.006,.010)*(1.0-metalFace);
-      } else {
+      } else if (sceneProfile > .5 && sceneProfile < 1.5) {
         /* Generic Orre wild field: filtered warm sunlight through a
-           green canopy, with cool open-sky fill. Keep the source rock honest
-           while letting grass and foliage read lush instead of desert-brown. */
+           green canopy, with cool open-sky fill. Keep the authored recipe
+           isolated from source-backed Colosseum stages. */
         float forestFace=clamp(.5+.5*dot(n,normalize(vec3(.48,.74,-.34))),0.0,1.0);
         shaded *= .996 + outer*.007*venueSweep;
         shaded += vec3(.018,.028,.006)*forestFace*(.34+.66*outer);
         shaded += vec3(.004,.012,.018)*(1.0-forestFace);
+      } else if (sceneProfile > 4.5 && sceneProfile < 5.5) {
+        /* Relic Chamber: preserve the source bark/stone palette, but recover the
+           sun-filtered depth visible in Agate's forest. The old uniform green
+           fill flattened trunks and ground into one bare layer. Dapple is
+           deterministic world-space lighting only -- no extra texture samples
+           and no moving foreground foliage. */
+        float forestKey=clamp(.5+.5*dot(n,normalize(vec3(.38,.82,-.42))),0.0,1.0);
+        float upFace=smoothstep(.20,.84,n.y);
+        float dappleA=.5+.5*sin(worldPos.x*.103+worldPos.z*.071+1.17);
+        float dappleB=.5+.5*sin(worldPos.x*.041-worldPos.z*.127-0.63);
+        float dapple=clamp(dappleA*dappleB,0.0,1.0);
+        shaded *= .952+.076*forestKey;
+        shaded += vec3(.010,.016,.005)*forestKey;
+        shaded += vec3(.022,.026,.008)*dapple*upFace;
+        shaded += vec3(.004,.008,.012)*(1.0-forestKey)*hemi;
+      } else if (sceneProfile > 6.5 && sceneProfile < 7.5) {
+        /* Outskirts: strong but controlled Orre sunlight. The previous neutral
+           path let pale source diffuse values bloom almost completely white. */
+        float desertKey=clamp(.5+.5*dot(n,normalize(vec3(-.62,.63,.47))),0.0,1.0);
+        shaded *= .86+.075*desertKey;
+        shaded += vec3(.030,.014,.003)*desertKey;
+        shaded += vec3(.004,.008,.015)*(1.0-desertKey)*hemi;
+      } else if (sceneProfile > 8.5 && sceneProfile < 9.5) {
+        /* Deep Colosseum: the retail HSD already contains the stained metal,
+           rust and cool underground coloration. 1.9.25 double-darkened it and
+           added a procedural green breakup that turned the perimeter muddy.
+           Use only a restrained neutral key so the source atlas stays legible. */
+        float deepKey=clamp(.5+.5*dot(n,normalize(vec3(-.30,.88,.36))),0.0,1.0);
+        shaded *= .945+.050*deepKey;
+        shaded += vec3(.0045,.0048,.0042)*deepKey;
+      } else {
+        /* Relic Cave / Pyrite and any future source-neutral venues keep their
+           authored HSD palette without inheriting another arena's grade. */
+        shaded *= 1.0;
       }
     }
   }
@@ -588,7 +718,7 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
       shaded += vec3(.022,.009,.0025)*key;
       shaded += vec3(.010,.004,.0015)*lowOrre*(1.0-key);
       shaded += vec3(.002,.005,.011)*upFace*(1.0-key);
-    } else if (sceneProfile > 3.5) {
+    } else if (sceneProfile > 3.5 && sceneProfile < 4.5) {
       // Realgam: cool architectural key, cyan technology bounce and clean
       // high-metal fill. Keep it brighter than the crowd cavities.
       vec3 keyDir=normalize(vec3(-.42,.78,.46));
@@ -620,13 +750,45 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
     vec3 neutral=mix(vec3(luma),shaded,.91);
     shaded=neutral*vec3(1.035,.992,.955);
     shaded += vec3(.006,.0025,0.0)*(1.0-hemi);
-  } else if (sceneProfile > 3.5) {
+  } else if (sceneProfile > 3.5 && sceneProfile < 4.5) {
     vec3 neutral=mix(vec3(luma),shaded,.965);
     shaded=neutral*vec3(.96,.995,1.025);
     shaded += vec3(.002,.008,.014)*(1.0-hemi);
     // Preserve dark machine cavities while letting the silver shell live in a
     // brighter midrange like the source Realgam battle floor/towers.
     shaded=clamp((shaded-vec3(.44))*1.075+vec3(.47),vec3(0.0),vec3(1.0));
+  } else if (sceneProfile > 4.5 && sceneProfile < 5.5) {
+    /* Relic Chamber: keep source colors and recover a little local separation
+       in bark/roots/forest floor. This is deliberately much weaker than the
+       old generic sharpening path and costs no extra texture fetches. */
+    vec3 neutral=mix(vec3(luma),shaded,.996);
+    shaded=neutral*vec3(.995,1.010,.985);
+    shaded=clamp((shaded-vec3(.46))*1.035+vec3(.46),vec3(0.0),vec3(1.0));
+  } else if (sceneProfile > 6.5 && sceneProfile < 7.5) {
+    /* Outskirts: compress the extremely pale source highlights back into the
+       warm photographed desert range seen in the opening battle. */
+    vec3 neutral=mix(vec3(luma),shaded,.965);
+    shaded=neutral*vec3(1.025,.985,.925);
+    shaded=clamp((shaded-vec3(.47))*.90+vec3(.445),vec3(0.0),vec3(.94));
+    /* S1_out_bf uses a pale tiled battle pad inside the same sun-baked desert.
+       Keep the source tile detail, but warm low upward-facing floor fragments
+       toward the surrounding sand so the pad no longer reads as a pasted white
+       rectangle against the far-field continuation. */
+    float floorMask=(1.0-smoothstep(1.5,8.0,abs(worldPos.y)))*smoothstep(.18,.72,n.y);
+    float floorL=clamp(dot(shaded,vec3(.299,.587,.114)),.20,.96);
+    vec3 unifiedSand=vec3(.870,.805,.635)*(.82+.20*floorL)+(shaded-vec3(floorL))*.12;
+    shaded=mix(shaded,unifiedSand,floorMask*.78);
+  } else if (sceneProfile > 8.5 && sceneProfile < 9.5) {
+    /* Deep: source-neutral grading. Preserve the dirty steel/rust color range
+       and recover edge contrast in the outer masonry instead of flattening it
+       into green-grey fog. */
+    shaded=clamp((shaded-vec3(.42))*1.055+vec3(.42),vec3(0.0),vec3(1.0));
+    float floorFace=clamp(dot(n,vec3(0.0,1.0,0.0)),0.0,1.0);
+    shaded += vec3(.006,.006,.005)*floorFace;
+  } else {
+    /* Relic Cave / Pyrite and any other source-neutral venue keep the authored
+       HSD palette with only precision-noise stabilization. */
+    shaded=mix(vec3(luma),shaded,.992);
   }
   shaded=clamp((shaded-vec3(.5))*1.025+vec3(.5),vec3(0.0),vec3(1.0));
   /* Source-arena exposure trim. The authentic HSD materials were being
@@ -639,7 +801,7 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
     shaded *= .78;
     shaded=clamp((shaded-vec3(.46))*.94+vec3(.43),vec3(0.0),vec3(.90));
   } else if (sceneProfile > 2.5 && sceneProfile < 3.5) shaded *= .915;
-  else if (sceneProfile > 3.5) shaded *= .930;
+  else if (sceneProfile > 3.5 && sceneProfile < 4.5) shaded *= .930;
 
   /* Only the very outer shell blends into atmosphere. The old blue fog began
      inside the usable bowl and washed the whole arena into a translucent-looking
@@ -647,12 +809,25 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
   float d = length(worldPos - cameraEye);
   bool summitProfile = sceneProfile > 1.5 && sceneProfile < 2.5;
   bool orreProfile = sceneProfile > 2.5 && sceneProfile < 3.5;
-  bool realgamProfile = sceneProfile > 3.5;
-  /* Keep Mt. Battle's deck, pylons and first crater wall crisp. The former
-     175..275 range put a grey veil over architecture that was still close
-     enough to read as part of the arena; haze now begins beyond that shell. */
-  float fogNear = summitProfile ? 318.0 : (orreProfile ? 168.0 : (realgamProfile ? 205.0 : 150.0));
-  float fogFar  = summitProfile ? 520.0 : (orreProfile ? 292.0 : (realgamProfile ? 330.0 : 225.0));
+  bool realgamProfile = sceneProfile > 3.5 && sceneProfile < 4.5;
+  bool relicProfile = sceneProfile > 4.5 && sceneProfile < 5.5;
+  bool outskirtsProfile = sceneProfile > 6.5 && sceneProfile < 7.5;
+  bool deepProfile = sceneProfile > 8.5 && sceneProfile < 9.5;
+  bool neutralSourceProfile = sceneProfile > 4.5;
+  /* Venue-specific depth: Outskirts needs miles of pale desert atmosphere,
+     while Deep must keep its distant machinery visible inside a dark chamber. */
+  float fogNear = summitProfile ? 318.0
+    : (orreProfile ? 168.0
+    : (realgamProfile ? 205.0
+    : (outskirtsProfile ? 420.0
+    : (deepProfile ? 620.0
+    : (relicProfile ? 300.0 : 150.0)))));
+  float fogFar  = summitProfile ? 520.0
+    : (orreProfile ? 292.0
+    : (realgamProfile ? 330.0
+    : (outskirtsProfile ? 980.0
+    : (deepProfile ? 1400.0
+    : (relicProfile ? 760.0 : 225.0)))));
   float distanceFog = smoothstep(fogNear,fogFar,d);
   float edgeFog = sceneProfile < .5
     ? smoothstep(98.0,106.0,arenaRadius)
@@ -661,11 +836,23 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
   vec3 fogColor = summitProfile ? vec3(.50,.52,.54)
     : (orreProfile ? vec3(.63,.46,.31)
     : (realgamProfile ? vec3(.64,.47,.25)
-    : (sceneProfile > .5 ? vec3(.52,.64,.64) : vec3(.10,.19,.27))));
+    : (outskirtsProfile ? vec3(.91,.82,.62)
+    : (deepProfile ? vec3(.026,.029,.027)
+    : (relicProfile ? vec3(.30,.37,.25)
+    : (neutralSourceProfile ? vec3(.30,.31,.30)
+    : (sceneProfile > .5 ? vec3(.52,.64,.64) : vec3(.10,.19,.27))))))));
   if (materialMode > 3.5 && materialMode < 4.5)
-    shaded = mix(shaded,fogColor,fog*.10);
-  else if (!(materialMode > .5 && materialMode < 1.5))
-    shaded = mix(shaded,fogColor,fog*(summitProfile ? .055 : (orreProfile ? .27 : (realgamProfile ? .22 : (sceneProfile > .5 ? .36 : .42)))));
+    shaded = mix(shaded,fogColor,fog*(deepProfile ? .015 : .10));
+  else if (!(materialMode > .5 && materialMode < 1.5)) {
+    float fogStrength = summitProfile ? .055
+      : (orreProfile ? .27
+      : (realgamProfile ? .22
+      : (outskirtsProfile ? .12
+      : (deepProfile ? .018
+      : (relicProfile ? .070
+      : (neutralSourceProfile ? .08 : (sceneProfile > .5 ? .36 : .42)))))));
+    shaded = mix(shaded,fogColor,fog*fogStrength);
+  }
 
   if (materialMode > 2.5) a = 1.0;
   return vec4(clamp(shaded,vec3(0.0),vec3(1.0)),clamp(a,0.0,1.0));
@@ -673,6 +860,8 @@ vec4 effect(vec4 color, Image texture, vec2 uv, vec2 screen) {
 ]]
 
 local scene, shader, white
+local shaderMode=nil
+local outskirtsFarFieldMesh,relicFarFieldMesh=nil,nil
 -- Cache of which uniforms the currently compiled arena shader actually
 -- declares. Invalidated whenever `shader` is rebuilt or released.
 local uniformCache,uniformCacheShader=nil,nil
@@ -748,7 +937,11 @@ local function texture(spec,textures)
     local data=love.image.newImageData(1,1); data:setPixel(0,0,1,1,1,1)
     white=love.graphics.newImage(data); return {image=white,binaryAlpha=false}
   end
-  local prior=textures[spec.path]; if prior then return prior end
+  -- A retail image may be clamped on one polygon and repeated on another.
+  -- LÖVE stores sampler state on the Image, so sharing solely by pixel path
+  -- lets the first material's wrap mode leak into unrelated source surfaces.
+  local textureKey=tostring(spec.path).."|wrap:"..tostring(spec.wrapS)..","..tostring(spec.wrapT)
+  local prior=textures[textureKey]; if prior then return prior end
   local bytes,readErr=GeneratedAssets.read(spec.path); if not bytes then return nil,readErr or ("missing "..spec.path) end
   local binaryAlpha, fractionalAlpha = alphaInfo(bytes)
   local ok,data=pcall(love.image.newImageData,spec.w,spec.h,"rgba8",bytes)
@@ -756,9 +949,7 @@ local function texture(spec,textures)
   local ok2,img=pcall(love.graphics.newImage,data)
   if not ok2 then return nil,img end
   local path=tostring(spec.path or "")
-  local crowd=path:find("tex_0d5b60_",1,true) or path:find("tex_0ddb60_",1,true) or path:find("cache/stages/orre/crowd_",1,true)
-    or path:find("cache/stages/orre/source/tex_10f240_",1,true) or path:find("cache/stages/orre/source/tex_111240_",1,true)
-    or path:find("cache/stages/realgam/source/tex_0bed60_",1,true) or path:find("cache/stages/realgam/source/tex_0c0d60_",1,true)
+  local crowd=V.ArenaAudienceProfile and V.ArenaAudienceProfile.classifyPath(path)
   local d2stage=path:find("cache/stages/d2_crater/textures/",1,true)
   local wildRepeat=path:find("cache/stages/wildlands/ground_",1,true) or path:find("cache/stages/wildlands/bark_",1,true)
   local orreRepeat=path:find("cache/stages/orre/",1,true)
@@ -796,7 +987,7 @@ local function texture(spec,textures)
     end
   end
   local entry={image=img,binaryAlpha=binaryAlpha,fractionalAlpha=fractionalAlpha}
-  textures[spec.path]=entry; return entry
+  textures[textureKey]=entry; return entry
 end
 local function groupStats(vertices)
   local x,y,z,n=0,0,0,0
@@ -865,7 +1056,12 @@ local function withNormals(vertices,mode)
           -- Legacy/procedural recipes emit 9-field rows: XYZ, UV, RGBA.
           local r,g,bv,av=1,1,1,1
           local vnx,vny,vnz=nx,ny,nz
-          if #src>=9 then
+          if #src>=12 then
+            r,g,bv,av=src[6] or 1,src[7] or 1,src[8] or 1,src[9] or 1
+            vnx,vny,vnz=src[10] or nx,src[11] or ny,src[12] or nz
+            local nl=math.sqrt(vnx*vnx+vny*vny+vnz*vnz)
+            if nl>0.000001 then vnx,vny,vnz=vnx/nl,vny/nl,vnz/nl else vnx,vny,vnz=nx,ny,nz end
+          elseif #src>=9 then
             r,g,bv,av=src[6] or 1,src[7] or 1,src[8] or 1,src[9] or 1
           elseif #src==8 then
             vnx,vny,vnz=src[6] or nx,src[7] or ny,src[8] or nz
@@ -875,10 +1071,9 @@ local function withNormals(vertices,mode)
           if crowdPhase then
             local srcIndex=i+j-1
             local ph=crowdPhase[srcIndex] or 0.5
-            -- Encode a stable per-card animation phase in a very small tint
-            -- variation. The pixel shader decodes it, while the visible color
-            -- shift stays subtle enough to preserve the source crowd atlas.
-            r=.80+.20*ph;g=.965+.035*((ph*.61803398875)%1);bv=.975+.025*((ph*.38196601125)%1);av=1
+            -- Preserve RGBA; shader extracts phase from normal length and
+            -- normalizes the authored direction before lighting.
+            local scale=1+ph;vnx,vny,vnz=vnx*scale,vny*scale,vnz*scale
           end
           out[#out+1]={src[1] or 0,src[2] or 0,src[3] or 0,src[4] or 0,src[5] or 0,r,g,bv,av,vnx,vny,vnz}
         end
@@ -890,14 +1085,9 @@ end
 
 local function materialDetail(g)
   local path=g and g.texture and tostring(g.texture.path or "") or ""
-  -- These are the extracted architectural atlases: stone, floor, rails and
-  -- banner-on-stone sheets. Crowd sprites, water and effects stay untouched.
-  if path:find("tex_05c560_",1,true) or path:find("tex_05db60_",1,true) or
-     path:find("tex_08bb60_",1,true) or path:find("tex_0abb60_",1,true) or
-     path:find("cache/stages/wildlands/ground_",1,true) or path:find("cache/stages/wildlands/bark_",1,true) or
-     path:find("cache/stages/orre/",1,true) or path:find("cache/stages/realgam/",1,true) then
-    return 1
-  end
+  -- Original GC6E01 atlases are sampled as authored. Synthetic sharpening is
+  -- retained only for CBE's intentionally authored Wildlands textures.
+  if path:find("cache/stages/wildlands/ground_",1,true) or path:find("cache/stages/wildlands/bark_",1,true) then return 1 end
   return 0
 end
 local function materialMode(g,tex)
@@ -929,12 +1119,8 @@ local function materialMode(g,tex)
   end
   if path:find("tex_0cbb60_",1,true) then return 2 end -- waterfall glint
   if path:find("tex_0cdb60_",1,true) or path:find("tex_081b60_",1,true) then return 1 end -- water
-  local sourceCrowd =
-    path:find("cache/stages/orre/source/tex_10f240_",1,true) or path:find("cache/stages/orre/source/tex_111240_",1,true)
-    or path:find("cache/stages/realgam/source/tex_0bed60_",1,true) or path:find("cache/stages/realgam/source/tex_0c0d60_",1,true)
-  if tex and tex.binaryAlpha and (path:find("tex_0d5b60_",1,true) or path:find("tex_0ddb60_",1,true)
-      or path:find("cache/stages/orre/crowd_",1,true) or sourceCrowd) then
-    return 4 -- source crowd atlas: exact placement + alpha-tested depth
+  if tex and tex.binaryAlpha and V.ArenaAudienceProfile and V.ArenaAudienceProfile.classifyPath(path) then
+    return 4 -- all six source audience venues, namespace-qualified
   end
   if tex and tex.binaryAlpha and (path:find("tex_05c560_",1,true) or path:find("/source/",1,true)) then
     return 3 -- hard alpha-test source rails/cards/effects
@@ -944,12 +1130,23 @@ end
 local function sourcePath(g)
   return g and g.texture and tostring(g.texture.path or "") or ""
 end
-local function dropGhostLayer(g)
+local function sourceGroundShadow(g,arenaId)
+  -- Six S1_out_bf and two T1_ancient_colo source groups are cast-shadows
+  -- on the arena floor, verified against their bounds and rendered geometry.
+  -- NO_ZUPDATE is appropriate for these overlays; it does not make them junk.
+  if (arenaId~="outskirts" and arenaId~="orre_colosseum") or g.texture or not g.xlu or not g.noz then return false end
+  local rows=g.vertices or {};if #rows<3 then return false end
+  for _,v in ipairs(rows) do
+    local y=tonumber(v[2]);if not y or y<-.1 or y>3 then return false end
+  end
+  return true
+end
+local function dropGhostLayer(g,arenaId)
   local path=sourcePath(g)
   -- These textureless NO_ZUPDATE sheets are paired GameCube effect planes.
   -- Without the original TEV combiner they become literal translucent copies
   -- of nearby surfaces, i.e. the ghosting visible in the v5 recording.
-  if not g.texture and g.xlu and g.noz then return true end
+  if not g.texture and g.xlu and g.noz then return not sourceGroundShadow(g,arenaId or activeArenaId) end
   -- One giant translucent 512x512 source sheet sits across the high bowl. It is
   -- a compositing layer, not useful battle geometry in our flattened renderer.
   if path:find("tex_05db60_",1,true) and g.xlu and g.noz then return true end
@@ -1015,21 +1212,23 @@ end
 -- metadata plus tightly-packed float32 vertex streams. Subsequent sessions can
 -- skip both the giant Lua vertex parse and normal reconstruction. The source
 -- cache remains authoritative and any sidecar failure falls back to it.
-local ARENA_RUNTIME_MESH_VERSION=2
+local ARENA_RUNTIME_MESH_VERSION=7
 local arenaRuntimeHits,arenaRuntimeWrites=0,0
 local function safeArenaId(id) return tostring(id or "water"):gsub("[^%w_%-]","_") end
-local function arenaRuntimeRoot(id) return "cache/runtime_mesh_v2/arenas/"..safeArenaId(id) end
+local function arenaRuntimeRoot(id) return "cache/runtime_mesh_v7/arenas/"..safeArenaId(id) end
 local function arenaRuntimeMetaPath(id) return arenaRuntimeRoot(id).."/scene.lua" end
 local function arenaRuntimeBinPath(id,bucket,i)
   return arenaRuntimeRoot(id)..("/%s_%03d.f32"):format(tostring(bucket or "group"),tonumber(i) or 0)
 end
-local function arenaSourceSize(def)
+local function arenaSourceSize(def,meta)
   local info=GeneratedAssets and GeneratedAssets.info and GeneratedAssets.info(def and def.cache) or nil
-  return info and tonumber(info.size) or nil
+  if not info then return nil end
+  return tonumber(info.size) or tonumber(meta and meta.sourceSize)
 end
 local function arenaRuntimeUsable(meta,def,sourceSize)
   if type(meta)~="table" or tonumber(meta.runtimeMeshVersion)~=ARENA_RUNTIME_MESH_VERSION then return false end
   if not sourceSize or tonumber(meta.sourceSize)~=sourceSize or tostring(meta.sourceCache or "")~=tostring(def and def.cache or "") then return false end
+  if def and def.id=="water" and meta.audienceRevision~=2 then return false end
   local total=0
   for _,bucket in ipairs({"opaque","cutout","crowd","translucent","additive"}) do
     local rows=meta[bucket]
@@ -1037,34 +1236,52 @@ local function arenaRuntimeUsable(meta,def,sourceSize)
     for i,g in ipairs(rows) do
       local path=type(g)=="table" and (g.runtimeBin or arenaRuntimeBinPath(def.id,bucket,i)) or nil
       local info=path and GeneratedAssets.info and GeneratedAssets.info(path) or nil
-      local size=info and tonumber(info.size)
-      if not size or size<144 or size%48~=0 then return false end
+      if not info then return false end
+      local size=tonumber(info.size)
+      if size and (size<144 or size%48~=0) then return false end
       total=total+1
     end
   end
   return total>0
 end
+-- Opaque HSD materials may carry zero vertex alpha while their RGB is valid.
+-- The opaque pass does not alpha-blend that channel. Keep RGB and texture alpha
+-- independent; packed rows reconstruct the original XLU bit without rebaking.
+local function sourceVertexAlphaEnabled(g)
+  if not (g and g.useVertexColor==true) then return false end
+  if g.xlu~=nil then return g.xlu==true end
+  return math.floor((tonumber(g.renderFlags) or 0)/1073741824)%2==1
+end
 local function compactArenaEntry(g,textureSpec,runtimeBin)
-  return {runtimeBin=runtimeBin,texture=textureSpec,alpha=g.alpha,noz=g.noz,center=g.center,mode=g.mode,flow=g.flow,detail=g.detail,texelStep=g.texelStep,
-    diffuse=g.diffuse,ambient=g.ambient,specular=g.specular,shininess=g.shininess}
+  return {runtimeBin=runtimeBin,texture=textureSpec,alpha=g.alpha,noz=g.noz,center=g.center,span=g.span,extent=g.extent,mode=g.mode,flow=g.flow,detail=g.detail,texelStep=g.texelStep,
+    diffuse=g.diffuse,ambient=g.ambient,specular=g.specular,shininess=g.shininess,renderFlags=g.renderFlags,effect=g.effect,
+    useConstant=g.useConstant,useVertexColor=g.useVertexColor,useDiffuseLighting=g.useDiffuseLighting,textureSlot=g.textureSlot}
 end
 local function ensureArenaShader(ctx)
   if shader then return shader end
   local ok,sh
   if ARENA_ANDROID then
     ok,sh=pcall(love.graphics.newShader,MOBILE_VERTEX,MOBILE_PIXEL)
-    if not ok then
-      local mobileErr=sh
-      local okFull,full=pcall(love.graphics.newShader,VERTEX,PIXEL)
-      if okFull then ok,sh=true,full
-      else sh=("mobile=%s; full=%s"):format(tostring(mobileErr),tostring(full)) end
-    else
+    if ok and sh then
+      shaderMode="android-mobile"
       log(ctx,"info","Android GLES-safe arena shader active")
+    else
+      local mobileErr=sh
+      local okSafe,safe=pcall(love.graphics.newShader,ANDROID_SAFE_VERTEX,ANDROID_SAFE_PIXEL)
+      if okSafe and safe then
+        ok,sh=true,safe;shaderMode="android-safe-static"
+        log(ctx,"warn","primary Android arena shader rejected; safe static source shader active: %s",tostring(mobileErr))
+      else
+        local safeErr=safe
+        local okFull,full=pcall(love.graphics.newShader,VERTEX,PIXEL)
+        if okFull and full then ok,sh=true,full;shaderMode="desktop-fallback"
+        else sh=("mobile=%s; safe=%s; full=%s"):format(tostring(mobileErr),tostring(safeErr),tostring(full)) end
+      end
     end
   else
-    ok,sh=pcall(love.graphics.newShader,VERTEX,PIXEL)
+    ok,sh=pcall(love.graphics.newShader,VERTEX,PIXEL);if ok and sh then shaderMode="desktop" end
   end
-  if not ok then return nil,"shader: "..tostring(sh) end
+  if not ok or not sh then return nil,"shader: "..tostring(sh) end
   shader=sh
   uniformCache=nil;uniformCacheShader=nil
   return shader
@@ -1081,9 +1298,11 @@ local function loadRuntimeArena(ctx,meta,def)
       local mesh,merr=RuntimeMeshCache.meshFromPath(FORMAT,path,12,"static")
       if not mesh then releaseArenaScene(out);return nil,merr end
       mesh:setTexture(tex.image)
-      out[bucket][#out[bucket]+1]={mesh=mesh,alpha=tonumber(g.alpha) or 1,noz=g.noz and true or false,center=g.center or {0,0,0},
+      out[bucket][#out[bucket]+1]={mesh=mesh,alpha=tonumber(g.alpha) or 1,noz=g.noz and true or false,center=g.center or {0,0,0},span=tonumber(g.span) or 0,extent=g.extent or {0,0,0},
         mode=tonumber(g.mode) or 0,flow=tonumber(g.flow) or 0,detail=g.detail,texelStep=g.texelStep or {1,1},diffuse=g.diffuse or {1,1,1},
-        ambient=g.ambient or {1,1,1},specular=g.specular or {0,0,0},shininess=tonumber(g.shininess) or 0}
+        ambient=g.ambient or {1,1,1},specular=g.specular or {0,0,0},shininess=tonumber(g.shininess) or 0,renderFlags=tonumber(g.renderFlags) or 0,effect=g.effect and true or false,
+        useConstant=g.useConstant and true or false,useVertexColor=g.useVertexColor and true or false,useVertexAlpha=sourceVertexAlphaEnabled(g),useDiffuseLighting=g.useDiffuseLighting~=false,textureSlot=tonumber(g.textureSlot) or -1,
+        textureColorMap=tonumber(g.texture and g.texture.colorMap) or 4,textureBlending=tonumber(g.texture and g.texture.blending) or 1}
     end
   end
   arenaRuntimeHits=arenaRuntimeHits+1
@@ -1099,9 +1318,10 @@ local function loadScene(ctx)
   end
   local def=activeDef or (ArenaCatalog and ArenaCatalog.definition and ArenaCatalog.definition("water")) or {id="water",cache="cache/M1_water_cache.lua"}
   local cachePath=def.cache or "cache/M1_water_cache.lua"
-  local sourceSize=arenaSourceSize(def)
+  local rt
   if RuntimeMeshCache and type(RuntimeMeshCache.readLua)=="function" and type(RuntimeMeshCache.meshFromPath)=="function" then
-    local rt=select(1,RuntimeMeshCache.readLua(arenaRuntimeMetaPath(def.id)))
+    rt=select(1,RuntimeMeshCache.readLua(arenaRuntimeMetaPath(def.id)))
+    local sourceSize=arenaSourceSize(def,rt)
     if arenaRuntimeUsable(rt,def,sourceSize) then
       local runtimeScene,rerr=loadRuntimeArena(ctx,rt,def)
       if runtimeScene then
@@ -1112,6 +1332,7 @@ local function loadScene(ctx)
       log(ctx,"warn","arena runtime sidecar %s unusable at load (%s); falling back to source cache",tostring(def.id),tostring(rerr))
     end
   end
+  local sourceSize=arenaSourceSize(def,rt)
   local cache,err=readLua(cachePath)
   if not cache then errorText=tostring(err);return nil,errorText end
   local textures={}; local opaque, cutout, crowd, translucent, additive = {}, {}, {}, {}, {}
@@ -1152,8 +1373,10 @@ local function loadScene(ctx)
           local wp=tostring(g.texture and g.texture.path or "")
           flow=wp:find("grass_tuft_",1,true) and 1 or 0.35
         end
-        local entry={mesh=mesh,alpha=alpha,noz=g.noz and true or false,center=center,mode=mode,flow=flow,detail=detail,texelStep={1/math.max(1,tw),1/math.max(1,th)},
-          diffuse=g.diffuse or {1,1,1},ambient=g.ambient or {1,1,1},specular=g.specular or {0,0,0},shininess=tonumber(g.shininess) or 0}
+        local entry={mesh=mesh,alpha=alpha,noz=g.noz and true or false,center=center,span=span,extent=extent,mode=mode,flow=flow,detail=detail,texelStep={1/math.max(1,tw),1/math.max(1,th)},
+          diffuse=g.diffuse or {1,1,1},ambient=g.ambient or {1,1,1},specular=g.specular or {0,0,0},shininess=tonumber(g.shininess) or 0,renderFlags=tonumber(g.renderFlags) or 0,effect=g.effect and true or false,
+          useConstant=g.useConstant and true or false,useVertexColor=g.useVertexColor and true or false,useVertexAlpha=sourceVertexAlphaEnabled(g),useDiffuseLighting=g.useDiffuseLighting~=false,textureSlot=tonumber(g.textureSlot) or -1,
+          textureColorMap=tonumber(g.texture and g.texture.colorMap) or 4,textureBlending=tonumber(g.texture and g.texture.blending) or 1}
         local bucketName,bucket
         if mode==2 then
           bucketName,bucket="additive",additive
@@ -1162,13 +1385,11 @@ local function loadScene(ctx)
           -- material happened to be marked opaque for its original TEV setup.
           bucketName,bucket="translucent",translucent
         elseif mode==4 then
-          -- The prior support test still admitted four isolated cards high in
-          -- empty space (the tiny spectators visibly hanging over waterfalls in
-          -- the v21 recording).  The real seated bank in this extraction lives
-          -- below raw Y=80; the four strays begin above Y=95.  Cull that clean
-          -- gap rather than using a camera-dependent screen heuristic.
+          -- Exact source modelsets contain legitimate upper banks at raw
+          -- Y=105..148. The old recipe-only Y=84 rule erased 35 of 57 cards.
+          -- Preserve every authored source bank; retain the legacy recipe guard.
           local cpath=tostring(g.texture and g.texture.path or "")
-          if cpath:find("cache/stages/orre/crowd_",1,true) or (center[2] or 0) <= 84.0 then
+          if cache.crowdPolicy=="source-hsd-crowd" or activeArenaId~="water" or (center[2] or 0) <= 84.0 then
             bucketName,bucket="crowd",crowd
           else
             culled=culled+1;crowdOutliers=crowdOutliers+1
@@ -1197,7 +1418,7 @@ local function loadScene(ctx)
   scene={opaque=opaque,cutout=cutout,crowd=crowd,translucent=translucent,additive=additive,bounds=cache.bounds,source=cache.source,textures=textures,culled=culled,oversizeCulled=oversizeCulled,crowdOutliers=crowdOutliers,
     crowdOriginal=tonumber(cache.crowdOriginal) or 0,crowdKept=#crowd,crowdPolicy=cache.crowdPolicy or ((activeDef and activeDef.crowd) or "none"),cachePath=cachePath,runtimeSidecar=false }
   if runtimeAll and RuntimeMeshCache and type(RuntimeMeshCache.writeLua)=="function" then
-    local meta={runtimeMeshVersion=ARENA_RUNTIME_MESH_VERSION,sourceSize=sourceSize,sourceCache=cachePath,bounds=cache.bounds,source=cache.source,
+    local meta={runtimeMeshVersion=ARENA_RUNTIME_MESH_VERSION,audienceRevision=2,textureStateVersion=cache.textureStateVersion,sourceSize=sourceSize,sourceCache=cachePath,bounds=cache.bounds,source=cache.source,
       culled=culled,oversizeCulled=oversizeCulled,crowdOutliers=crowdOutliers,crowdOriginal=tonumber(cache.crowdOriginal) or 0,crowdKept=#crowd,
       crowdPolicy=cache.crowdPolicy or ((activeDef and activeDef.crowd) or "none"),opaque=runtimeRows.opaque,cutout=runtimeRows.cutout,crowd=runtimeRows.crowd,
       translucent=runtimeRows.translucent,additive=runtimeRows.additive}
@@ -1321,7 +1542,10 @@ local function viewProjection(ctx,w,h)
   if not (pose and pose.eye and pose.focus and pose.fov) then
     -- Deliberately a fresh table: consumers receive this pose through
     -- ctx.services.camera.pose and must never share a module-level default.
-    pose={eye={54,24,13},focus={0,6,0},fov=math.rad(40)}
+    local cam=activeDef and activeDef.camera or {}
+    pose={eye={cam.side or 54,cam.height or 24,cam.back or 13},
+      focus={cam.lookX or 0,cam.lookY or 6,0},fov=math.rad(40)}
+    if V.Camera and V.Camera.guardPose then pose=V.Camera:guardPose(pose,{camera=cam},"passive") end
   end
   local eye,focus=pose.eye,pose.focus
   local dx,dy,dz=eye[1]-focus[1],eye[2]-focus[2],eye[3]-focus[3]
@@ -1332,14 +1556,10 @@ local function viewProjection(ctx,w,h)
   -- scenery enough depth range instead of clipping it at the generic 345-unit
   -- arena plane.
   local profile=(activeDef and activeDef.profile) or "water"
-  local baseFar=(profile=="summit" and 1450)
-    or (profile=="realgam" and 1200)
-    or (profile=="orre" and 760)
-    or 345
-  local tail=(profile=="summit" and 1320)
-    or (profile=="realgam" and 1050)
-    or (profile=="orre" and 650)
-    or 265
+  local sourceFar=math.max(345,(BATTLE_VERTEX_RADIUS_RAW or 415)*(STAGE_SCALE or 0.25)+120)
+  local profileBoost=(profile=="summit" and 260) or (profile=="deep" and 180) or (profile=="realgam" and 160) or 0
+  local baseFar=sourceFar+profileBoost
+  local tail=math.max(265,sourceFar*.72)
   local far=math.max(baseFar,dist+tail)
   local p=Mat4.perspective(pose.fov,w/h,near,far)
   -- scale(1,-1,1) * p only negates the second row of p; doing that directly
@@ -1357,7 +1577,7 @@ local function setStageState(vp,model,writeDepth,pose)
   sendShader("sceneTime",sceneTime)
   sendShader("sceneRadiusWorld",math.max(20,(BATTLE_VERTEX_RADIUS_RAW or 415)*(STAGE_SCALE or 0.25)+8))
   local profile=(activeDef and activeDef.profile) or "water"
-  sendShader("sceneProfile",profile=="realgam" and 4 or (profile=="orre" and 3 or (profile=="summit" and 2 or (profile=="outdoor" and 1 or 0))))
+  sendShader("sceneProfile",profile=="realgam" and 4 or (profile=="orre" and 3 or (profile=="summit" and 2 or (profile=="outdoor" and 1 or (profile=="water" and 0 or (profile=="relic" and 5 or (profile=="relic_cave" and 6 or (profile=="outskirts" and 7 or (profile=="pyrite" and 8 or ((profile=="deep" or profile=="cipher_lab") and 9 or 5))))))))))
   sendShader("cameraEye",pose and pose.eye or {54,24,13})
 end
 -- Shared immutable fallbacks. These were allocated fresh for every material
@@ -1365,20 +1585,348 @@ end
 local WHITE3={1,1,1}
 local BLACK3={0,0,0}
 local UNIT2={1,1}
-local function drawGroup(g)
+local worldCenter
+local function cameraOccluder(g,pose)
+  -- The complete Relic cache uses native joint scale compensation. Its former
+  -- "overhangs" were sheared source geometry, not extra foreground props.
+  -- A material group can contain hundreds of separate leaf sprigs; its AABB
+  -- must never erase the real forest now that their transforms are correct.
+  if activeDef and activeDef.profile=="relic" and activeDef.sourceShellOnly then return false end
+  -- 1.9.27 hard Relic clear-zone rule. Any broad, thin, elevated carrier whose
+  -- raw bounds actually cross the battle core is presentation-only overhead for
+  -- CBE's 360-degree camera and is never submitted. This is deliberately based
+  -- on geometry bounds, not a single centre ray, so the same branch/canopy sheet
+  -- cannot reappear from the opposite side of the arena.
+  if activeDef and activeDef.profile=="relic" and g and g.center and g.extent then
+    local sc=STAGE_SCALE or .25
+    local cx=(tonumber(g.center[1]) or 0)*sc;local cy=(tonumber(g.center[2]) or 0)*sc;local cz=(tonumber(g.center[3]) or 0)*sc
+    local ex=math.abs((tonumber(g.extent[1]) or 0)*sc);local ey=math.abs((tonumber(g.extent[2]) or 0)*sc);local ez=math.abs((tonumber(g.extent[3]) or 0)*sc)
+    local hx,hz=ex*.5,ez*.5
+    local crossesCore=(cx-hx)<48 and (cx+hx)>-48 and (cz-hz)<48 and (cz+hz)>-48
+    local broad=ex>20 and ez>20 and math.max(ex,ez)>30
+    local thin=ey<math.max(14,math.max(ex,ez)*.46)
+    local elevated=(cy+ey*.5)>9.0
+    if crossesCore and broad and thin and elevated then return true end
+  end
+
+  -- Relic Chamber uses a view-adaptive presentation guard in addition to its
+  -- clean camera volume. The source scene stays complete; only an oversized
+  -- camera-side foliage/root carrier that actually covers the protected battle
+  -- viewport is omitted for the current view. This catches the broad off-centre
+  -- canopy/pale bark sheets that centre-ray tests cannot detect.
+  if activeDef and activeDef.presentationOccluderTrim and activeDef.profile=="relic"
+      and RelicPresentation and type(RelicPresentation.shouldCull)=="function" then
+    local aspect=(projW and projH and projH>0) and (projW/projH) or (16/9)
+    local ok,skip=pcall(RelicPresentation.shouldCull,g,pose,STAGE_SCALE or .25,STAGE_YAW or 0,aspect)
+    if ok and skip then return true end
+  end
+  if not (activeDef and activeDef.cameraOccluderTrim and pose and pose.eye and pose.focus and g and g.center) then return false end
+  local span=(tonumber(g.span) or 0)*(STAGE_SCALE or 0.25)
+  -- Relic camera trimming is intentionally more sensitive than the generic
+  -- scene culler: modest leaf cards close to the lens can obscure a battler
+  -- even when their world span is not enormous.
+  if span<7 then return false end
+  local ex,ey,ez=pose.eye[1] or 0,pose.eye[2] or 0,pose.eye[3] or 0
+  local fx,fy,fz=pose.focus[1] or 0,pose.focus[2] or 0,pose.focus[3] or 0
+  local gx,gy,gz=worldCenter(g.center)
+  local vx,vy,vz=fx-ex,fy-ey,fz-ez;local vv=vx*vx+vy*vy+vz*vz
+  if vv<1e-6 then return false end
+  local t=((gx-ex)*vx+(gy-ey)*vy+(gz-ez)*vz)/vv
+  -- Only trim geometry between the lens and battlers. Broad alpha-tested leaf
+  -- cards need a wider interval than long solid trunks because their centre can
+  -- sit well off the actual pixels crossing the view.
+  if t<=0.025 or t>=0.78 then return false end
+  local genericBetween=(t>0.06 and t<0.46)
+  local cx,cy,cz=ex+vx*t,ey+vy*t,ez+vz*t
+  local dx,dy,dz=gx-cx,gy-cy,gz-cz
+  local extent=g.extent or {0,0,0};local sx=(tonumber(extent[1]) or 0)*(STAGE_SCALE or 0.25);local sy=(tonumber(extent[2]) or 0)*(STAGE_SCALE or 0.25);local sz=(tonumber(extent[3]) or 0)*(STAGE_SCALE or 0.25)
+  local long=math.max(sx,sy,sz);local short=math.max(1,math.min(sx>0 and sx or long,sy>0 and sy or long,sz>0 and sz or long))
+  local elongated=long/short>2.0
+  local eyeDist=(gx-ex)^2+(gy-ey)^2+(gz-ez)^2
+  local corridor=math.min(10,span*.30)+2.5
+
+  -- Relic Chamber's shrine scene contains broad leaf/root carrier sheets as
+  -- well as long trunk carriers. The older test only recognized elongated
+  -- objects, so the giant flat canopy in front of the lens survived and could
+  -- cover half the battlefield. Treat a large, elevated, camera-side flat
+  -- carrier as an occluder too. Ground/floor sheets are protected by the y
+  -- test, and rear architecture is protected by the camera/focus t interval.
+  local maxXZ=math.max(sx,sz)
+  local mode=tonumber(g.mode) or 0
+  local sourceCard=(mode>2.5 and mode<3.5)
+  local broadCanopy=(gy>4.0 and maxXZ>14 and sy<math.max(10.0,maxXZ*.42))
+  local sight2=dx*dx+dy*dy+dz*dz
+  if (broadCanopy or (sourceCard and gy>3.0 and long>8.0)) and t>0.025 and t<0.78 and eyeDist<96*96 then
+    -- Use the carrier's own footprint as part of the sight corridor. This is
+    -- what catches the huge off-centre leaf sheet in the reported screenshots:
+    -- its centre can sit well left of the battlers while its geometry still
+    -- stretches directly across the camera frustum.
+    local canopyCorridor=math.min(46,math.max(13,maxXZ*.62,span*.46))
+    if sight2<canopyCorridor*canopyCorridor then return true end
+  end
+  return genericBetween and elongated and eyeDist<58*58 and sight2<corridor*corridor
+end
+local function ensureRelicFarField()
+  if relicFarFieldMesh then return relicFarFieldMesh end
+  if not (love and love.graphics and love.graphics.newMesh) then return nil end
+  local tex=texture(nil,scene and scene.textures or {})
+  if not (tex and tex.image) then return nil end
+  local rows={};local seg=96
+  -- 1.9.31 continuity land: source geometry now supplies the visible roots,
+  -- rocks and ground patches. This mesh only bridges the space underneath them,
+  -- but uses denser rings and low-relief deterministic mottling so it no longer
+  -- reads as one flat olive disc beyond the authored stage.
+  local radii={220,440,760,1180,1780,2520,3420}
+  local baseY={-3.5,-5.0,-7.0,-10.5,-15.0,-21.0,-29.0}
+  local colors={{.315,.355,.205},{.292,.340,.192},{.264,.320,.176},
+                {.232,.294,.160},{.200,.268,.145},{.170,.242,.132},{.145,.215,.120}}
+  local function ringPoint(ri,i)
+    local a=(i/seg)*math.pi*2
+    local wave=math.sin(a*3.0+ri*.73)*7+math.sin(a*7.0-ri*.41)*3+math.sin(a*13.0+ri*.19)*1.6
+    local y=baseY[ri]+wave*(ri<3 and .045 or .115)
+    return math.cos(a)*radii[ri],y,math.sin(a)*radii[ri],a
+  end
+  local function add(x,y,z,c,a,ri)
+    local m=.94+.045*math.sin(x*.016+z*.011+ri*.71)+.025*math.sin(x*.037-z*.029)
+    local warm=.012*(.5+.5*math.sin(a*5.0+ri*.6))
+    rows[#rows+1]={x,y,z,0,0,
+      math.max(0,math.min(1,c[1]*m+warm)),
+      math.max(0,math.min(1,c[2]*m+warm*.45)),
+      math.max(0,math.min(1,c[3]*m-warm*.15)),1,0,1,0}
+  end
+  for ri=1,#radii-1 do
+    for i=0,seg-1 do
+      local x0,y0,z0,a0=ringPoint(ri,i);local x1,y1,z1,a1=ringPoint(ri+1,i)
+      local x2,y2,z2,a2=ringPoint(ri+1,i+1);local x3,y3,z3,a3=ringPoint(ri,i+1)
+      local c0,c1=colors[ri],colors[ri+1]
+      add(x0,y0,z0,c0,a0,ri);add(x1,y1,z1,c1,a1,ri+1);add(x2,y2,z2,c1,a2,ri+1)
+      add(x0,y0,z0,c0,a0,ri);add(x2,y2,z2,c1,a2,ri+1);add(x3,y3,z3,c0,a3,ri)
+    end
+  end
+  local ok,m=pcall(love.graphics.newMesh,FORMAT,rows,"triangles","static")
+  if not ok then return nil end
+  m:setTexture(tex.image);relicFarFieldMesh=m
+  return m
+end
+local function drawRelicFarField()
+  if not (activeDef and activeDef.profile=="relic") then return end
+  if activeDef.sourceShellOnly then return end
+  local m=ensureRelicFarField();if not m then return end
+  sendShader("materialAlpha",1);sendShader("materialMode",0);sendShader("materialFlow",0)
+  sendShader("sourceTextureColorMap",4);sendShader("sourceTextureBlending",1)
+  sendShader("materialDiffuse",WHITE3);sendShader("materialAmbient",WHITE3);sendShader("materialSpecular",BLACK3);sendShader("materialShininess",0)
+  sendShader("sourceDiffuseLighting",0);sendShader("sourceVertexColor",1);sendShader("sourceVertexAlpha",1);sendShader("sourceConstantColor",0)
+  sendShader("materialDetail",0);sendShader("texelStep",UNIT2)
+  love.graphics.draw(m)
+end
+
+-- Relic Chamber source-forest closure. The battle map has excellent authentic
+-- tree/trunk/leaf assets, but its retail camera never exposes every azimuth at
+-- once. CBE does. Rather than drawing synthetic billboard trees, select a small
+-- motif directly from the extracted M3_shrine_1F_bf material groups and reuse
+-- those source meshes OUTSIDE the legal camera volume. This gives every 360°
+-- angle real Colosseum bark/foliage geometry while keeping the inner clearing
+-- completely free of foreground branches.
+local drawGroup
+local relicForestSectorCache=setmetatable({},{__mode="k"})
+local function angleWrap(a)
+  while a<=-math.pi do a=a+math.pi*2 end
+  while a>math.pi do a=a-math.pi*2 end
+  return a
+end
+local function angleDistance(a,b)
+  return math.abs(angleWrap(a-b))
+end
+local function relicAtan2(y,x)
+  if math.atan2 then return math.atan2(y,x) end
+  if x>0 then return math.atan(y/x) end
+  if x<0 and y>=0 then return math.atan(y/x)+math.pi end
+  if x<0 and y<0 then return math.atan(y/x)-math.pi end
+  if x==0 and y>0 then return math.pi*.5 end
+  if x==0 and y<0 then return -math.pi*.5 end
+  return 0
+end
+
+-- 1.9.29: build the missing 360-degree Relic perimeter from a COMPLETE source
+-- forest sector rather than cloning four trunk groups and five leaf cards as
+-- isolated "trees".  The retail battle map contains one side with a coherent
+-- arrangement of trunks, roots, rocks and matching foliage.  Find the densest
+-- safe 120-degree perimeter sector at runtime, preserve every eligible group in
+-- that sector at its authored relative position, then rotate that whole source
+-- sector around the shrine.  This keeps real Colosseum spacing/material pairing
+-- and removes the sparse/repeated artificial-ring look from 1.9.28.
+local function relicForestSector(s)
+  if not s then return nil end
+  local cached=relicForestSectorCache[s];if cached then return cached end
+  local sc=STAGE_SCALE or .25
+  local binsN=16
+  local bins={};for i=1,binsN do bins[i]=0 end
+  local candidates={}
+  local function consider(g,pass)
+    if not (g and g.center and g.extent) then return end
+    local c,e=g.center,g.extent
+    local x,z=(tonumber(c[1]) or 0)*sc,(tonumber(c[3]) or 0)*sc
+    local r=math.sqrt(x*x+z*z)
+    local ex,ey,ez=math.abs((tonumber(e[1]) or 0)*sc),math.abs((tonumber(e[2]) or 0)*sc),math.abs((tonumber(e[3]) or 0)*sc)
+    local maxXZ=math.max(ex,ez)
+    local inner=r-maxXZ*.56
+
+    -- Preserve substantially more of the authentic perimeter than 1.9.29.
+    -- Large vertical roots/tree-wall pieces are legitimate background; only
+    -- floor-spanning sheets and huge shallow canopy carriers are rejected.
+    if r<48 or r>340 or inner<44 or maxXZ>118 then return end
+    local perimeterGround=ey<1.05 and maxXZ>3.0 and maxXZ<62 and inner>48
+    local shallowCarrier=maxXZ>42 and ey<math.max(2.8,maxXZ*.10)
+    if shallowCarrier and not perimeterGround then return end
+    if pass=="cutout" and maxXZ>36 and ey<4.2 then return end
+
+    local vertical=ey>4.0
+    local treeLike=(pass=="cutout") or vertical or perimeterGround or (maxXZ>1.0 and ey>.5)
+    if not treeLike then return end
+
+    local a=relicAtan2(z,x)
+    local bi=math.floor(((a+math.pi)/(math.pi*2))*binsN)%binsN+1
+    local weight
+    if perimeterGround then
+      weight=.52+math.min(22,maxXZ)*.016
+    elseif pass=="cutout" then
+      weight=.92+math.min(16,ey)*.030
+    else
+      weight=1.05+math.min(28,ey)*.052+math.min(28,maxXZ)*.025
+      if ey>9 and maxXZ>6 then weight=weight*1.28 end -- thick roots/tree walls
+    end
+    bins[bi]=bins[bi]+weight
+    local smallDetail=perimeterGround
+      or (pass=="opaque" and ey<7.0 and maxXZ<18 and inner>50)
+      or (pass=="cutout" and ey<5.5 and maxXZ<9 and inner>54)
+    candidates[#candidates+1]={g=g,pass=pass,angle=a,r=r,inner=inner,
+      ground=perimeterGround,smallDetail=smallDetail}
+  end
+  for _,g in ipairs(s.opaque or {}) do consider(g,"opaque") end
+  for _,g in ipairs(s.cutout or {}) do consider(g,"cutout") end
+
+  -- Use one coherent HALF of the retail forest and mirror only the missing
+  -- hemisphere. 1.9.29's 120-degree slice repeated three times was structurally
+  -- complete but visually repetitive and sparse. A 180-degree source slice
+  -- retains far more unique trunks, roots, ground and foliage relationships.
+  local windowBins=8
+  local bestStart,bestScore=1,-1
+  for st=1,binsN do
+    local score=0
+    for j=0,windowBins-1 do score=score+bins[((st-1+j)%binsN)+1] end
+    if score>bestScore then bestScore=score;bestStart=st end
+  end
+  local centerAngle=-math.pi+((bestStart-1)+windowBins*.5)/binsN*(math.pi*2)
+  local halfWidth=math.rad(94)
+  local groups,detailGroups={},{}
+  for _,row in ipairs(candidates) do
+    if angleDistance(row.angle,centerAngle)<=halfWidth then
+      groups[#groups+1]=row.g
+      if row.smallDetail then detailGroups[#detailGroups+1]=row.g end
+    end
+  end
+  relicForestSectorCache[s]={groups=groups,detailGroups=detailGroups,
+    center=centerAngle,score=bestScore}
+  return relicForestSectorCache[s]
+end
+
+local function drawRelicSourceForestShell(s,vp,baseModel,pose)
+  if not (activeDef and activeDef.profile=="relic" and s) or activeDef.sourceShellOnly then return end
+  local sector=relicForestSector(s)
+  if not (sector and #sector.groups>0) then return end
+
+  -- The original M3 scene remains authoritative. Fill only the opposite
+  -- hemisphere with the complete source half. This removes the repeated
+  -- three-sector tree cadence while preserving a clean inner camera bowl.
+  local copyModel=Mat4.mul(Mat4.rotateY(math.pi),baseModel)
+  setStageState(vp,copyModel,true,pose)
+  for _,g in ipairs(sector.groups) do drawGroup(g) end
+
+  -- A sparse second pass reuses only authentic low ground/root/rock/understory
+  -- pieces at the quarter turns. It adds forest-floor density and breaks the
+  -- bare continuity-land look without copying tall trees or broad foliage into
+  -- new foreground silhouettes.
+  if sector.detailGroups and #sector.detailGroups>0 then
+    for _,delta in ipairs({math.pi*.5,math.pi*1.5}) do
+      local detailModel=Mat4.mul(Mat4.rotateY(delta),baseModel)
+      setStageState(vp,detailModel,true,pose)
+      for _,g in ipairs(sector.detailGroups) do drawGroup(g) end
+    end
+  end
+  setStageState(vp,baseModel,true,pose)
+end
+
+local function ensureOutskirtsFarField()
+  if outskirtsFarFieldMesh then return outskirtsFarFieldMesh end
+  if not (love and love.graphics and love.graphics.newMesh) then return nil end
+  local tex=texture(nil,scene and scene.textures or {})
+  if not (tex and tex.image) then return nil end
+  local rows={}
+  local seg=80
+  local radii={360,1050,2800,6500,12800}
+  local baseY={-3.5,-6.0,-10.5,-20,-34}
+  -- Match the opening battle's pale yellow Orre sand rather than the darker
+  -- procedural brown used by the first continuity patch.
+  local colors={{.925,.875,.710},{.910,.845,.665},{.875,.795,.585},{.805,.690,.445},{.715,.555,.320}}
+  local function ringPoint(ri,i)
+    local a=(i/seg)*math.pi*2
+    local wave=math.sin(a*2.0+ri*.8)*10 + math.sin(a*5.0-ri*.55)*4 + math.sin(a*11.0+ri)*1.8
+    -- The Outskirt Stand horizon is broad and flat. Dunes only develop in the
+    -- far rings so the battle pad and source prop silhouettes stay untouched.
+    local y=baseY[ri] + (ri>=4 and wave*.48 or (ri>=3 and wave*.22 or wave*.06))
+    return math.cos(a)*radii[ri],y,math.sin(a)*radii[ri]
+  end
+  local function add(x,y,z,c)
+    rows[#rows+1]={x,y,z,0,0,c[1],c[2],c[3],1,0,1,0}
+  end
+  -- Multi-ring sand skirt: the first ring sits beneath the authentic S1_out_bf
+  -- ground, while the farther rings develop very low Orre dunes. This removes
+  -- the square boundary without competing with the source wagon/fences/pad.
+  for ri=1,#radii-1 do
+    for i=0,seg-1 do
+      local x0,y0,z0=ringPoint(ri,i);local x1,y1,z1=ringPoint(ri+1,i)
+      local x2,y2,z2=ringPoint(ri+1,i+1);local x3,y3,z3=ringPoint(ri,i+1)
+      local c0,c1=colors[ri],colors[ri+1]
+      add(x0,y0,z0,c0);add(x1,y1,z1,c1);add(x2,y2,z2,c1)
+      add(x0,y0,z0,c0);add(x2,y2,z2,c1);add(x3,y3,z3,c0)
+    end
+  end
+  local ok,m=pcall(love.graphics.newMesh,FORMAT,rows,"triangles","static")
+  if not ok then return nil end
+  m:setTexture(tex.image);outskirtsFarFieldMesh=m
+  return m
+end
+local function drawOutskirtsFarField()
+  if not (activeDef and activeDef.profile=="outskirts") then return end
+  local m=ensureOutskirtsFarField();if not m then return end
+  sendShader("materialAlpha",1);sendShader("materialMode",0);sendShader("materialFlow",0)
+  sendShader("sourceTextureColorMap",4);sendShader("sourceTextureBlending",1)
+  sendShader("materialDiffuse",WHITE3);sendShader("materialAmbient",WHITE3);sendShader("materialSpecular",BLACK3);sendShader("materialShininess",0)
+  sendShader("sourceDiffuseLighting",0);sendShader("sourceVertexColor",1);sendShader("sourceVertexAlpha",1);sendShader("sourceConstantColor",0)
+  sendShader("materialDetail",0);sendShader("texelStep",UNIT2)
+  love.graphics.draw(m)
+end
+
+drawGroup=function(g)
   sendShader("materialAlpha",g.alpha or 1)
   sendShader("materialMode",g.mode or 0)
+  sendShader("sourceTextureColorMap",g.textureColorMap or 4)
+  sendShader("sourceTextureBlending",g.textureBlending or 1)
   sendShader("materialFlow",g.flow or 0)
   sendShader("materialDiffuse",g.diffuse or WHITE3)
   sendShader("materialAmbient",g.ambient or WHITE3)
   sendShader("materialSpecular",g.specular or BLACK3)
   sendShader("materialShininess",g.shininess or 0)
+  sendShader("sourceDiffuseLighting",g.useDiffuseLighting and 1 or 0)
+  sendShader("sourceVertexColor",g.useVertexColor and 1 or 0)
+  sendShader("sourceVertexAlpha",g.useVertexAlpha and 1 or 0)
+  sendShader("sourceConstantColor",g.useConstant and 1 or 0)
   sendShader("materialDetail",g.detail or 0)
   sendShader("texelStep",g.texelStep or UNIT2)
   love.graphics.draw(g.mesh)
 end
-local function drawGroups(groups)
-  for i=1,#groups do drawGroup(groups[i]) end
+local function drawGroups(groups,pose)
+  for i=1,#groups do local g=groups[i];if not cameraOccluder(g,pose) then drawGroup(g) end end
 end
 local function drawCrowd(groups,vp,baseModel,pose)
   if not groups then return end
@@ -1413,10 +1961,10 @@ local function drawCrowd(groups,vp,baseModel,pose)
     end
   end
 end
-local function drawAdditive(groups)
+local function drawAdditive(groups,pose)
   if not groups or #groups==0 then return end
   love.graphics.setBlendMode("add","alphamultiply")
-  drawGroups(groups)
+  drawGroups(groups,pose)
   love.graphics.setBlendMode("alpha","alphamultiply")
 end
 local function projectWorldToBackdrop(vp,x,y,z,w,h)
@@ -1474,6 +2022,65 @@ local function paintBackdropStatic(w,h)
       love.graphics.rectangle("fill",0,y,w,math.ceil(h/55)+2)
     end
     love.graphics.setColor(.12,.17,.18,.08);love.graphics.rectangle("fill",0,h*.76,w,h*.24)
+    love.graphics.setColor(1,1,1,1)
+    return
+  elseif profile=="relic" then
+    -- Relic Chamber must read as an outdoor Agate forest from every azimuth.
+    -- The source HSD owns the shrine, stone, trunks and near foliage. This
+    -- backdrop supplies only the distant sky/forest closure behind that real
+    -- geometry so there is never a black void or flat green wall between trees.
+    local topSky={.19,.42,.70};local midSky={.42,.61,.72};local horizon={.70,.80,.66}
+    for i=0,71 do
+      local t=i/71;local y=i*h/71;local r,g,b
+      if t<.58 then
+        local q=t/.58;r=topSky[1]+(midSky[1]-topSky[1])*q;g=topSky[2]+(midSky[2]-topSky[2])*q;b=topSky[3]+(midSky[3]-topSky[3])*q
+      else
+        local q=(t-.58)/.42;r=midSky[1]+(horizon[1]-midSky[1])*q;g=midSky[2]+(horizon[2]-midSky[2])*q;b=midSky[3]+(horizon[3]-midSky[3])*q
+      end
+      love.graphics.setColor(r,g,b,1);love.graphics.rectangle("fill",0,y,w,math.ceil(h/71)+2)
+    end
+    -- Thin high clouds: enough to read unmistakably as sky, never a grey/green
+    -- fullscreen slab. They sit behind all source tree geometry.
+    local clouds={{.15,.17,.22,.032,.12},{.42,.12,.26,.038,.10},{.70,.20,.22,.034,.11},{.91,.14,.18,.030,.09}}
+    for _,c in ipairs(clouds) do
+      love.graphics.setColor(.96,.98,1.0,c[5]);love.graphics.ellipse("fill",c[1]*w,c[2]*h,c[3]*w,c[4]*h)
+    end
+    -- 1.9.28: the actual 360-degree tree line is now built in 3D from
+    -- M3_shrine_1F_bf source meshes. The screen-space backdrop is sky only; a
+    -- very soft horizon haze hides the mathematical seam without pretending to
+    -- be trees. This removes the flat cardboard-tree look from reverse angles.
+    love.graphics.setColor(.32,.43,.23,.036);love.graphics.rectangle("fill",0,h*.735,w,h*.265)
+    love.graphics.setColor(.56,.63,.42,.022);love.graphics.rectangle("fill",0,h*.675,w,h*.105)
+    love.graphics.setColor(1,1,1,1)
+    return
+  elseif profile=="relic_cave" then
+    -- Enclosed source cave: no borrowed outdoor horizon.
+    for i=0,55 do
+      local t=i/55;local u=t*t*(3-2*t);local y=i*h/55
+      love.graphics.setColor(top[1]+(bottom[1]-top[1])*u,top[2]+(bottom[2]-top[2])*u,top[3]+(bottom[3]-top[3])*u,1)
+      love.graphics.rectangle("fill",0,y,w,math.ceil(h/55)+2)
+    end
+    love.graphics.setColor(0,0,0,.07);love.graphics.rectangle("fill",0,h*.68,w,h*.32)
+    love.graphics.setColor(1,1,1,1)
+    return
+  elseif profile=="cipher_lab" then
+    -- Enclosed source lab: no artificial horizon, stars or outdoor sky.
+    love.graphics.setColor(.025,.04,.055,1);love.graphics.rectangle("fill",0,0,w,h)
+    love.graphics.setColor(1,1,1,1);return
+  elseif profile=="deep" then
+    -- Deep Colosseum is an enclosed underground machine hall. In the retail
+    -- scene, empty gaps are essentially black; the old green fallback polluted
+    -- those gaps and made the perimeter read as foggy/muddy scenery.
+    local a={.005,.006,.006};local b={.018,.020,.019}
+    for i=0,63 do
+      local t=i/63;local u=t*t*(3-2*t);local y=i*h/63
+      love.graphics.setColor(a[1]+(b[1]-a[1])*u,a[2]+(b[2]-a[2])*u,a[3]+(b[3]-a[3])*u,1)
+      love.graphics.rectangle("fill",0,y,w,math.ceil(h/63)+2)
+    end
+    -- Very faint warm reflected floor light only; visible pipes/walls come from
+    -- M4_bottom_colo itself rather than a screen-space haze.
+    love.graphics.setColor(.075,.066,.052,.055);love.graphics.rectangle("fill",0,h*.76,w,h*.24)
+    love.graphics.setColor(.035,.032,.027,.045);love.graphics.rectangle("fill",0,h*.90,w,h*.10)
     love.graphics.setColor(1,1,1,1)
     return
   elseif profile=="summit" then
@@ -1539,6 +2146,51 @@ local function paintBackdropStatic(w,h)
         love.graphics.rectangle("fill",0,y,w,math.ceil(h/63)+2)
       end
     end
+    love.graphics.setColor(1,1,1,1)
+    return
+  elseif profile=="outskirts" then
+    -- Opening-story Outskirts: bright cobalt Orre sky, broad white cloud banks,
+    -- pale sun-baked desert and a very low distant mesa line. The source clip
+    -- is warm, but it is not an orange fantasy sunset; preserve that balance.
+    local topSky={.095,.265,.555};local midSky={.34,.50,.70};local horizon={.94,.84,.62}
+    for i=0,71 do
+      local t=i/71;local y=i*h/71
+      local r,g,b
+      if t<.56 then
+        local q=t/.56;r=topSky[1]+(midSky[1]-topSky[1])*q;g=topSky[2]+(midSky[2]-topSky[2])*q;b=topSky[3]+(midSky[3]-topSky[3])*q
+      else
+        local q=(t-.56)/.44;r=midSky[1]+(horizon[1]-midSky[1])*q;g=midSky[2]+(horizon[2]-midSky[2])*q;b=midSky[3]+(horizon[3]-midSky[3])*q
+      end
+      love.graphics.setColor(r,g,b,1);love.graphics.rectangle("fill",0,y,w,math.ceil(h/71)+2)
+    end
+    -- Broad, soft cloud banks match the first-battle footage and break the old
+    -- flat-blue model-viewer read. They remain behind all 3D source geometry.
+    local clouds={
+      {.15,.18,.20,.050,.16},{.34,.12,.16,.042,.13},{.52,.22,.23,.055,.15},{.72,.14,.18,.047,.14},{.90,.25,.22,.052,.14},
+      {.25,.33,.28,.060,.10},{.64,.34,.30,.058,.11},
+    }
+    for i,c in ipairs(clouds) do
+      local x,y,rx,ry,a=c[1]*w,c[2]*h,c[3]*w,c[4]*h,c[5]
+      love.graphics.setColor(.96,.97,.94,a)
+      love.graphics.ellipse("fill",x,y,rx,ry)
+      love.graphics.setColor(.78,.84,.86,a*.55)
+      love.graphics.ellipse("fill",x+rx*.22,y+ry*.30,rx*.78,ry*.62)
+    end
+    -- Warm late-afternoon sun, intentionally restrained.
+    local sx,sy=w*.80,h*.235
+    for i=10,1,-1 do local rr=(16+i*9)*(w/1280);love.graphics.setColor(1.0,.76,.34,.0065*i);love.graphics.circle("fill",sx,sy,rr) end
+    love.graphics.setColor(1.0,.91,.66,.78);love.graphics.circle("fill",sx,sy,math.max(5,7*w/1280))
+    -- The original battle shows a low, continuous desert mesa/plateau very far
+    -- behind the wagon/fences. Keep the silhouette shallow and atmospheric.
+    love.graphics.setColor(.49,.40,.29,.62)
+    local ridge={{0,.515},{.07,.505},{.14,.498},{.22,.503},{.30,.486},{.38,.499},{.46,.491},{.55,.501},{.64,.480},{.72,.495},{.80,.488},{.89,.503},{1,.493},{1,.565},{0,.565}}
+    local pts={};for _,v in ipairs(ridge) do pts[#pts+1]=v[1]*w;pts[#pts+1]=v[2]*h end
+    love.graphics.polygon("fill",pts)
+    -- Successive pale dust bands visually merge the 3D far-field sand with the
+    -- horizon without exposing a hard rectangular edge.
+    love.graphics.setColor(.94,.84,.62,.24);love.graphics.rectangle("fill",0,h*.535,w,h*.095)
+    love.graphics.setColor(.96,.88,.68,.18);love.graphics.rectangle("fill",0,h*.615,w,h*.17)
+    love.graphics.setColor(.98,.91,.73,.12);love.graphics.rectangle("fill",0,h*.76,w,h*.24)
     love.graphics.setColor(1,1,1,1)
     return
   elseif profile=="outdoor" then
@@ -1664,7 +2316,46 @@ local function drawBackdrop(w,h,vp,baked)
   paintBackdropDynamic(w,h,vp)
 end
 
-local function worldCenter(c)
+-- Extremely light airborne sand for Outskirts. This is deliberately a tiny
+-- screen-space atmospheric pass rather than a dense particle system: it gives
+-- the hot desert a little motion without obscuring Pokemon, trainers or UI.
+-- Positions are deterministic from sceneTime, so there is no allocation-heavy
+-- emitter and no random-state churn on low-end/mobile devices.
+local function drawOutskirtsSandDrift(w,h)
+  if not (activeDef and activeDef.profile=="outskirts") then return end
+  love.graphics.setShader()
+  love.graphics.setDepthMode()
+  love.graphics.setBlendMode("alpha","alphamultiply")
+  local t=tonumber(sceneTime) or 0
+  local lw=math.max(1,h*.00110)
+  if love.graphics.setLineWidth then love.graphics.setLineWidth(lw) end
+  for i=1,30 do
+    local seed=(i*.61803398875)%1
+    local speed=.022+.0045*(i%5)
+    local q=(seed+t*speed)%1
+    local x=w*(q*1.28-.14)
+    local y=h*(.58+((i*.34711)%1)*.31)+math.sin(t*.42+i*1.71)*h*.0025
+    local len=w*(.010+.012*((i*7)%9)/8)
+    local alpha=.018+.016*((i*3)%7)/6
+    love.graphics.setColor(.98,.91,.74,alpha)
+    love.graphics.line(x,y,x+len,y-h*.0018)
+  end
+  -- A handful of tiny grains make the drift read as sand rather than haze.
+  for i=1,16 do
+    local q=((i*.41421356237)+t*(.014+.002*(i%4)))%1
+    local x=w*(q*1.20-.10)
+    local y=h*(.61+((i*.27183)%1)*.27)
+    local r=math.max(.7,h*(.00045+.00018*(i%3)))
+    love.graphics.setColor(1.0,.93,.76,.022+.007*(i%3))
+    love.graphics.circle("fill",x,y,r)
+  end
+  local drift=((t*.012)%1)*w*.34
+  love.graphics.setColor(.97,.89,.70,.018);love.graphics.rectangle("fill",-w*.08+drift,h*.69,w*.34,h*.006)
+  love.graphics.setColor(.99,.92,.76,.012);love.graphics.rectangle("fill",w*.48-drift,h*.80,w*.38,h*.004)
+  love.graphics.setColor(1,1,1,1)
+end
+
+worldCenter=function(c)
   local x,y,z=(c[1] or 0)*STAGE_SCALE,(c[2] or 0)*STAGE_SCALE,(c[3] or 0)*STAGE_SCALE
   if STAGE_YAW~=0 then
     local cs,sn=math.cos(STAGE_YAW),math.sin(STAGE_YAW)
@@ -1680,9 +2371,10 @@ end
 -- computed exactly once per frame and the sort compares plain numbers.
 -- Ordering is identical.
 local sortKey=setmetatable({},{__mode="k"})
-local function drawTransparent(groups,eye)
+local function drawTransparent(groups,pose)
   local n=#groups
-  if n<2 then return drawGroups(groups) end
+  if n<2 then return drawGroups(groups,pose) end
+  local eye=pose and pose.eye or {0,0,0}
   local ex,ey,ez=eye[1],eye[2],eye[3]
   local cs,sn=1,0
   local yawed=STAGE_YAW~=0
@@ -1696,7 +2388,7 @@ local function drawTransparent(groups,eye)
     sortKey[g]=dx*dx+dy*dy+dz*dz
   end
   table.sort(groups,function(a,b) return sortKey[a]>sortKey[b] end)
-  drawGroups(groups)
+  drawGroups(groups,pose)
 end
 local function updateAnchors(arena)
   local k=math.max(0.001,figureScale)
@@ -1867,10 +2559,39 @@ function A:update(ctx,dt,arena)
   end
   updateAnchors(arena)
 end
+local function clearArenaTarget(out)
+  if depthActive then
+    local ok,err=pcall(love.graphics.clear,0.025,0.075,0.145,1,true,true)
+    if ok then return true end
+    -- Some Android LÖVE/GLES combinations accept the depth attachment but reject
+    -- the extended clear signature. Detach depth and keep rendering color-only
+    -- instead of aborting the entire arena.
+    log(nil,"warn","depth clear rejected; switching arena to color-only fallback: %s",tostring(err))
+    pcall(love.graphics.setDepthMode)
+    local rebound,rerr=pcall(love.graphics.setCanvas,out)
+    if not rebound then return false,rerr end
+    depthActive=false;depthMode="none"
+  end
+  local ok,err=pcall(love.graphics.clear,0.025,0.075,0.145,1)
+  return ok,err
+end
+
+local function safeArenaPass(ctx,label,fn)
+  local ok,err=pcall(fn)
+  if ok then renderErrors[label]=nil;return true end
+  local text=tostring(err)
+  local changed=renderErrors[label]~=text
+  renderErrors[label]=text
+  pcall(love.graphics.setShader);pcall(love.graphics.setDepthMode)
+  if changed then log(ctx,"warn","arena %s pass failed open: %s",tostring(label),text) end
+  return false
+end
+
 function A:render(ctx,arena,drawActors)
   local s=loadScene(ctx); if not s then return V.FALLBACK end
   local w,h=pixelSize(); if not (w and h and w>0 and h>0) then return V.FALLBACK end
   local ok,out=pcall(ensureCanvas,w,h); if not ok then error(out) end
+  if not out then return V.FALLBACK end
   local vp,pose=viewProjection(ctx,w,h)
   local model=Mat4.mul(Mat4.rotateY(STAGE_YAW),Mat4.scale(STAGE_SCALE,STAGE_SCALE,STAGE_SCALE))
   local actorVP=Mat4.mul(vp,Mat4.scale(figureScale,figureScale,figureScale))
@@ -1889,15 +2610,19 @@ function A:render(ctx,arena,drawActors)
     local baked=ensureBackdrop(w,h)
     local bound,bindErr=bindArenaCanvas(out)
     if not bound then error("arena framebuffer bind: "..tostring(bindErr)) end
-    if depthActive then love.graphics.clear(0.025,0.075,0.145,1,true,true)
-    else love.graphics.clear(0.025,0.075,0.145,1) end
-    drawBackdrop(w,h,vp,baked)
+    local cleared,clearErr=clearArenaTarget(out)
+    if not cleared then error("arena framebuffer clear: "..tostring(clearErr)) end
+    safeArenaPass(ctx,"backdrop",function() drawBackdrop(w,h,vp,baked) end)
 
-    -- 1) True solid geometry and binary-alpha cutouts establish scene depth.
-    setStageState(vp,model,true,pose)
-    drawGroups(s.opaque)
-    drawGroups(s.cutout)
-    drawCrowd(s.crowd,vp,model,pose)
+    -- 1) Isolate arena buckets on Android/portable drivers. One malformed mesh or
+    -- backend-specific material draw must not discard the entire completed frame.
+    safeArenaPass(ctx,"opaque",function()
+      setStageState(vp,model,true,pose)
+      drawRelicFarField();drawOutskirtsFarField();drawRelicSourceForestShell(s,vp,model,pose)
+      drawGroups(s.opaque,pose)
+    end)
+    safeArenaPass(ctx,"cutout",function() setStageState(vp,model,true,pose);drawGroups(s.cutout,pose) end)
+    safeArenaPass(ctx,"crowd",function() setStageState(vp,model,true,pose);drawCrowd(s.crowd,vp,model,pose) end)
 
     -- 2) The boss trainer shadow is authored directly onto the Colosseum
     -- floor before any figures draw. It is deliberately separate from the
@@ -1937,8 +2662,9 @@ function A:render(ctx,arena,drawActors)
       if not (obj and type(obj[method])=="function") then return end
       local okT,errT=pcall(obj[method],obj,...)
       if okT then renderErrors[label]=nil else
+        local changed=renderErrors[label]~=tostring(errT)
         renderErrors[label]=tostring(errT);pcall(love.graphics.setShader);pcall(love.graphics.setDepthMode,"lequal",true)
-        log(ctx,"warn","%s failed open: %s",label,tostring(errT))
+        if changed then log(ctx,"warn","%s failed open: %s",label,tostring(errT)) end
       end
     end
     safeTrainer("playerTrainer",PlayerTrainer,"draw",ctx,vp,pose)
@@ -1948,11 +2674,28 @@ function A:render(ctx,arena,drawActors)
 
     -- 5) Water/glass/NO_ZUPDATE material groups are camera-sorted and then
     -- composited without depth writes, preserving actors behind transparency.
-    setStageState(vp,model,false,pose)
-    drawTransparent(s.translucent,pose.eye)
+    safeArenaPass(ctx,"translucent",function() setStageState(vp,model,false,pose);drawTransparent(s.translucent,pose) end)
     -- Source waterfall/highlight layers use additive energy. Treating their
     -- black background as alpha in 0.0.3 produced dark cards/slabs.
-    drawAdditive(s.additive)
+    safeArenaPass(ctx,"additive",function() setStageState(vp,model,false,pose);drawAdditive(s.additive,pose) end)
+
+    -- Final ambient desert motion. It is intentionally subtle and screen-space;
+    -- all actual Outskirts geometry remains source-backed.
+    safeArenaPass(ctx,"atmosphere",function() drawOutskirtsSandDrift(w,h) end)
+
+    -- Colosseum Type-4 filter/blur/distortion effects operate on the completed
+    -- scene framebuffer. Give WazaHandlers the arena canvas only after all
+    -- world geometry, Pokemon, trainers and transparent materials are present.
+    local wh=V.WazaHandlers
+    if wh and type(wh.drawPost)=="function" then
+      local doubles=V.DoublesRuntime and V.DoublesRuntime.presentation and V.DoublesRuntime.presentation(ctx.battle)
+      local mp=V.DoublesMovePresentation
+      local okPost,postErr
+      if doubles and doubles.movePresentation and mp and mp.drawPost then
+        okPost,postErr=pcall(mp.drawPost,doubles,ctx,out,w,h)
+      else okPost,postErr=pcall(wh.drawPost,ctx,out,w,h) end
+      if not okPost then renderErrors.movefxPost=tostring(postErr) else renderErrors.movefxPost=nil end
+    end
 
     love.graphics.setShader()
     love.graphics.setDepthMode()
@@ -1983,12 +2726,15 @@ function A:resetRuntime()
   end
   if scene and not released[scene] then releaseArenaScene(scene) end
   pcall(function() if shader and shader.release then shader:release() end end)
+  pcall(function() if outskirtsFarFieldMesh and outskirtsFarFieldMesh.release then outskirtsFarFieldMesh:release() end end)
+  pcall(function() if relicFarFieldMesh and relicFarFieldMesh.release then relicFarFieldMesh:release() end end)
+  outskirtsFarFieldMesh=nil;relicFarFieldMesh=nil
   pcall(function() if white and white.release then white:release() end end)
   pcall(function() if canvas and canvas.release then canvas:release() end end)
   pcall(function() if depthCanvas and depthCanvas.release then depthCanvas:release() end end)
   pcall(function() if backdropCanvas and backdropCanvas.release then backdropCanvas:release() end end)
   backdropCanvas=nil;backdropKey=nil
-  scene=nil;shader=nil;white=nil;canvas=nil;depthCanvas=nil;depthMode=nil;depthActive=false;cw=nil;ch=nil;errorText=nil;renderErrors={};sceneTime=0
+  scene=nil;shader=nil;shaderMode=nil;white=nil;canvas=nil;depthCanvas=nil;depthMode=nil;depthActive=false;cw=nil;ch=nil;errorText=nil;renderErrors={};sceneTime=0
   uniformCache=nil;uniformCacheShader=nil
   residentScenes={};residentUse={};residentSerial=0;activeDef=nil;activeArenaId="water"
   if Trainer and type(Trainer.resetRuntime)=="function" then pcall(Trainer.resetRuntime,Trainer) end
@@ -2009,9 +2755,10 @@ function A:status()
     crowdOriginal=scene and scene.crowdOriginal or 0,
     crowdPolicy=scene and scene.crowdPolicy or nil,
     crowdOutliers=scene and scene.crowdOutliers or 0,
-    activeArena=activeArenaId,cache=activeDef and activeDef.cache or nil,profile=activeDef and activeDef.profile or nil,source=scene and scene.source or nil,framebufferMode=depthMode,depthActive=depthActive,android=ARENA_ANDROID,
+    activeArena=activeArenaId,cache=activeDef and activeDef.cache or nil,profile=activeDef and activeDef.profile or nil,source=scene and scene.source or nil,framebufferMode=depthMode,depthActive=depthActive,shaderMode=shaderMode,android=ARENA_ANDROID,
     backdropBaked=backdropCanvas~=nil,backdropBakes=backdropBakes,
     residentScenes=residentCount(),residentLimit=RESIDENT_LIMIT,runtimeSidecar=scene and scene.runtimeSidecar==true or false,runtimeMeshHits=arenaRuntimeHits,runtimeMeshWrites=arenaRuntimeWrites,
   }
 end
+A._test={sourceVertexAlphaEnabled=sourceVertexAlphaEnabled,vertex=VERTEX,pixel=PIXEL,mobileVertex=MOBILE_VERTEX,mobilePixel=MOBILE_PIXEL,withNormals=withNormals,materialMode=materialMode,texture=texture,dropGhostLayer=dropGhostLayer}
 return A
